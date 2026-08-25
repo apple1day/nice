@@ -2,7 +2,7 @@
   "name": "playwright-ts-demo",
   "version": "1.0.0",
   "scripts": {
-    "start": "tsx run.ts"
+    "start": "tsx run1.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.40.0",

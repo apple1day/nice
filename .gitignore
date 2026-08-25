@@ -18,3 +18,5 @@ bin-release/
 # information for Eclipse / Flash Builder.
 .DS_Store
 node_modules/
+screenshots
+.user_data/
