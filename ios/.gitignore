@@ -8,3 +8,8 @@ Tests/Fixtures/*.mp4
 Tests/Fixtures/*.mkv
 Licenses/MobileVLCKit-COPYING.txt
 Licenses/Acknowledgements.txt
+.project-backups/
+.project-setup-*.json
+tools/__pycache__/
+DerivedData-device/
+xcode-tests.log

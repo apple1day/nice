@@ -21,6 +21,11 @@ targets:
           - Info.plist
       - path: Licenses
         type: folder
+    preBuildScripts:
+      - name: Check generated source membership
+        script: python3 "$SRCROOT/tools/project_doctor.py" check --sources-only
+        basedOnDependencyAnalysis: false
+        showEnvVars: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anxiong.nicevideos
