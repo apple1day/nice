@@ -177,6 +177,7 @@ private struct VLCVideoSurface: UIViewRepresentable {
 }
 
 struct PlaybackScreen: View {
+    @EnvironmentObject private var store: VideoStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model: PlaybackModel
@@ -193,7 +194,11 @@ struct PlaybackScreen: View {
                 VLCVideoSurface(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .accessibilityIdentifier("offlineVideoSurface")
+                    .overlay(alignment: .center) { WatchDeleteButton(videoID: request.key) }
                 if model.phase == .opening { ProgressView("打开本地文件…") }
+                if let notice = store.deletionNotice {
+                    Text(notice).font(.caption).foregroundStyle(.secondary).padding(.horizontal)
+                }
                 if let message = model.message {
                     Text(message).font(.footnote).foregroundStyle(.red).padding(.horizontal)
                 }
@@ -232,14 +237,22 @@ struct PlaybackScreen: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("关闭") { model.close(); dismiss() }
+                    Button("关闭") { closePlayback(); dismiss() }
                 }
             }
         }
+        .alert("操作提示", isPresented: Binding(
+            get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } }
+        )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
+        message: { Text(store.errorMessage ?? "") }
         .onChange(of: scenePhase) { _, phase in
             // No hidden audio/background video: resuming is an explicit user action.
             if phase != .active { model.pause() }
         }
-        .onDisappear { model.close() }
+        .onDisappear { closePlayback() }
+    }
+    private func closePlayback() {
+        model.close()
+        store.playbackDidClose(request)
     }
 }

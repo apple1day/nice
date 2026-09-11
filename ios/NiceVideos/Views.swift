@@ -14,9 +14,12 @@ struct RootView: View {
             NavigationStack { SettingsView() }
                 .tabItem { Label("设置", systemImage: "gearshape") }
         }
-        .fullScreenCover(item: $store.playback) { request in PlaybackScreen(request: request) }
+        .fullScreenCover(item: $store.playback) { request in
+            PlaybackScreen(request: request).environmentObject(store)
+        }
         .alert("提示", isPresented: Binding(
-            get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } }
+            get: { store.playback == nil && store.errorMessage != nil },
+            set: { if !$0 { store.errorMessage = nil } }
         )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
         message: { Text(store.errorMessage ?? "") }
         // Intentionally NO startup refresh, reachability gate, or login gate.
@@ -40,6 +43,7 @@ struct OfflineView: View {
                     .font(.footnote).foregroundStyle(.secondary)
                 Text("\(store.completed.count) 个视频 · \(ByteCountFormatter.string(fromByteCount: store.usedBytes, countStyle: .file))")
             }
+            PendingDeletionSection()
             ForEach(filtered) { record in
                 Button { store.playLocal(record) } label: {
                     HStack {
@@ -48,6 +52,9 @@ struct OfflineView: View {
                             Text(record.video.name).foregroundStyle(.primary).lineLimit(2)
                             Text("\(record.video.fileExtension.uppercased()) · \(record.video.sizeLabel)")
                                 .font(.caption).foregroundStyle(.secondary)
+                            if store.isPendingDeletion(record.id) {
+                                Label("待删除", systemImage: "trash").font(.caption).foregroundStyle(.orange)
+                            }
                         }
                     }.padding(.vertical, 4)
                 }
@@ -80,6 +87,7 @@ struct CatalogView: View {
     }
     var body: some View {
         List {
+            PendingDeletionSection()
             Section {
                 Text("服务器仅用于获取列表和下载。播放前必须下载完成。")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -97,6 +105,9 @@ struct CatalogView: View {
                     Label(video.name, systemImage: "film").font(.headline).lineLimit(2)
                     Text("\(video.sizeLabel) · \(video.fileExtension.uppercased())")
                         .font(.caption).foregroundStyle(.secondary)
+                    if let record = record, store.isPendingDeletion(record.id) {
+                        Label("手机副本待删除", systemImage: "trash").font(.caption).foregroundStyle(.orange)
+                    }
                     if !video.supportsOffline {
                         Text("暂不下载此格式；播放清单不是独立视频。")
                             .font(.caption).foregroundStyle(.secondary)
@@ -177,7 +188,7 @@ struct SettingsView: View {
             }
             Section("下载网络") {
                 Toggle("允许新下载使用蜂窝数据", isOn: $allowCellular)
-                Text("只影响新创建的任务；已有任务需要取消后重试。")
+                Text("只影响新创建的任务；已有任务需要取消重试。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("离线播放器") {

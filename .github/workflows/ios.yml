@@ -20,7 +20,9 @@ jobs:
           done
       - name: Test project repair, signing preservation and XML checks without pyexpat
         run: python3 -m unittest discover -s ios/tools -p 'test_*.py' -v
-      - name: Compile app and run offline policy, lifecycle and VLC decode tests
+      - name: Test recoverable local file deletion
+        run: bash ios/check-watch-delete.sh
+      - name: Compile app and run offline policy, lifecycle, watch-delete and VLC decode tests
         run: |
           bash ios/test.sh > ios/xcode-tests.log 2>&1 || { tail -n 140 ios/xcode-tests.log; exit 1; }
           tail -n 100 ios/xcode-tests.log
