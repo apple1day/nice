@@ -1,0 +1,17 @@
+Nice 视频 — 第三方组件
+
+MobileVLCKit 3.7.3 is developed by the VideoLAN/VLC authors.
+It is used as the local playback engine under LGPL v2.1 (see the accompanying COPYING).
+Project/source: https://code.videolan.org/videolan/VLCKit
+Build source revisions: VLCKit 319ed2c0 / VLC 79128878 (official distribution filename).
+
+Official binary:
+https://download.videolan.org/pub/cocoapods/prod/MobileVLCKit-3.7.3-319ed2c0-79128878.tar.xz
+SHA256: 0d04059906962ddc9a7bd1ebaa12e1f9ae85eb2466116a97a2f46886dd27a0a9
+
+setup.sh copies the installed component's actual COPYING and CocoaPods acknowledgements
+into this folder, which is bundled in the application and readable offline.
+
+本项目没有复制 VLC for iOS 的应用界面代码。
+发布/分发前必须完成所选库和底层依赖的许可合规检查，包括适用的源码及重链接义务；
+仅展示此通知不能替代相应义务。当前交付是待真机验收的开发版本，不是 App Store 发布包。

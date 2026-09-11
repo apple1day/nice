@@ -1,0 +1,43 @@
+name: iOS native offline VLC app
+on:
+  pull_request:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and fixture tools
+        run: |
+          for tool in xcodegen cocoapods ffmpeg; do
+            brew list "$tool" >/dev/null 2>&1 || brew install "$tool"
+          done
+      - name: Test project repair, signing preservation and XML checks without pyexpat
+        run: python3 -m unittest discover -s ios/tools -p 'test_*.py' -v
+      - name: Compile app and run offline policy, lifecycle and VLC decode tests
+        run: |
+          bash ios/test.sh > ios/xcode-tests.log 2>&1 || { tail -n 140 ios/xcode-tests.log; exit 1; }
+          tail -n 100 ios/xcode-tests.log
+      - name: Compile Release for iPhone device SDK without signing
+        run: |
+          xcodebuild -quiet -workspace ios/NiceVideos.xcworkspace -scheme NiceVideos \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath ios/DerivedData-device CODE_SIGNING_ALLOWED=NO build
+      - name: Show resolved dependency lock
+        if: always()
+        run: cat ios/Podfile.lock 2>/dev/null || true
+      - name: Save test results and dependency lock
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: |
+            ios/DerivedData/Logs/Test/*.xcresult
+            ios/Podfile.lock
+            ios/xcode-tests.log
