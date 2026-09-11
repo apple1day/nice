@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Check Xcode target membership and preserve signing during XcodeGen repair.
 
-Python standard library only; plutil is supplied by macOS. No downloads, Git
-resets, application-data deletion, or private signing-key access are performed.
+Python standard library only; plutil and xmllint are supplied by macOS. No
+package installs, Git resets, application-data deletion, or key access occur.
+On macOS, workspace XML is parsed by libxml2, NOT Python's optional pyexpat.
 """
 import argparse
 import datetime
@@ -11,12 +12,13 @@ import shutil
 import subprocess
 import sys
 import uuid
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = "NiceVideos.xcodeproj"
 WORKSPACE = "NiceVideos.xcworkspace"
+WORKSPACE_REFERENCES = ("group:NiceVideos.xcodeproj", "group:Pods/Pods.xcodeproj")
+WORKSPACE_MAX_BYTES = 1024 * 1024
 SIGNING_KEYS = (
     "PRODUCT_BUNDLE_IDENTIFIER", "DEVELOPMENT_TEAM", "CODE_SIGN_STYLE",
     "CODE_SIGN_IDENTITY", "PROVISIONING_PROFILE_SPECIFIER", "PROVISIONING_PROFILE",
@@ -129,14 +131,71 @@ def source_errors(root, project):
     return errors
 
 
+def workspace_references(workspace: Path) -> set:
+    """Read required XML references without loading Homebrew pyexpat on macOS.
+
+    CocoaPods writes UTF-8 workspace XML. Use a bounded, read-once input with
+    no DTD/entity declarations; never repair malformed XML or skip validation.
+    XPath evaluates actual FileRef elements, not comments or text matches.
+    """
+    with workspace.open("rb") as stream:
+        data = stream.read(WORKSPACE_MAX_BYTES + 1)
+    if len(data) > WORKSPACE_MAX_BYTES:
+        raise ValueError("工作区 XML 超过 1 MiB，已停止检查。")
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeError:
+        raise ValueError("工作区 XML 不是 CocoaPods 使用的 UTF-8 编码，请重新运行 setup.sh。") from None
+    if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
+        raise ValueError("工作区 XML 不允许 DTD 或自定义实体声明。")
+
+    if sys.platform == "darwin":
+        # Absolute system path avoids Homebrew's mismatched Expat/libxml paths.
+        # No shell, recovery mode, DTD loading, or entity expansion is enabled.
+        checks = ["boolean(/Workspace)"] + [
+            "boolean(/Workspace//FileRef[@location='%s'])" % ref
+            for ref in WORKSPACE_REFERENCES
+        ]
+        xpath = "concat(" + ", '|', ".join(checks) + ")"
+        try:
+            result = subprocess.run(
+                ["/usr/bin/xmllint", "--nonet", "--xpath", xpath, "-"],
+                input=text, capture_output=True, encoding="utf-8",
+                errors="replace", check=False, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ValueError("无法运行 macOS XML 检查器 /usr/bin/xmllint：" + str(error)) from None
+        if result.returncode:
+            raise ValueError("工作区 XML 解析失败：" + result.stderr.strip()[-1000:])
+        values = result.stdout.strip().split("|")
+        if len(values) != len(checks) or any(v not in ("true", "false") for v in values):
+            raise ValueError("工作区 XML 检查器返回了无效结果。")
+        if values[0] != "true":
+            raise ValueError("工作区 XML 根节点必须为 Workspace。")
+        return {ref for ref, value in zip(WORKSPACE_REFERENCES, values[1:]) if value == "true"}
+
+    # Cross-platform unit tests can use the standard parser. Import lazily so
+    # even --sources-only and prepare never require Expat on any platform.
+    try:
+        from xml.etree import ElementTree as ET
+        document = ET.fromstring(text)
+    except ImportError as error:
+        raise ValueError("Python XML 解析器不可用，请使用兼容的 Python 环境：" + str(error)) from None
+    except ET.ParseError as error:
+        raise ValueError("工作区 XML 解析失败：" + str(error)) from None
+    if document.tag != "Workspace":
+        raise ValueError("工作区 XML 根节点必须为 Workspace。")
+    return {node.attrib.get("location", "") for node in document.iter("FileRef")}
+
+
 def dependency_errors(root):
     errors = []
     workspace = root / WORKSPACE / "contents.xcworkspacedata"
     if not workspace.is_file():
         errors.append("缺少 .xcworkspace，请重新运行 setup.sh 安装 CocoaPods 依赖。")
     else:
-        refs = {node.attrib.get("location", "") for node in ET.parse(workspace).iter("FileRef")}
-        for expected in ("group:NiceVideos.xcodeproj", "group:Pods/Pods.xcodeproj"):
+        refs = workspace_references(workspace)
+        for expected in WORKSPACE_REFERENCES:
             if expected not in refs:
                 errors.append("工作区缺少工程引用：" + expected)
     lock = root / "Podfile.lock"
@@ -190,8 +249,10 @@ def main():
             print("error: 保存并关闭 Xcode，在仓库根目录执行 bash ios/repair-project.sh。", file=sys.stderr)
             return 1
         print("工程检查通过：所有 App/测试 Swift 文件均已加入正确编译目标。")
+        if not args.sources_only:
+            print("工作区和 VLC 依赖检查通过。")
         return 0
-    except (OSError, ValueError, KeyError, ET.ParseError) as error:
+    except (OSError, ValueError, KeyError) as error:
         print("error: " + str(error), file=sys.stderr)
         return 1
 
