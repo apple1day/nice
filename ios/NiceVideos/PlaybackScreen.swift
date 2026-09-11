@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import UIKit
 import Combine
 
 // Main-queue confined. The engine is injected in lifecycle tests, not mocked via VLC internals.
@@ -14,6 +15,7 @@ final class PlaybackModel: ObservableObject {
     private let defaults: UserDefaults
     private let manageAudioSession: Bool
     private var started = false
+    private var pauseRequested = false
     private var closed = false
     private var restoredPosition = false
     private var lastSave = Date.distantPast
@@ -51,9 +53,13 @@ final class PlaybackModel: ObservableObject {
         started = true
         do {
             try engine.load(fileURL: request.url)
-            try activateAudio()
-            phase = .opening
-            engine.play()
+            if pauseRequested {
+                phase = .paused
+            } else {
+                try activateAudio()
+                phase = .opening
+                engine.play()
+            }
         } catch {
             message = error.localizedDescription
             phase = .failed
@@ -70,6 +76,7 @@ final class PlaybackModel: ObservableObject {
         guard phase != .failed else { return }
         do {
             try activateAudio()
+            pauseRequested = false
             if phase == .ended {
                 seconds = 0
                 restoredPosition = true // Replay must not reapply a saved bookmark.
@@ -78,7 +85,9 @@ final class PlaybackModel: ObservableObject {
         } catch { message = error.localizedDescription }
     }
     func pause() {
-        guard started && !closed else { return }
+        guard !closed else { return }
+        pauseRequested = true
+        guard started else { return }
         savePosition()
         engine.pause()
         if phase == .playing || phase == .opening { phase = .paused }
@@ -93,7 +102,14 @@ final class PlaybackModel: ObservableObject {
     }
     private func receive(_ snapshot: PlaybackSnapshot) {
         guard !closed else { return }
-        phase = snapshot.phase
+        if snapshot.phase == .playing && pauseRequested {
+            // A background/interruption pause can arrive while VLC is still opening.
+            // Apply it again when the native engine becomes ready instead of leaking audio.
+            engine.pause()
+            phase = .paused
+        } else {
+            phase = snapshot.phase
+        }
         seconds = snapshot.seconds.isFinite ? max(0, snapshot.seconds) : 0
         duration = snapshot.duration.isFinite ? max(0, snapshot.duration) : 0
         seekable = snapshot.seekable && duration > 0

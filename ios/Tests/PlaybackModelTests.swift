@@ -86,6 +86,26 @@ private final class FakeEngine: LocalPlaybackEngine {
         XCTAssertEqual(engine.playCount, 2)
         model.close()
     }
+    func testPauseBeforeMountPreventsAutomaticPlayback() throws {
+        let (model, engine, _) = try fixture()
+        model.pause()
+        model.attach(to: UIView())
+        XCTAssertEqual(engine.loads.count, 1)
+        XCTAssertEqual(engine.playCount, 0)
+        XCTAssertEqual(model.phase, .paused)
+        model.toggle()
+        XCTAssertEqual(engine.playCount, 1)
+        model.close()
+    }
+    func testLatePlayingEventCannotUndoPauseDuringOpening() throws {
+        let (model, engine, _) = try fixture()
+        model.attach(to: UIView())
+        model.pause()
+        engine.emit(.playing)
+        XCTAssertEqual(model.phase, .paused)
+        XCTAssertEqual(engine.pauseCount, 2)
+        model.close()
+    }
     func testSeekIgnoresNaNAndClampsRange() throws {
         let (model, engine, _) = try fixture()
         model.attach(to: UIView())
