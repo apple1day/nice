@@ -24,7 +24,9 @@ jobs:
         run: bash ios/check-watch-delete.sh
       - name: Test fullscreen controls and auto-hide timing
         run: bash ios/check-player-controls.sh
-      - name: Compile app and run offline policy, lifecycle, watch-delete and VLC decode tests
+      - name: Test local playlist order and swipe directions
+        run: bash ios/check-playlist.sh
+      - name: Compile app and run offline policy, lifecycle, playlist, watch-delete and VLC decode tests
         run: |
           bash ios/test.sh > ios/xcode-tests.log 2>&1 || { tail -n 140 ios/xcode-tests.log; exit 1; }
           tail -n 100 ios/xcode-tests.log

@@ -139,7 +139,7 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             if existing.state == .downloading { return }
             if existing.state == .complete, disk.verifiedFile(for: existing) != nil { return }
         }
-        guard playbackSession?.key != id && playback?.key != id else {
+        guard !isPlaybackProtected(id) else {
             throw ClientError("请先关闭正在播放的视频，再重新下载。")
         }
         var request = URLRequest(url: try ServerAddress.endpoint(video.downloadUrl, on: base))
@@ -184,11 +184,7 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     func playLocal(_ record: DownloadRecord) {
         guard playbackSession == nil && playback == nil else { return }
         do {
-            guard let current = records.first(where: { $0.id == record.id }),
-                  current.state == .complete, let file = disk?.verifiedFile(for: current) else {
-                throw ClientError("本地文件缺失或下载未完成，请重新下载。")
-            }
-            let request = try PlaybackRequest(key: current.id, title: current.video.name, url: file)
+            let request = try localPlaybackRequest(for: record.id)
             playbackSession = request
             deletionNotice = nil
             playback = request
@@ -197,10 +193,47 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             reconcileFiles()
         }
     }
-    // Called AFTER PlaybackModel.close(). Old covers may not release a new lease.
+
+    // All verified local downloads in the same order as the unfiltered local
+    // library. No server setting, catalog, reachability check or URLSession.
+    var localPlaylistRecords: [DownloadRecord] {
+        completed.filter { disk?.verifiedFile(for: $0) != nil }
+    }
+    func localPlaybackRequest(for id: String) throws -> PlaybackRequest {
+        guard let record = records.first(where: { $0.id == id }),
+              record.state == .complete, let file = disk?.verifiedFile(for: record) else {
+            throw ClientError("本地文件缺失或下载未完成，请重新下载。")
+        }
+        return try PlaybackRequest(key: record.id, title: record.video.name, url: file)
+    }
+    func transitionPlayback(from old: PlaybackRequest, to next: PlaybackRequest,
+                            stopCurrent: () -> Void) throws {
+        guard playback != nil, playbackSession?.id == old.id else {
+            throw ClientError("播放会话已结束，请重新打开本地视频。")
+        }
+        // Revalidate the target before stopping anything. Reject caller-supplied
+        // paths even when they happen to be valid local media elsewhere.
+        let verified = try localPlaybackRequest(for: next.key)
+        guard verified.url == next.url else { throw ClientError("播放文件与本地索引不一致。") }
+        stopCurrent()
+        playbackSession = next
+        deletionNotice = nil
+        // Keep playback (the presentation anchor) unchanged: switching must not
+        // dismiss/re-present the cover or reset fullscreen/auto-hide UI state.
+    }
+    private func isPlaybackProtected(_ id: String) -> Bool {
+        // Once a playlist has switched, the old cover item is NOT an active file.
+        if let current = playbackSession { return current.key == id }
+        return playback?.key == id
+    }
+    // Called AFTER PlaybackModel.close(). Old drawables cannot release a new lease.
     func playbackDidClose(_ request: PlaybackRequest) {
-        if playbackSession?.id == request.id { playbackSession = nil }
-        if playback?.id == request.id { playback = nil }
+        if playbackSession?.id == request.id {
+            playbackSession = nil
+            playback = nil
+        } else if playbackSession == nil && playback?.id == request.id {
+            playback = nil
+        }
     }
     func reconcileFiles() {
         guard let disk = disk else { return }
@@ -384,7 +417,7 @@ extension VideoStore {
     }
 
     private func deleteLocally(_ record: DownloadRecord, saving next: [DownloadRecord]) throws -> String? {
-        guard playbackSession?.key != record.id && playback?.key != record.id else {
+        guard !isPlaybackProtected(record.id) else {
             throw ClientError("此视频仍在播放，请先关闭播放器后重试。")
         }
         guard let disk = disk else { throw ClientError("本地存储不可用。") }

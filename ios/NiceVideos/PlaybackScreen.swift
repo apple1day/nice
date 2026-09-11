@@ -166,7 +166,6 @@ private struct VLCVideoSurface: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
         view.backgroundColor = .black
-        // SwiftUI must finish mounting the drawable before playback begins.
         DispatchQueue.main.async { [weak model, weak view] in
             if let view = view { model?.attach(to: view) }
         }
@@ -176,51 +175,61 @@ private struct VLCVideoSurface: UIViewRepresentable {
     static func dismantleUIView(_ view: UIView, coordinator: PlaybackModel) { coordinator.close() }
 }
 
+// The presentation anchor never changes while swiping; this wrapper supplies the
+// existing EnvironmentObject before constructing the session's StateObject.
 struct PlaybackScreen: View {
+    @EnvironmentObject private var store: VideoStore
+    let request: PlaybackRequest
+    var body: some View { PlaylistPlayerHost(request: request, store: store) }
+}
+
+private struct PlaylistPlayerHost: View {
+    @StateObject private var playlist: PlaylistPlaybackModel
+    init(request: PlaybackRequest, store: VideoStore) {
+        _playlist = StateObject(wrappedValue: PlaylistPlaybackModel(request: request, store: store))
+    }
+    var body: some View { PlaylistPlayerView(playlist: playlist, model: playlist.player) }
+}
+
+private struct PlaylistPlayerView: View {
     @EnvironmentObject private var store: VideoStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
-    @StateObject private var model: PlaybackModel
+    @ObservedObject var playlist: PlaylistPlaybackModel
+    @ObservedObject var model: PlaybackModel
     @State private var controls = PlaybackControlsState()
     @State private var draftSeconds: Double = 0
-    private let request: PlaybackRequest
+    @State private var showsPlaylist = false
+    @GestureState private var draggingSurface = false
+    private var request: PlaybackRequest { playlist.current }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
-    private var hasMessage: Bool { store.errorMessage != nil || model.message != nil }
+    private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist }
     private var showsPause: Bool { model.phase == .playing || model.phase == .opening }
-
-    init(request: PlaybackRequest) {
-        self.request = request
-        _model = StateObject(wrappedValue: PlaybackModel(request: request))
-    }
+    private var canNavigate: Bool { scenePhase == .active && !controls.isScrubbing && store.errorMessage == nil && !showsPlaylist }
 
     var body: some View {
         NavigationStack {
-            GeometryReader { geometry in
-                // Keep ONE drawable at the same structural position. Fullscreen and
-                // auto-hide only change layout/overlays: never close or reload VLC.
+            GeometryReader { _ in
                 ZStack {
                     Color.black.ignoresSafeArea()
+                    // Rebuild ONLY the drawable for a new clip. Fullscreen changes
+                    // neither this ID nor the current PlaybackModel.
                     VLCVideoSurface(model: model)
+                        .id(request.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .ignoresSafeArea(.container, edges: controls.isFullscreen ? .all : [])
                         .allowsHitTesting(false)
                         .accessibilityIdentifier("offlineVideoSurface")
-                    // Sibling below the controls, not a parent gesture: pressing a
-                    // button/dragging the slider cannot also toggle the whole HUD.
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) { controls.surfaceTapped(at: now) }
-                    } label: {
-                        Rectangle().fill(Color.clear).contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(controls.isVisible ? "隐藏播放控制" : "显示播放控制")
-                    .accessibilityIdentifier("playbackSurfaceToggle")
-                    WatchDeleteButton(videoID: request.key, compact: geometry.size.height < 420,
-                                      onInteraction: revealControls)
-                        .opacity(controls.isVisible ? 1 : 0)
-                        .allowsHitTesting(controls.isVisible)
-                        .accessibilityHidden(!controls.isVisible)
+                    Rectangle().fill(Color.clear).contentShape(Rectangle())
+                        .gesture(surfaceGesture)
+                        .accessibilityElement()
+                        .accessibilityLabel("视频画面，上滑上一条，下滑下一条")
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityAction { toggleControls() }
+                        .accessibilityAction(named: Text("上一个视频")) { navigate(.previous) }
+                        .accessibilityAction(named: Text("下一个视频")) { navigate(.next) }
+                        .accessibilityIdentifier("playbackSurfaceToggle")
                 }
                 .overlay(alignment: .top) {
                     if controls.isFullscreen {
@@ -252,22 +261,27 @@ struct PlaybackScreen: View {
         .preferredColorScheme(.dark)
         .statusBarHidden(controls.isFullscreen)
         .persistentSystemOverlays(controls.isFullscreen && !controls.isVisible ? .hidden : .automatic)
+        .sheet(isPresented: $showsPlaylist) { playlistSheet }
         .alert("操作提示", isPresented: Binding(
             get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } }
         )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
         message: { Text(store.errorMessage ?? "") }
+        .onChange(of: request.id) { _, _ in
+            draftSeconds = 0
+            controls.setScrubbing(false, at: now)
+            controls.setNavigating(false, at: now)
+            controls.setPlaying(model.phase == .playing, at: now)
+            controls.interacted(at: now)
+            if scenePhase != .active { model.pause() }
+        }
         .onChange(of: model.phase, initial: true) { _, phase in
             controls.setPlaying(phase == .playing, at: now)
         }
-        .onChange(of: hasMessage, initial: true) { _, value in
-            controls.setPresentingAlert(value, at: now)
-        }
-        .onChange(of: voiceOverEnabled, initial: true) { _, value in
-            controls.setVoiceOverEnabled(value, at: now)
-        }
+        .onChange(of: draggingSurface) { _, value in controls.setNavigating(value, at: now) }
+        .onChange(of: hasMessage, initial: true) { _, value in controls.setPresentingAlert(value, at: now) }
+        .onChange(of: voiceOverEnabled, initial: true) { _, value in controls.setVoiceOverEnabled(value, at: now) }
         .onChange(of: scenePhase, initial: true) { _, phase in
             controls.setSceneActive(phase == .active, at: now)
-            // No hidden audio/background video: resuming is an explicit action.
             if phase != .active { model.pause() }
         }
         .task(id: controls.hideDeadline) {
@@ -276,36 +290,58 @@ struct PlaybackScreen: View {
             do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
             catch { return }
             guard !Task.isCancelled else { return }
-            withAnimation(.easeInOut(duration: 0.2)) {
-                controls.hideIfDue(at: now, deadline: deadline)
-            }
+            withAnimation(.easeInOut(duration: 0.2)) { controls.hideIfDue(at: now, deadline: deadline) }
         }
         .onDisappear { closePlayback() }
     }
 
+    // Both gestures belong ONLY to the empty picture area, not the slider or
+    // buttons. An exclusive drag cannot also trigger a tap (or mark deletion).
+    private var surfaceGesture: some Gesture {
+        DragGesture(minimumDistance: 20)
+            .updating($draggingSurface) { _, value, _ in value = true }
+            .onEnded { value in
+                controls.setNavigating(false, at: now)
+                guard let direction = PlaylistSwipe.direction(
+                    horizontal: Double(value.translation.width), vertical: Double(value.translation.height)
+                ) else { revealControls(); return }
+                navigate(direction)
+            }
+            .exclusively(before: TapGesture().onEnded { _ in toggleControls() })
+    }
+    private func toggleControls() {
+        withAnimation(.easeInOut(duration: 0.2)) { controls.surfaceTapped(at: now) }
+    }
+    private func navigate(_ direction: LocalPlaybackPlaylist.Direction) {
+        guard canNavigate else { return }
+        playlist.move(direction)
+        revealControls()
+    }
     private var fullscreenHeader: some View {
         HStack(spacing: 12) {
             Text(request.title).font(.headline).lineLimit(1)
             Spacer(minLength: 4)
-            Button { closePlayback(); dismiss() } label: {
-                Image(systemName: "xmark").frame(width: 44, height: 44)
-            }.accessibilityLabel("关闭播放器").accessibilityIdentifier("closeFullscreenPlayer")
+            Button { closePlayback(); dismiss() } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
+                .accessibilityLabel("关闭播放器").accessibilityIdentifier("closeFullscreenPlayer")
         }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 16)
+        .foregroundStyle(.white).padding(.horizontal, 16)
         .background(LinearGradient(colors: [.black.opacity(0.8), .clear], startPoint: .top, endPoint: .bottom))
+        .contentShape(Rectangle())
     }
-
     private var transportControls: some View {
         VStack(spacing: 4) {
-            if model.phase == .opening {
-                ProgressView("打开本地文件…").tint(.white).font(.caption)
-            }
-            if let message = model.message {
-                Text(message).font(.caption).foregroundStyle(.red).lineLimit(3)
-            }
-            if let notice = store.deletionNotice {
-                Text(notice).font(.caption2).lineLimit(2)
+            if model.phase == .opening { ProgressView("打开本地文件…").tint(.white).font(.caption) }
+            if let message = model.message { Text(message).font(.caption).foregroundStyle(.red).lineLimit(2) }
+            if let notice = playlist.notice { Text(notice).font(.caption).lineLimit(2) }
+            if let notice = store.deletionNotice { Text(notice).font(.caption2).lineLimit(2) }
+            HStack(spacing: 8) {
+                Text("上滑上一条 · 下滑下一条").font(.caption2)
+                Spacer(minLength: 4)
+                Button { revealControls(); showsPlaylist = true } label: {
+                    Label(playlist.positionLabel, systemImage: "list.bullet")
+                        .font(.caption.monospacedDigit()).padding(.vertical, 8)
+                }.accessibilityLabel("本地播放列表 \(playlist.positionLabel)")
+                    .accessibilityIdentifier("openLocalPlaylistButton")
             }
             Slider(value: Binding(
                 get: { min(max(0, controls.isScrubbing ? draftSeconds : model.seconds), max(1, model.duration)) },
@@ -315,49 +351,93 @@ struct PlaybackScreen: View {
                 else { model.seek(to: draftSeconds) }
                 controls.setScrubbing(editing, at: now)
             })
-            .tint(.white)
-            .disabled(!model.seekable)
-            .accessibilityLabel("播放进度")
-            .accessibilityIdentifier("playbackProgressSlider")
+            .tint(.white).disabled(!model.seekable)
+            .accessibilityLabel("播放进度").accessibilityIdentifier("playbackProgressSlider")
             HStack {
                 Text(PlaybackPosition.label(controls.isScrubbing ? draftSeconds : model.seconds))
                 Spacer()
                 Text(PlaybackPosition.label(model.duration))
             }.font(.caption.monospacedDigit())
-            HStack(spacing: 16) {
+            // Five equally flexible cells: deletion is the geometrical middle
+            // cell in both portrait and landscape, no longer over the picture.
+            HStack(spacing: 0) {
                 Button { revealControls(); model.seek(to: model.seconds - 15) } label: {
-                    Image(systemName: "gobackward.15").frame(width: 44, height: 44)
+                    Image(systemName: "gobackward.15").frame(width: 44, height: 52)
                 }.disabled(!model.seekable).accessibilityLabel("后退15秒")
+                    .frame(minWidth: 0, maxWidth: .infinity)
                 Button { revealControls(); model.toggle() } label: {
                     Image(systemName: showsPause ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 40)).frame(width: 48, height: 48)
+                        .font(.system(size: 38)).frame(width: 44, height: 52)
                 }.disabled(model.phase == .failed || model.phase == .idle)
                     .accessibilityLabel(showsPause ? "暂停" : "播放")
                     .accessibilityIdentifier("togglePlaybackButton")
+                    .frame(minWidth: 0, maxWidth: .infinity)
+                transportDeleteButton.frame(minWidth: 0, maxWidth: .infinity)
                 Button { revealControls(); model.seek(to: model.seconds + 15) } label: {
-                    Image(systemName: "goforward.15").frame(width: 44, height: 44)
+                    Image(systemName: "goforward.15").frame(width: 44, height: 52)
                 }.disabled(!model.seekable).accessibilityLabel("前进15秒")
-                Spacer(minLength: 0)
+                    .frame(minWidth: 0, maxWidth: .infinity)
                 Button { controls.toggleFullscreen(at: now) } label: {
                     Image(systemName: controls.isFullscreen
                           ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                        .frame(width: 44, height: 44)
-                }
-                .accessibilityLabel(controls.isFullscreen ? "退出全屏" : "全屏播放")
-                .accessibilityValue(controls.isFullscreen ? "全屏" : "普通")
-                .accessibilityIdentifier("toggleFullscreenButton")
+                        .frame(width: 44, height: 52)
+                }.accessibilityLabel(controls.isFullscreen ? "退出全屏" : "全屏播放")
+                    .accessibilityValue(controls.isFullscreen ? "全屏" : "普通")
+                    .accessibilityIdentifier("toggleFullscreenButton")
+                    .frame(minWidth: 0, maxWidth: .infinity)
             }.font(.title2)
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 16).padding(.top, 20).padding(.bottom, 4)
+        .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 4)
         .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
+        // Shield empty gaps in the transport row from the picture's swipe layer.
+        .contentShape(Rectangle())
+        .onTapGesture { revealControls() }
         .accessibilityIdentifier("playbackTransportControls")
     }
-
-    private func revealControls() { controls.interacted(at: now) }
-    private func closePlayback() {
-        controls.stop()
-        model.close()
-        store.playbackDidClose(request)
+    private var transportDeleteButton: some View {
+        let queued = store.isPendingDeletion(request.key)
+        return Button {
+            revealControls()
+            if queued { store.unmarkForDeletion(request.key) }
+            else { store.markForDeletion(request.key) }
+        } label: {
+            VStack(spacing: 2) {
+                Image(systemName: queued ? "arrow.uturn.backward.circle" : "trash").font(.title2)
+                Text("\(queued ? "撤销" : "删除") \(store.pendingDeletionRecords.count)/\(VideoStore.deletionQueueLimit)")
+                    .font(.caption2.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.8)
+            }.frame(minWidth: 44, minHeight: 52)
+        }
+        .tint(.orange).foregroundStyle(.orange)
+        .accessibilityLabel(queued ? "撤销当前视频的待删除标记" : "将当前视频加入待删除队列")
+        .accessibilityIdentifier(queued ? "undoWatchDeleteButton" : "watchDeleteButton")
     }
+    private var playlistSheet: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text("本次打开时的全部本地视频，按本地列表顺序播放。上滑上一条，下滑下一条；已删除文件自动跳过。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                ForEach(playlist.entries) { record in
+                    Button {
+                        guard scenePhase == .active else { return }
+                        if playlist.select(record.id) { showsPlaylist = false }
+                    } label: {
+                        HStack {
+                            Image(systemName: record.id == request.key ? "play.fill" : "film")
+                            Text(record.video.name).lineLimit(2)
+                            Spacer(minLength: 4)
+                            if store.isPendingDeletion(record.id) { Image(systemName: "trash").foregroundStyle(.orange) }
+                        }.padding(.vertical, 4)
+                    }.accessibilityIdentifier("playlistItem_" + record.id)
+                }
+                if let notice = playlist.notice { Text(notice).font(.footnote).foregroundStyle(.secondary) }
+            }
+            .navigationTitle("本地播放列表")
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { showsPlaylist = false } } }
+        }
+    }
+    private func revealControls() { controls.interacted(at: now) }
+    private func closePlayback() { controls.stop(); playlist.close() }
 }

@@ -9,6 +9,7 @@ struct PlaybackControlsState {
     private(set) var isFullscreen = false
     private(set) var isPlaying = false
     private(set) var isScrubbing = false
+    private(set) var isNavigating = false
     private(set) var isSceneActive = true
     private(set) var voiceOverEnabled = false
     private(set) var isPresentingAlert = false
@@ -20,7 +21,7 @@ struct PlaybackControlsState {
     }
 
     private var canHide: Bool {
-        isPlaying && isSceneActive && !isScrubbing && !voiceOverEnabled && !isPresentingAlert
+        isPlaying && isSceneActive && !isScrubbing && !isNavigating && !voiceOverEnabled && !isPresentingAlert
     }
 
     mutating func interacted(at now: TimeInterval) {
@@ -49,6 +50,11 @@ struct PlaybackControlsState {
         interacted(at: now)
     }
 
+    mutating func setNavigating(_ value: Bool, at now: TimeInterval) {
+        isNavigating = value
+        interacted(at: now)
+    }
+
     mutating func toggleFullscreen(at now: TimeInterval) {
         isFullscreen.toggle()
         interacted(at: now)
@@ -56,7 +62,7 @@ struct PlaybackControlsState {
 
     mutating func setSceneActive(_ value: Bool, at now: TimeInterval) {
         isSceneActive = value
-        if !value { isScrubbing = false }
+        if !value { isScrubbing = false; isNavigating = false }
         interacted(at: now)
     }
 
@@ -82,5 +88,6 @@ struct PlaybackControlsState {
         isPlaying = false
         isSceneActive = false
         isScrubbing = false
+        isNavigating = false
     }
 }
