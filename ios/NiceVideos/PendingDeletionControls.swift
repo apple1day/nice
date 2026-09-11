@@ -1,35 +1,54 @@
 import SwiftUI
 
-// A small, explicit control at the center of the video. Marking does not stop
-// playback or delete this file immediately. Repeated taps cannot move its order.
+// Center overlay; the player owns visibility/timing, the store owns the queue.
+// Compact landscape controls leave room for the progress bar and fullscreen HUD.
 struct WatchDeleteButton: View {
     @EnvironmentObject private var store: VideoStore
     let videoID: String
+    var compact = false
+    var onInteraction: () -> Void = {}
     private var queued: Bool { store.isPendingDeletion(videoID) }
     var body: some View {
-        VStack(spacing: 8) {
-            Button { store.markForDeletion(videoID) } label: {
-                Label(queued ? "已待删除" : "删除", systemImage: queued ? "checkmark.circle" : "trash")
-                    .font(.headline).padding(.horizontal, 8).padding(.vertical, 4)
-            }
-            .buttonStyle(.borderedProminent).tint(.orange)
-            .disabled(queued)
-            .accessibilityLabel(queued ? "当前视频已加入待删除" : "将当前视频加入待删除队列")
-            .accessibilityIdentifier("watchDeleteButton")
-            Text("待删除 \(store.pendingDeletionRecords.count)/\(VideoStore.deletionQueueLimit)")
-                .font(.caption.monospacedDigit()).foregroundStyle(.white)
-            if queued {
-                Button("撤销待删除") { store.unmarkForDeletion(videoID) }
-                    .buttonStyle(.bordered).tint(.white)
-                    .accessibilityIdentifier("undoWatchDeleteButton")
+        Group {
+            if compact {
+                HStack(spacing: 12) {
+                    markButton
+                    Text("\(store.pendingDeletionRecords.count)/\(VideoStore.deletionQueueLimit)")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.white)
+                    if queued { undoButton }
+                }
             } else {
-                Text(store.pendingDeletionRecords.count >= VideoStore.deletionQueueLimit
-                     ? "加入后自动删除最早的一个" : "先加入队列，不立即删除")
-                    .font(.caption2).foregroundStyle(.white)
+                VStack(spacing: 8) {
+                    markButton
+                    Text("待删除 \(store.pendingDeletionRecords.count)/\(VideoStore.deletionQueueLimit)")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.white)
+                    if queued {
+                        undoButton
+                    } else {
+                        Text(store.pendingDeletionRecords.count >= VideoStore.deletionQueueLimit
+                             ? "加入后自动删除最早的一个" : "先加入队列，不立即删除")
+                            .font(.caption2).foregroundStyle(.white)
+                    }
+                }
             }
         }
-        .padding(12)
+        .padding(compact ? 8 : 12)
         .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 16))
+    }
+    private var markButton: some View {
+        Button { onInteraction(); store.markForDeletion(videoID) } label: {
+            Label(queued ? "已待删除" : "删除", systemImage: queued ? "checkmark.circle" : "trash")
+                .font(.headline).padding(.horizontal, 8).padding(.vertical, 4)
+        }
+        .buttonStyle(.borderedProminent).tint(.orange)
+        .disabled(queued)
+        .accessibilityLabel(queued ? "当前视频已加入待删除" : "将当前视频加入待删除队列")
+        .accessibilityIdentifier("watchDeleteButton")
+    }
+    private var undoButton: some View {
+        Button("撤销待删除") { onInteraction(); store.unmarkForDeletion(videoID) }
+            .buttonStyle(.bordered).tint(.white)
+            .accessibilityIdentifier("undoWatchDeleteButton")
     }
 }
 

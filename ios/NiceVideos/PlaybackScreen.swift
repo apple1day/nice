@@ -180,78 +180,183 @@ struct PlaybackScreen: View {
     @EnvironmentObject private var store: VideoStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @StateObject private var model: PlaybackModel
-    @State private var scrubbing = false
+    @State private var controls = PlaybackControlsState()
     @State private var draftSeconds: Double = 0
     private let request: PlaybackRequest
+    private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+    private var hasMessage: Bool { store.errorMessage != nil || model.message != nil }
+    private var showsPause: Bool { model.phase == .playing || model.phase == .opening }
+
     init(request: PlaybackRequest) {
         self.request = request
         _model = StateObject(wrappedValue: PlaybackModel(request: request))
     }
+
     var body: some View {
         NavigationStack {
-            VStack(spacing: 12) {
-                VLCVideoSurface(model: model)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .accessibilityIdentifier("offlineVideoSurface")
-                    .overlay(alignment: .center) { WatchDeleteButton(videoID: request.key) }
-                if model.phase == .opening { ProgressView("打开本地文件…") }
-                if let notice = store.deletionNotice {
-                    Text(notice).font(.caption).foregroundStyle(.secondary).padding(.horizontal)
+            GeometryReader { geometry in
+                // Keep ONE drawable at the same structural position. Fullscreen and
+                // auto-hide only change layout/overlays: never close or reload VLC.
+                ZStack {
+                    Color.black.ignoresSafeArea()
+                    VLCVideoSurface(model: model)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .ignoresSafeArea(.container, edges: controls.isFullscreen ? .all : [])
+                        .allowsHitTesting(false)
+                        .accessibilityIdentifier("offlineVideoSurface")
+                    // Sibling below the controls, not a parent gesture: pressing a
+                    // button/dragging the slider cannot also toggle the whole HUD.
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { controls.surfaceTapped(at: now) }
+                    } label: {
+                        Rectangle().fill(Color.clear).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(controls.isVisible ? "隐藏播放控制" : "显示播放控制")
+                    .accessibilityIdentifier("playbackSurfaceToggle")
+                    WatchDeleteButton(videoID: request.key, compact: geometry.size.height < 420,
+                                      onInteraction: revealControls)
+                        .opacity(controls.isVisible ? 1 : 0)
+                        .allowsHitTesting(controls.isVisible)
+                        .accessibilityHidden(!controls.isVisible)
                 }
-                if let message = model.message {
-                    Text(message).font(.footnote).foregroundStyle(.red).padding(.horizontal)
+                .overlay(alignment: .top) {
+                    if controls.isFullscreen {
+                        fullscreenHeader
+                            .opacity(controls.isVisible ? 1 : 0)
+                            .allowsHitTesting(controls.isVisible)
+                            .accessibilityHidden(!controls.isVisible)
+                    }
                 }
-                VStack(spacing: 10) {
-                    Slider(value: Binding(
-                        get: { scrubbing ? draftSeconds : model.seconds },
-                        set: { draftSeconds = $0 }
-                    ), in: 0...max(1, model.duration), onEditingChanged: { editing in
-                        if editing { draftSeconds = model.seconds }
-                        else { model.seek(to: draftSeconds) }
-                        scrubbing = editing
-                    })
-                    .disabled(!model.seekable)
-                    .accessibilityLabel("播放进度")
-                    HStack {
-                        Text(PlaybackPosition.label(scrubbing ? draftSeconds : model.seconds))
-                        Spacer()
-                        Text(PlaybackPosition.label(model.duration))
-                    }.font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    HStack(spacing: 44) {
-                        Button { model.seek(to: model.seconds - 15) } label: { Image(systemName: "gobackward.15") }
-                            .disabled(!model.seekable).accessibilityLabel("后退15秒")
-                        Button { model.toggle() } label: {
-                            Image(systemName: model.phase == .playing ? "pause.circle.fill" : "play.circle.fill")
-                                .font(.system(size: 44))
-                        }.disabled(model.phase == .failed || model.phase == .idle)
-                            .accessibilityLabel(model.phase == .playing ? "暂停" : "播放")
-                        Button { model.seek(to: model.seconds + 15) } label: { Image(systemName: "goforward.15") }
-                            .disabled(!model.seekable).accessibilityLabel("前进15秒")
-                    }.font(.title2)
-                    Text("手机本地文件 · VLC · 不使用在线播放")
-                        .font(.caption).foregroundStyle(.secondary)
-                }.padding([.horizontal, .bottom])
+                .overlay(alignment: .bottom) {
+                    transportControls
+                        .opacity(controls.isVisible ? 1 : 0)
+                        .allowsHitTesting(controls.isVisible)
+                        .accessibilityHidden(!controls.isVisible)
+                }
             }
+            .background(.black)
             .navigationTitle(request.title)
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar(controls.isFullscreen ? .hidden : .visible, for: .navigationBar)
+            .toolbarBackground(.black, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("关闭") { closePlayback(); dismiss() }
                 }
             }
         }
+        .preferredColorScheme(.dark)
+        .statusBarHidden(controls.isFullscreen)
+        .persistentSystemOverlays(controls.isFullscreen && !controls.isVisible ? .hidden : .automatic)
         .alert("操作提示", isPresented: Binding(
             get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } }
         )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
         message: { Text(store.errorMessage ?? "") }
-        .onChange(of: scenePhase) { _, phase in
-            // No hidden audio/background video: resuming is an explicit user action.
+        .onChange(of: model.phase, initial: true) { _, phase in
+            controls.setPlaying(phase == .playing, at: now)
+        }
+        .onChange(of: hasMessage, initial: true) { _, value in
+            controls.setPresentingAlert(value, at: now)
+        }
+        .onChange(of: voiceOverEnabled, initial: true) { _, value in
+            controls.setVoiceOverEnabled(value, at: now)
+        }
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            controls.setSceneActive(phase == .active, at: now)
+            // No hidden audio/background video: resuming is an explicit action.
             if phase != .active { model.pause() }
+        }
+        .task(id: controls.hideDeadline) {
+            guard let deadline = controls.hideDeadline else { return }
+            let delay = min(60, max(0, deadline - now))
+            do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                controls.hideIfDue(at: now, deadline: deadline)
+            }
         }
         .onDisappear { closePlayback() }
     }
+
+    private var fullscreenHeader: some View {
+        HStack(spacing: 12) {
+            Text(request.title).font(.headline).lineLimit(1)
+            Spacer(minLength: 4)
+            Button { closePlayback(); dismiss() } label: {
+                Image(systemName: "xmark").frame(width: 44, height: 44)
+            }.accessibilityLabel("关闭播放器").accessibilityIdentifier("closeFullscreenPlayer")
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 16)
+        .background(LinearGradient(colors: [.black.opacity(0.8), .clear], startPoint: .top, endPoint: .bottom))
+    }
+
+    private var transportControls: some View {
+        VStack(spacing: 4) {
+            if model.phase == .opening {
+                ProgressView("打开本地文件…").tint(.white).font(.caption)
+            }
+            if let message = model.message {
+                Text(message).font(.caption).foregroundStyle(.red).lineLimit(3)
+            }
+            if let notice = store.deletionNotice {
+                Text(notice).font(.caption2).lineLimit(2)
+            }
+            Slider(value: Binding(
+                get: { min(max(0, controls.isScrubbing ? draftSeconds : model.seconds), max(1, model.duration)) },
+                set: { draftSeconds = $0 }
+            ), in: 0...max(1, model.duration), onEditingChanged: { editing in
+                if editing { draftSeconds = model.seconds }
+                else { model.seek(to: draftSeconds) }
+                controls.setScrubbing(editing, at: now)
+            })
+            .tint(.white)
+            .disabled(!model.seekable)
+            .accessibilityLabel("播放进度")
+            .accessibilityIdentifier("playbackProgressSlider")
+            HStack {
+                Text(PlaybackPosition.label(controls.isScrubbing ? draftSeconds : model.seconds))
+                Spacer()
+                Text(PlaybackPosition.label(model.duration))
+            }.font(.caption.monospacedDigit())
+            HStack(spacing: 16) {
+                Button { revealControls(); model.seek(to: model.seconds - 15) } label: {
+                    Image(systemName: "gobackward.15").frame(width: 44, height: 44)
+                }.disabled(!model.seekable).accessibilityLabel("后退15秒")
+                Button { revealControls(); model.toggle() } label: {
+                    Image(systemName: showsPause ? "pause.circle.fill" : "play.circle.fill")
+                        .font(.system(size: 40)).frame(width: 48, height: 48)
+                }.disabled(model.phase == .failed || model.phase == .idle)
+                    .accessibilityLabel(showsPause ? "暂停" : "播放")
+                    .accessibilityIdentifier("togglePlaybackButton")
+                Button { revealControls(); model.seek(to: model.seconds + 15) } label: {
+                    Image(systemName: "goforward.15").frame(width: 44, height: 44)
+                }.disabled(!model.seekable).accessibilityLabel("前进15秒")
+                Spacer(minLength: 0)
+                Button { controls.toggleFullscreen(at: now) } label: {
+                    Image(systemName: controls.isFullscreen
+                          ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel(controls.isFullscreen ? "退出全屏" : "全屏播放")
+                .accessibilityValue(controls.isFullscreen ? "全屏" : "普通")
+                .accessibilityIdentifier("toggleFullscreenButton")
+            }.font(.title2)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 16).padding(.top, 20).padding(.bottom, 4)
+        .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
+        .accessibilityIdentifier("playbackTransportControls")
+    }
+
+    private func revealControls() { controls.interacted(at: now) }
     private func closePlayback() {
+        controls.stop()
         model.close()
         store.playbackDidClose(request)
     }

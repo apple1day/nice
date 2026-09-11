@@ -22,6 +22,8 @@ jobs:
         run: python3 -m unittest discover -s ios/tools -p 'test_*.py' -v
       - name: Test recoverable local file deletion
         run: bash ios/check-watch-delete.sh
+      - name: Test fullscreen controls and auto-hide timing
+        run: bash ios/check-player-controls.sh
       - name: Compile app and run offline policy, lifecycle, watch-delete and VLC decode tests
         run: |
           bash ios/test.sh > ios/xcode-tests.log 2>&1 || { tail -n 140 ios/xcode-tests.log; exit 1; }
