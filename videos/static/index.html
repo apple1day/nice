@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>视频播放与下载站</title>
+  <link rel="stylesheet" href="/style.css?v=20260909b" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▶</span>
+      <h1>视频播放与下载站</h1>
+    </div>
+    <div class="tabs">
+      <button class="tab active" id="tabLibrary">视频库</button>
+      <button class="tab" id="tabWatch">观看</button>
+    </div>
+    <div class="actions">
+      <label class="btn btn-primary">
+        上传视频
+        <input type="file" id="uploadInput" accept="video/*" multiple hidden />
+      </label>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- 视频库视图 -->
+    <section id="viewLibrary">
+      <section id="player" class="player hidden">
+        <div class="player-header">
+          <h2 id="playerTitle"></h2>
+          <button class="btn btn-ghost" id="closePlayer">关闭</button>
+        </div>
+        <video id="videoEl" controls></video>
+      </section>
+
+      <div class="toolbar">
+        <h2>视频库</h2>
+        <div class="toolbar-right">
+          <input type="search" id="search" placeholder="搜索视频名称…" />
+          <button class="btn btn-primary" id="downloadAllBtn">一键下载全部</button>
+        </div>
+      </div>
+
+      <div id="grid" class="grid"></div>
+      <p id="empty" class="empty hidden">暂无视频，点击右上角上传吧。</p>
+    </section>
+
+    <!-- 观看视图 -->
+    <section id="viewWatch" class="hidden">
+      <div class="watch-layout">
+        <aside class="watch-side" id="watchSide">
+          <div class="watch-side-head">
+            <span>播放列表</span>
+            <button class="btn btn-ghost btn-sm" id="collapseSide">收起 ›</button>
+          </div>
+          <ul id="watchList" class="watch-list"></ul>
+        </aside>
+        <div class="watch-main">
+          <div class="watch-player-head">
+            <h2 id="watchTitle" class="watch-title"></h2>
+            <div class="watch-player-actions">
+              <button class="btn btn-ghost" id="nextBtn">下一个 ▾</button>
+              <button class="btn btn-danger" id="watchDelete">删除</button>
+            </div>
+          </div>
+          <video id="watchVideo" class="watch-video" controls></video>
+          <p class="watch-hint">上滑 / 滚轮向下 / 方向键 ↓ 播放下一个</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/app.js?v=20260909b"></script>
+</body>
+</html>
