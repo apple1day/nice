@@ -1,4 +1,4 @@
-name: iOS native app
+name: iOS native offline VLC app
 on:
   pull_request:
     paths:
@@ -10,10 +10,24 @@ permissions:
 jobs:
   test:
     runs-on: macos-15
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install XcodeGen
-        run: command -v xcodegen >/dev/null || brew install xcodegen
-      - name: Build and run unit tests
+      - name: Install build and fixture tools
+        run: |
+          for tool in xcodegen cocoapods ffmpeg; do
+            brew list "$tool" >/dev/null 2>&1 || brew install "$tool"
+          done
+      - name: Compile app and run offline policy, lifecycle and VLC decode tests
         run: bash ios/test.sh
+      - name: Show resolved dependency lock
+        if: always()
+        run: cat ios/Podfile.lock 2>/dev/null || true
+      - name: Save test results and dependency lock
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: |
+            ios/DerivedData/Logs/Test/*.xcresult
+            ios/Podfile.lock

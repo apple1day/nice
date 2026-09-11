@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-command -v xcodegen >/dev/null || { echo '请先执行 brew install xcodegen'; exit 1; }
-xcodegen generate
+bash Tests/generate-fixtures.sh
+bash setup.sh
 DEVICE_ID="${DEVICE_ID:-$(xcrun simctl list devices available -j | python3 -c '
 import json, sys
 for devices in json.load(sys.stdin)["devices"].values():
@@ -10,9 +10,9 @@ for devices in json.load(sys.stdin)["devices"].values():
         if device.get("isAvailable") and "iPhone" in device["name"]:
             print(device["udid"])
             sys.exit(0)
-sys.exit("没有可用 iPhone 模拟器，请在 Xcode 中安装 iOS Simulator runtime")
+sys.exit("请在 Xcode 中安装一个 iPhone 模拟器 runtime")
 ')}"
-xcodebuild -project NiceVideos.xcodeproj -scheme NiceVideos \
+xcodebuild -workspace NiceVideos.xcworkspace -scheme NiceVideos \
   -destination "platform=iOS Simulator,id=$DEVICE_ID" \
   -derivedDataPath "${DERIVED_DATA_PATH:-./DerivedData}" \
-  CODE_SIGNING_ALLOWED=NO test
+  -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO test

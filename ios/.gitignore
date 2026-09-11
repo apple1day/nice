@@ -1,4 +1,10 @@
 NiceVideos.xcodeproj/
+NiceVideos.xcworkspace/
+Pods/
 DerivedData/
 *.xcresult
 .DS_Store
+Tests/Fixtures/*.mp4
+Tests/Fixtures/*.mkv
+Licenses/MobileVLCKit-COPYING.txt
+Licenses/Acknowledgements.txt

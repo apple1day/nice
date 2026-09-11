@@ -25,9 +25,8 @@
     <string>UIInterfaceOrientationLandscapeLeft</string>
     <string>UIInterfaceOrientationLandscapeRight</string>
   </array>
-  <key>UIBackgroundModes</key><array><string>audio</string></array>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>连接你自己的局域网视频服务器，获取视频列表、在线播放和下载到本机。</string>
+  <string>连接你自己的局域网视频服务器，获取视频列表并下载到本机。播放本地文件无需联网。</string>
   <key>NSAppTransportSecurity</key><dict>
     <key>NSAllowsLocalNetworking</key><true/>
     <key>NSExceptionDomains</key><dict>

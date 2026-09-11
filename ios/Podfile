@@ -1,0 +1,11 @@
+platform :ios, '17.0'
+use_frameworks!
+install! 'cocoapods', :deterministic_uuids => true
+
+# Official production build; no 4.0 development snapshot or floating version.
+target 'NiceVideos' do
+  pod 'MobileVLCKit', '3.7.3'
+  target 'NiceVideosTests' do
+    inherit! :search_paths
+  end
+end

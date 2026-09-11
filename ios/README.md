@@ -1,103 +1,111 @@
-# Nice 视频：原生 iOS 离线客户端
+# Nice 视频 — VLC 原生离线版
 
-这是 `videos/` Go 服务的 SwiftUI + AVPlayer 客户端，不是 WebView，不需要 Jellyfin、Node、数据库或第三方播放器运行时。
+SwiftUI + **MobileVLCKit 3.7.3**，对接仓库 `videos/` 的列表和下载 API。
+**不提供在线播放：先下载完整文件，再播放手机里的真实文件。** 不使用 WebView，不需要 Jellyfin。
 
-**交付状态：第一版实现，需通过 macOS/Xcode 编译及真机验收后再合并。生成代码的环境没有 Xcode，不能把源码提交等同于已通过真机测试。** PR 配有 macOS CI，实际结果以 Actions 为准。
-
-## 快速运行
-
-要求：Mac、Xcode 15 或更高版本、iOS 17+。只需安装一次构建工具 XcodeGen（它不进入 App）：
+## 在 Mac 上运行
 
 ```bash
-brew install xcodegen
-cd ios
-xcodegen generate
-open NiceVideos.xcodeproj
+# 在仓库根目录
+brew install xcodegen cocoapods
+bash ios/setup.sh
+open ios/NiceVideos.xcworkspace
 ```
 
-在 Xcode 选择 `NiceVideos` target → Signing & Capabilities → 选择自己的 Team。Bundle Identifier 默认 `com.anxiong.nicevideos`，有冲突时改成自己的唯一标识。本工程没有 Widget extension。
+要求：Xcode 15+、iOS 17+。安装依赖需要外网；App 播放本地文件不需要外网。
 
-选择 iPhone 真机后运行；首次访问局域网需要授权。在「设置」填 `http://你的Mac局域网IP:8106`。**真机不能填 localhost/127.0.0.1，那指的是手机自己。** 服务器根路径部署，暂不支持反向代理路径前缀。公网应使用 HTTPS。
+**CocoaPods 接入后必须打开 `.xcworkspace`，不再使用 `.xcodeproj` 运行。**
+在 `NiceVideos` target 的 Signing & Capabilities 选择自己的 Team。默认 Bundle Identifier 仍是
+`com.anxiong.nicevideos`，与第一版保持一致。已安装旧版时不要卸载；保持原标识和签名更新，
+旧的 Media 文件、v1 下载索引、`position.<id>` 播放位置会继续使用。
+若以前改过标识或 Team，应在 `project.yml` 保留相同配置，避免重新生成工程后变回默认值。
 
-后端在仓库根目录启动：
+App 默认打开「本地」。首次下载：设置 → `http://192.168.19.70:8106` → 保存并读取 → 服务器 → 下载。
+地址只是用户当前局域网示例，可修改；真机不要填 localhost。允许系统首次提示的局域网权限。
+后端仍然这样运行，无需改接口：
 
 ```bash
 cd videos
-VIDEO_DIR="/Users/even/mine/some" PORT=8106 go run .
+PORT=8106 go run .
 ```
 
-Mac 和 iPhone 处于相互可达的局域网，允许 Go 进程通过防火墙。先在手机 Safari 打开 `http://Mac的IP:8106/api/videos` 排除网络问题。代码默认端口是 8106；旧 `videos/README.md` 的 8080 表格和 ollama 目录名已过时。
+## 行为与边界
 
-## 已实现的行为
+- 只有用户主动保存服务器或点击刷新才请求 `/api/videos`；冷启动不刷新、不检测登录或网络。
+- 下载使用 API 返回的 `/api/download/...`，单个文件独立任务；批量下载不使用 ZIP。
+- 不创建 `/api/stream/...` 播放请求。服务器返回的 `url` 仅为 API 兼容保留，不参与播放。
+- 本地页独立于服务器设置/缓存/下载任务恢复，断网启动也能进入。
+- 请求构造、下载索引和 VLC 入口分别检查本地文件；文件缺失时明确报错，绝不回退网络。
+- HTTP 状态、响应类型、文件大小检查通过后同步移动到 Application Support，再原子保存索引。
+  下载的错误文本和常见伪装播放清单会被拒绝。大小与头部检查不等于完整解码或密码学校验。
+- VLC 提供播放/暂停、进度条、前后 15 秒；位置定期保存，关闭/暂停时保存，播完清除旧位置。
+- 全屏页面支持系统横竖屏；锁屏/切后台/来电/拔出耳机时暂停，返回不自动发声。
+- 重复视图更新不会重复启动；关闭时停止原生输出、解除 drawable/delegate，并丢弃晚到事件。
+- 默认禁止新下载使用蜂窝数据，可在设置打开。已有任务的网络策略需取消重试后才改变。
 
-- 原生视频列表、搜索、刷新、按服务器保存列表缓存。
-- 使用 `/api/stream/{name}` 在线播放；有本地副本时优先播放真实 `file://` 文件。
-- 使用 `/api/download/{name}` 单独下载；“全部下载”创建独立后台任务，跳过已完成/进行中的任务，不下载 ZIP。
-- 系统后台 URLSession、任务恢复、进度、取消、失败后重新下载；默认禁用新下载的蜂窝数据，可在设置开启。
-- 独立“本地”页面，不要求先请求服务器、检查登录或联网成功；服务器关闭/删除文件后，本地副本仍能使用。
-- 下载索引原子写入；文件保存于 Application Support/Media，排除备份，不使用可被系统清理的缓存目录。
-- 下载完成校验 HTTP 状态、非错误文本/清单响应、实际文件大小，再移动到持久目录；不是把错误页面保存成 MP4。
-- 中文、空格、加号、百分号等使用后端已有编码，避免重复编码；跨服务器同名文件隔离。
-- 播放进度每 5 秒及关闭时保存；本地删除仅删除手机副本，不调用服务器 DELETE API。
-- 原生播放器控制、横竖屏和画中画能力；具体设备行为需要真机验证。
+当前允许下载 MP4/M4V/MOV/MKV/AVI/WebM/OGG/FLV/WMV/TS 完整文件；容器白名单不保证所有编码、
+配置档次、码率或损坏文件可播放。HLS/DASH、M3U/PLS 等清单不支持离线下载，也不提供在线回退。
+没有实现外部字幕下载/音轨字幕选择、倍速、画中画、后台音频、断点续传、空间配额。
+失败/取消后重试是重新完整下载；iOS 手动上划强退会中止后台传输，不承诺强退后继续下载。
 
-## 明确限制
+## 固定依赖与许可证
 
-1. 当前离线下载支持 MP4、M4V、MOV **容器**；里面的音视频编码仍须 AVPlayer/设备支持。推荐先用常见 H.264 + AAC MP4 验收。MKV、AVI、WMV、FLV、WebM 等本版不下载、不承诺播放；需要时单独评估 VLCKit/其他解码器，不能仅按扩展名假定可播。
-2. HLS `.m3u8` 仅尝试在线播放，不支持离线下载。HLS 的正确离线实现是 AVAssetDownloadURLSession 并保存所有资源，不是下载一个清单。现有 Go 服务按 URL 的文件名查文件，带相对子路径的 HLS 清单也可能无法在线正常工作。
-3. 取消、失败重试从头下载；本版没有实现 resumeData 持久化/断点续传。正常系统挂起时后台任务交给 iOS；用户上划强退会取消后台传输，重新启动后可重试。不能承诺强退后仍然下载。
-4. `httpMaximumConnectionsPerHost = 2` 是连接设置，不保证 HTTP/2 下严格只有两个下载。下载调度由系统控制，不实现只依赖前台进程运行的串行队列。
-5. 文件大小检查不是密码学内容校验。后端没有 stable ID、mtime/version、SHA256。现用“服务器 + 文件名 + 文件大小”建立本地 ID；同名同大小替换无法自动检测。后续建议后端提供 ID/version/hash。
-6. 尚未实现字幕下载、封面生成、存储配额/预留空间检查、自动重试退避、批量删除、Android、远程登录/鉴权和 App Store 发布素材。
-7. 后端当前没有鉴权，且上传/删除接口可直接访问；仅用于可信局域网。客户端不会修复后端的公网安全问题。
+`Podfile` 指定 `MobileVLCKit = 3.7.3`，使用官方生产发行包，不跟随 4.0 开发分支。
+CocoaPods 发布 spec 的 SHA256 校验值为：
 
-## 文件与 API
+```
+0d04059906962ddc9a7bd1ebaa12e1f9ae85eb2466116a97a2f46886dd27a0a9
+```
 
-| 文件 | 职责 |
-|---|---|
-| `NiceVideos/Core.swift` | API 模型、URL 解析、本地索引、文件验证/存储 |
-| `NiceVideos/VideoStore.swift` | 列表缓存、后台任务、恢复、下载/播放状态 |
-| `NiceVideos/Views.swift` | 视频/本地/下载/设置四个页面 |
-| `NiceVideos/PlaybackScreen.swift` | 原生播放与进度保存 |
-| `NiceVideos/NiceVideosApp.swift` | App 入口、系统后台回调 |
-| `Tests/CoreTests.swift` | URL、API、文件完整性、离线索引等单元测试 |
-| `project.yml` | 可重复生成 Xcode 工程的配置 |
+`setup.sh` 安装依赖后复制实际 COPYING 和 CocoaPods acknowledgements，随 App 打包，
+可在「设置 → 开源组件与许可证」离线查看。依赖解析记录见 `Podfile.lock` 和 CI artifact。
 
-列表响应必须是 `{"videos":[...]}`，不是裸数组；字段使用 `name/size/contentType/url/downloadUrl`。后端 `downloaded` 只表示服务器的下载历史，**客户端故意不把它映射成本机已下载**。本版不需要修改后端 API。
+这是使用 VLC 内核的自定义界面，没有复制 VLC for iOS 应用代码。发布前仍须完成 LGPL 及底层依赖的
+源码提供/重链接等适用合规要求；带上通知并不自动满足全部发布条件。此交付不是 App Store 发布包。
 
-## 自动化测试
+## 测试
 
 ```bash
-bash ios/test.sh  # 在仓库根目录执行
-# 或指定已经安装的模拟器 UUID
-DEVICE_ID="你的模拟器UUID" bash ios/test.sh
+# 核心离线策略测试：Mac/Linux 都可运行（需要 Swift）
+bash ios/check-policy.sh
+
+# Xcode 编译、单元测试、真实 VLC 本地解码测试：Mac
+brew install ffmpeg
+bash ios/test.sh
+# 可指定模拟器
+DEVICE_ID="模拟器UUID" bash ios/test.sh
 ```
 
-测试覆盖实际 API envelope、空列表、URL 规范化、拒绝非根地址/凭据地址、特殊文件名、拒绝异源 endpoint、服务器隔离、格式策略、HTTP/HTML/HLS/截断文件拒绝、本地索引重载、缺失文件、损坏索引保留、重试 attempt 隔离。
+测试前本地生成 3 秒的 H.264/AAC MP4 与 MPEG-4 Part 2/AAC MKV 合成样片，
+无网络视频、无用户视频。样片仅进入测试包，不进入正式 App。
 
-这些测试不是后台下载端到端测试，也不能证明所有设备/编码都能播放。合并前必须进行以下验收：
+- `CoreTests`：API/URL 编码、服务器隔离、格式清单、HTTP/文件验证、v1 索引重载、
+  拒绝远程播放地址、缺失文件/符号链接/伪装清单、无服务器配置/不可达服务器下本地播放。
+- `PlaybackModelTests`：重复挂载、延迟续播、首次出画面前关闭、暂停保存、重复关闭与晚到事件、
+  播完重播、非法/越界拖动。
+- `VLCDecodeTests`：直接使用固定版本的真实 VLC 内核，在模拟器窗口中解码本地 MP4/MKV，
+  验证 `hasVideoOut` 且播放时间前进；再次验证引擎拒绝 HTTP 地址。
 
-| 场景 | 预期 |
+这些测试不等于物理设备端到端验收，尤其不能证明所有编码、音频输出、锁屏和后台下载都正常。
+源码生成环境没有 Xcode/iOS SDK；编译/测试实际状态以该提交的 macOS CI 为准。PR 保持草稿。
+
+## 合并前真机验收
+
+| 场景 | 必须达到的结果 |
 |---|---|
-| 真机第一次连接 Mac API | 请求局域网权限，显示列表 |
-| 下载一个 H.264/AAC MP4 | 进度完成，本地页面出现记录 |
-| 飞行模式，关闭 Wi-Fi，再强退/重启 App | 不依赖服务器，可进入本地页播放和拖动 |
-| 下载后关闭 Go 服务、删除服务器原视频 | 本地副本仍能播放 |
-| 服务器历史显示 downloaded=true，但手机未下载 | 不得显示“已在本机” |
-| 大文件下载时锁屏、正常切后台 | 观察系统调度与完成后的索引落盘 |
-| 下载途中手动上划强退 | 重新启动后可以识别中断并重试，不伪装完成 |
-| 同时取消、立即重试 | 旧任务回调不能覆盖新 attempt 的状态 |
-| 手机存储不足/404/HTML错误页/文件被替换 | 明确失败，不出现在本地可播放列表 |
-| 切换另一服务器，同名视频 | 下载隔离，原本地副本仍在 |
-| 手机删除本地副本 | 服务器原文件不受影响 |
+| 下载真实 MP4、MKV，检查画面与声音 | 本地文件可播放，拖动进度正常 |
+| 飞行模式并关闭 Wi-Fi → 强退 → 冷启动 | 立即进入本地页，可播放已下载文件 |
+| 关闭 Go 服务/删除服务器原文件/清空服务器设置 | 手机原副本仍可播放 |
+| 连续打开、关闭、切换视频 | 旧视频声音和播放资源不残留 |
+| 播放中锁屏、来电、拔出耳机 | 暂停，返回后用户手动继续 |
+| 下载中断/空间不足/同名文件变更/HTML错误页 | 明确失败，不伪装完整下载 |
+| 安装前一版并下载，再覆盖安装新版 | 原下载和进度保留（不卸载，不改变 Bundle ID） |
+| 删除手机副本 | 不向服务器发送删除请求 |
 
-## 后端下一步建议（本次未修改）
+## 主要文件
 
-优先增加稳定 ID、修改时间/版本、校验值和鉴权；文件上传改为临时文件完成后原子重命名，避免播放器/下载器读取半成品。`downloaded` 应改名为更准确的历史指标，或由客户端完成后回报记录，但本机离线状态永远由本机维护。还应检查 symlink 路径逃逸、上传体积限制、覆盖同名文件、HEAD 请求误记下载等问题。
+`OfflineMediaPolicy.swift` 是无框架依赖的本地播放边界；`Core.swift` 保存原有数据协议和索引；
+`VideoStore.swift` 只负责列表、下载和本地请求；`VLCPlaybackEngine.swift` 封装固定版本 VLC；
+`PlaybackScreen.swift` 管理播放状态/生命周期；`Views.swift` 默认展示本地库。
 
-参考：
-- Apple background downloads: https://developer.apple.com/documentation/foundation/downloading-files-in-the-background
-- Apple force-quit limitation: https://developer.apple.com/documentation/foundation/urlsessionconfiguration/background(withidentifier:)
-- Apple ATS/local networking: https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity/nsallowslocalnetworking
-- XcodeGen: https://github.com/yonaskolb/XcodeGen
-- VLC iOS: https://github.com/videolan/vlc-ios
+服务器仍无鉴权，不要把 8106 直接暴露公网。后端没有稳定版本/hash，同名同大小替换无法自动检测。

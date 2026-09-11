@@ -9,8 +9,8 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     TARGETED_DEVICE_FAMILY: "1,2"
     CODE_SIGN_STYLE: Automatic
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "2"
 targets:
   NiceVideos:
     type: application
@@ -19,6 +19,8 @@ targets:
       - path: NiceVideos
         excludes:
           - Info.plist
+      - path: Licenses
+        type: folder
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anxiong.nicevideos
@@ -29,7 +31,12 @@ targets:
     type: bundle.unit-test
     platform: iOS
     sources:
-      - Tests
+      - path: Tests
+        excludes:
+          - Fixtures
+          - '*.sh'
+      - path: Tests/Fixtures
+        type: folder
     dependencies:
       - target: NiceVideos
     settings:
