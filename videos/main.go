@@ -51,7 +51,9 @@ var videoExts = map[string]string{
 }
 
 func init() {
-	videoDir = getEnv("VIDEO_DIR", "/Users/even/mine/some")
+	loadDotEnv() // 先加载 .env 文件，再读取环境变量
+	// /Users/even/mine/down  测试用目录
+	videoDir = getEnv("VIDEO_DIR", "/Users/even/mine/down")
 	staticDir = getEnv("STATIC_DIR", "./static")
 	dataDir = getEnv("DATA_DIR", "./data")
 	port = getEnv("PORT", "8106")
@@ -62,6 +64,30 @@ func init() {
 		}
 	}
 	loadDownloadRecords()
+}
+
+// loadDotEnv 加载可执行目录下的 .env 文件（KEY=VALUE 格式，# 开头为注释）。
+// 已存在的环境变量优先，不会被 .env 覆盖。
+func loadDotEnv() {
+	b, err := os.ReadFile(".env")
+	if err != nil {
+		return // 没有 .env 就直接用系统环境变量/默认值
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.Trim(strings.TrimSpace(v), `"'`) // 去掉值两边可能的引号
+		if k != "" && os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
 }
 
 func getEnv(key, def string) string {
