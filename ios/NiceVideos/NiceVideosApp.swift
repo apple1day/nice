@@ -15,6 +15,6 @@ struct NiceVideosApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var store = VideoStore.shared
     var body: some Scene {
-        WindowGroup { RootView().environmentObject(store) }
+        WindowGroup { UpdatedRootView().environmentObject(store) }
     }
 }
