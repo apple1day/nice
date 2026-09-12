@@ -7,6 +7,10 @@ for tool in xcodegen pod python3; do
 done
 xcodebuild -version >/dev/null
 printf '%s\n' '请先保存并关闭此工程的 Xcode 窗口，避免旧窗口写回旧工程配置。'
+# Keep the approved artwork in Git; render an opaque PNG before XcodeGen scans assets.
+# Native macOS ImageIO is used, so no Pillow/Homebrew image package is required.
+xcrun swift tools/render_app_icon.swift Branding/nice-logo.webp \
+  NiceVideos/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png
 # Git ignores generated projects: pulling new Swift files does not update target
 # membership. Always regenerate, preserving locally edited signing beforehand.
 spec="$(python3 -c 'import tempfile; f = tempfile.NamedTemporaryFile(dir=".", prefix=".project-setup-", suffix=".json", delete=False); print(f.name); f.close()')"
@@ -22,5 +26,5 @@ license="Pods/MobileVLCKit/COPYING.txt"
 cp "$license" Licenses/MobileVLCKit-COPYING.txt
 cp 'Pods/Target Support Files/Pods-NiceVideos/Pods-NiceVideos-acknowledgements.markdown' Licenses/Acknowledgements.txt
 python3 tools/project_doctor.py check
-printf '%s\n' '工程及依赖已更新。请打开 ios/NiceVideos.xcworkspace（不是 .xcodeproj）。' \
+printf '%s\n' '工程、App 图标及依赖已更新。请打开 ios/NiceVideos.xcworkspace（不是 .xcodeproj）。' \
   '原签名设置已保留；其他自定义构建设置应写入 project.yml，旧工程备份位于 ios/.project-backups。'

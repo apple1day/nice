@@ -13,3 +13,5 @@ Licenses/Acknowledgements.txt
 tools/__pycache__/
 DerivedData-device/
 xcode-tests.log
+# Generated from the committed Branding/nice-logo.webp by setup.sh.
+NiceVideos/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png
