@@ -433,3 +433,46 @@ extension VideoStore {
         return warning
     }
 }
+
+extension VideoStore {
+    // Keep on the same main queue as URLSession delegates. Each removal reuses
+    // the recoverable file/index transaction and only cancels a task AFTER the
+    // manifest commit. A failed commit leaves its task, file and bookmark intact.
+    @discardableResult func removeBatch(_ request: BatchRemovalRequest) -> BatchRemovalResult {
+        precondition(Thread.isMainThread)
+        var result = BatchRemovalResult()
+        guard !request.records.isEmpty else { return result }
+        guard request.scope != .downloadTasks || !restoring else {
+            result.failures = ["正在恢复系统下载任务，请恢复完成后重试。"]
+            errorMessage = result.failures[0]
+            return result
+        }
+        for snapshot in request.records {
+            guard let current = request.currentRecord(for: snapshot, in: records) else {
+                result.skippedCount += 1
+                continue
+            }
+            do {
+                // Do not turn a stale task dialog into a local-file deletion,
+                // even if a complete file was recovered before the UI updated.
+                if request.scope == .downloadTasks, disk?.verifiedFile(for: current) != nil {
+                    result.skippedCount += 1
+                    continue
+                }
+                if let warning = try deleteLocally(current, saving: records.filter { $0.id != current.id }) {
+                    result.warnings.append("\(current.video.name)：\(warning)")
+                }
+                result.removedCount += 1
+            } catch {
+                result.failures.append("\(current.video.name)：\(error.localizedDescription)")
+            }
+        }
+        deletionNotice = result.summary(for: request.scope)
+        let details = result.failures + result.warnings
+        errorMessage = details.isEmpty ? nil : (
+            [result.summary(for: request.scope)] + Array(details.prefix(12)) +
+            (details.count > 12 ? ["另有 \(details.count - 12) 项未删除或空间回收未完成。"] : [])
+        ).joined(separator: "\n")
+        return result
+    }
+}

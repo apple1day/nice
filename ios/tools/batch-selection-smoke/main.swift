@@ -1,0 +1,36 @@
+import Foundation
+
+var checks = 0
+func expect(_ value: @autoclosure () -> Bool, _ label: String) {
+    precondition(value(), label)
+    checks += 1
+    print("PASS: \(label)")
+}
+var selection = BatchSelection()
+selection.toggle("a")
+expect(selection.tokens.isEmpty, "normal mode does not select")
+selection.toggleAll(in: ["a", "b"])
+expect(selection.tokens.isEmpty, "normal mode ignores select all")
+selection.begin()
+selection.toggle("a")
+selection.toggle("b")
+expect(selection.tokens == ["a", "b"], "multiple independent rows")
+selection.toggle("a")
+expect(selection.tokens == ["b"], "tap selected row to deselect")
+selection.toggleAll(in: ["a", "b", "c"])
+expect(selection.tokens.count == 3, "select all visible rows")
+selection.reconcile(with: ["b", "c", "d"])
+expect(selection.tokens == ["b", "c"], "search removes hidden selections")
+expect(!selection.tokens.contains("d"), "new rows do not inherit selection")
+selection.toggleAll(in: ["b", "c"])
+expect(selection.tokens.isEmpty, "cancel select all")
+selection.toggle("id|old")
+selection.reconcile(with: ["id|new"])
+expect(selection.tokens.isEmpty, "retry attempt does not inherit selection")
+expect(!selection.allSelected(in: []), "empty list is not all selected")
+selection.toggle("a")
+selection.end()
+expect(!selection.isSelecting && selection.tokens.isEmpty, "done clears mode and selection")
+selection.begin()
+expect(selection.tokens.isEmpty, "reopening selection starts empty")
+print("\(checks) selection checks passed.")

@@ -29,55 +29,6 @@ struct RootView: View {
     }
 }
 
-struct OfflineView: View {
-    @EnvironmentObject private var store: VideoStore
-    @State private var search = ""
-    @State private var deletion: DownloadRecord?
-    private var filtered: [DownloadRecord] {
-        store.completed.filter { search.isEmpty || $0.video.name.localizedCaseInsensitiveContains(search) }
-    }
-    var body: some View {
-        List {
-            Section {
-                Label("所有播放均读取手机文件，无需服务器在线。", systemImage: "checkmark.shield")
-                    .font(.footnote).foregroundStyle(.secondary)
-                Text("\(store.completed.count) 个视频 · \(ByteCountFormatter.string(fromByteCount: store.usedBytes, countStyle: .file))")
-            }
-            PendingDeletionSection()
-            ForEach(filtered) { record in
-                Button { store.playLocal(record) } label: {
-                    HStack {
-                        Image(systemName: "play.circle.fill").font(.title)
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(record.video.name).foregroundStyle(.primary).lineLimit(2)
-                            Text("\(record.video.fileExtension.uppercased()) · \(record.video.sizeLabel)")
-                                .font(.caption).foregroundStyle(.secondary)
-                            if store.isPendingDeletion(record.id) {
-                                Label("待删除", systemImage: "trash").font(.caption).foregroundStyle(.orange)
-                            }
-                        }
-                    }.padding(.vertical, 4)
-                }
-                .swipeActions { Button("删除", role: .destructive) { deletion = record } }
-            }
-            if filtered.isEmpty {
-                ContentUnavailableView(search.isEmpty ? "暂无本地视频" : "没有匹配的视频", systemImage: "internaldrive",
-                    description: Text("在「设置」连接视频站，再到「服务器」下载。完成后即可在此离线播放。"))
-            }
-        }
-        .navigationTitle("本地视频")
-        .searchable(text: $search, prompt: "搜索本地视频")
-        .confirmationDialog("仅删除手机中的文件？", isPresented: Binding(
-            get: { deletion != nil }, set: { if !$0 { deletion = nil } }
-        ), titleVisibility: .visible) {
-            Button("删除本地文件", role: .destructive) {
-                if let record = deletion { store.removeFromDevice(record) }
-                deletion = nil
-            }
-        } message: { Text("不会删除服务器上的视频。") }
-    }
-}
-
 struct CatalogView: View {
     @EnvironmentObject private var store: VideoStore
     @State private var search = ""
@@ -136,40 +87,6 @@ struct CatalogView: View {
         .confirmationDialog("下载全部支持的完整视频文件？", isPresented: $confirmAll, titleVisibility: .visible) {
             Button("加入下载队列") { store.downloadAll() }
         } message: { Text("跳过本机已有或正在下载的视频。不下载 ZIP 或播放清单，请确认空间和流量。") }
-    }
-}
-
-struct TransfersView: View {
-    @EnvironmentObject private var store: VideoStore
-    var body: some View {
-        List {
-            Section {
-                Text("默认禁用新下载的蜂窝数据。后台传输由 iOS 调度；手动上划强退会中断任务，失败重试从头下载。")
-                    .font(.footnote).foregroundStyle(.secondary)
-                if store.restoring { ProgressView("恢复系统下载任务") }
-            }
-            ForEach(store.unfinished) { record in
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(record.video.name).font(.headline)
-                    if record.state == .downloading {
-                        ProgressView(value: store.progress[record.id] ?? 0)
-                        HStack {
-                            Text("\(Int((store.progress[record.id] ?? 0) * 100))% · \(record.video.sizeLabel)").font(.caption)
-                            Spacer()
-                            Button("取消") { store.cancel(record) }
-                        }
-                    } else {
-                        Text(record.message ?? "下载失败").font(.caption).foregroundStyle(.secondary)
-                        HStack {
-                            Button("重新下载") { store.retry(record) }.disabled(store.restoring)
-                            Spacer()
-                            Button("移除记录", role: .destructive) { store.removeFromDevice(record) }
-                        }
-                    }
-                }.padding(.vertical, 5).buttonStyle(.borderless)
-            }
-            if store.unfinished.isEmpty { Text("没有进行中或失败的任务。下载完成的视频在「本地」。").foregroundStyle(.secondary) }
-        }.navigationTitle("下载任务")
     }
 }
 
