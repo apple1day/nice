@@ -79,7 +79,7 @@ final class PlaybackModel: ObservableObject {
             pauseRequested = false
             if phase == .ended {
                 seconds = 0
-                restoredPosition = true // Replay must not reapply a saved bookmark.
+                restoredPosition = true
             }
             engine.play()
         } catch { message = error.localizedDescription }
@@ -103,8 +103,6 @@ final class PlaybackModel: ObservableObject {
     private func receive(_ snapshot: PlaybackSnapshot) {
         guard !closed else { return }
         if snapshot.phase == .playing && pauseRequested {
-            // A background/interruption pause can arrive while VLC is still opening.
-            // Apply it again when the native engine becomes ready instead of leaking audio.
             engine.pause()
             phase = .paused
         } else {
@@ -122,8 +120,6 @@ final class PlaybackModel: ObservableObject {
             restoredPosition = true
             return
         }
-        // Wait for both duration and seekability. Never overwrite the old bookmark
-        // with 0 while VLC is still opening or while a failed file is being closed.
         if !restoredPosition, seekable, phase == .playing || phase == .paused {
             restoredPosition = true
             if let target = PlaybackPosition.resume(saved: defaults.double(forKey: key), duration: duration) {
@@ -144,7 +140,7 @@ final class PlaybackModel: ObservableObject {
     func close() {
         guard !closed else { return }
         savePosition()
-        closed = true // Drop late VLC events before stopping native output.
+        closed = true
         engine.onUpdate = nil
         engine.stop()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -175,8 +171,6 @@ private struct VLCVideoSurface: UIViewRepresentable {
     static func dismantleUIView(_ view: UIView, coordinator: PlaybackModel) { coordinator.close() }
 }
 
-// The presentation anchor never changes while swiping; this wrapper supplies the
-// existing EnvironmentObject before constructing the session's StateObject.
 struct PlaybackScreen: View {
     @EnvironmentObject private var store: VideoStore
     let request: PlaybackRequest
@@ -210,11 +204,9 @@ private struct PlaylistPlayerView: View {
 
     var body: some View {
         NavigationStack {
-            GeometryReader { _ in
+            GeometryReader { proxy in
                 ZStack {
                     Color.black.ignoresSafeArea()
-                    // Rebuild ONLY the drawable for a new clip. Fullscreen changes
-                    // neither this ID nor the current PlaybackModel.
                     VLCVideoSurface(model: model)
                         .id(request.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -240,7 +232,7 @@ private struct PlaylistPlayerView: View {
                     }
                 }
                 .overlay(alignment: .bottom) {
-                    transportControls
+                    transportControls(isLandscape: proxy.size.width > proxy.size.height)
                         .opacity(controls.isVisible ? 1 : 0)
                         .allowsHitTesting(controls.isVisible)
                         .accessibilityHidden(!controls.isVisible)
@@ -295,8 +287,6 @@ private struct PlaylistPlayerView: View {
         .onDisappear { closePlayback() }
     }
 
-    // Both gestures belong ONLY to the empty picture area, not the slider or
-    // buttons. An exclusive drag cannot also trigger a tap (or mark deletion).
     private var surfaceGesture: some Gesture {
         DragGesture(minimumDistance: 20)
             .updating($draggingSurface) { _, value, _ in value = true }
@@ -328,7 +318,7 @@ private struct PlaylistPlayerView: View {
         .background(LinearGradient(colors: [.black.opacity(0.8), .clear], startPoint: .top, endPoint: .bottom))
         .contentShape(Rectangle())
     }
-    private var transportControls: some View {
+    private func transportControls(isLandscape: Bool) -> some View {
         VStack(spacing: 4) {
             if model.phase == .opening { ProgressView("打开本地文件…").tint(.white).font(.caption) }
             if let message = model.message { Text(message).font(.caption).foregroundStyle(.red).lineLimit(2) }
@@ -358,9 +348,15 @@ private struct PlaylistPlayerView: View {
                 Spacer()
                 Text(PlaybackPosition.label(model.duration))
             }.font(.caption.monospacedDigit())
-            // Five equally flexible cells: deletion is the geometrical middle
-            // cell in both portrait and landscape, no longer over the picture.
             HStack(spacing: 0) {
+                if isLandscape {
+                    Button { navigate(.previous) } label: {
+                        Image(systemName: "backward.end.fill").frame(width: 44, height: 52)
+                    }
+                    .accessibilityLabel("上一个视频")
+                    .accessibilityIdentifier("previousVideoButton")
+                    .frame(minWidth: 0, maxWidth: .infinity)
+                }
                 Button { revealControls(); model.seek(to: model.seconds - 15) } label: {
                     Image(systemName: "gobackward.15").frame(width: 44, height: 52)
                 }.disabled(!model.seekable).accessibilityLabel("后退15秒")
@@ -377,6 +373,14 @@ private struct PlaylistPlayerView: View {
                     Image(systemName: "goforward.15").frame(width: 44, height: 52)
                 }.disabled(!model.seekable).accessibilityLabel("前进15秒")
                     .frame(minWidth: 0, maxWidth: .infinity)
+                if isLandscape {
+                    Button { navigate(.next) } label: {
+                        Image(systemName: "forward.end.fill").frame(width: 44, height: 52)
+                    }
+                    .accessibilityLabel("下一个视频")
+                    .accessibilityIdentifier("nextVideoButton")
+                    .frame(minWidth: 0, maxWidth: .infinity)
+                }
                 Button { controls.toggleFullscreen(at: now) } label: {
                     Image(systemName: controls.isFullscreen
                           ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
@@ -390,7 +394,6 @@ private struct PlaylistPlayerView: View {
         .foregroundStyle(.white)
         .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 4)
         .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
-        // Shield empty gaps in the transport row from the picture's swipe layer.
         .contentShape(Rectangle())
         .onTapGesture { revealControls() }
         .accessibilityIdentifier("playbackTransportControls")
@@ -399,24 +402,23 @@ private struct PlaylistPlayerView: View {
         let queued = store.isPendingDeletion(request.key)
         return Button {
             revealControls()
-            if queued { store.unmarkForDeletion(request.key) }
-            else { store.markForDeletion(request.key) }
+            if !queued { store.markForDeletion(request.key) }
         } label: {
             VStack(spacing: 2) {
-                Image(systemName: queued ? "arrow.uturn.backward.circle" : "trash").font(.title2)
-                Text("\(queued ? "撤销" : "删除") \(store.pendingDeletionRecords.count)/\(VideoStore.deletionQueueLimit)")
-                    .font(.caption2.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.8)
+                Image(systemName: queued ? "checkmark.circle.fill" : "trash").font(.title2)
+                Text("删除").font(.caption2).lineLimit(1)
             }.frame(minWidth: 44, minHeight: 52)
         }
+        .disabled(queued)
         .tint(.orange).foregroundStyle(.orange)
-        .accessibilityLabel(queued ? "撤销当前视频的待删除标记" : "将当前视频加入待删除队列")
-        .accessibilityIdentifier(queued ? "undoWatchDeleteButton" : "watchDeleteButton")
+        .accessibilityLabel(queued ? "当前视频已加入待删除列表" : "将当前视频加入待删除列表")
+        .accessibilityIdentifier("watchDeleteButton")
     }
     private var playlistSheet: some View {
         NavigationStack {
             List {
                 Section {
-                    Text("本次打开时的全部本地视频，按本地列表顺序播放。上滑上一条，下滑下一条；已删除文件自动跳过。")
+                    Text("本次打开时的全部本地视频，按本地列表顺序播放。上滑上一条，下滑下一条；横屏控制栏也可直接切换上一个和下一个。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 ForEach(playlist.entries) { record in

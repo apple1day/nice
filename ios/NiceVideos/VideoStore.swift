@@ -5,7 +5,6 @@ import Combine
 final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     static let shared = VideoStore()
     static let sessionID = (Bundle.main.bundleIdentifier ?? "com.anxiong.nicevideos") + ".downloads.v1"
-    static let deletionQueueLimit = 3
     @Published private(set) var server: String
     @Published private(set) var videos: [Video] = []
     @Published private(set) var records: [DownloadRecord] = []
@@ -342,35 +341,26 @@ extension VideoStore {
         records.contains { $0.id == id && $0.pendingDeletionOrder != nil }
     }
 
-    // Returns false on failure; no fourth entry is admitted unless FIFO deletion
-    // and the new queue are committed together. Duplicate taps never reorder it.
+    // Marking never removes a file. The queue has no item limit and is persisted
+    // with the download manifest. Actual deletion only happens after the list-page
+    // "一键删除" confirmation calls deleteAllPendingVideos.
     @discardableResult func markForDeletion(_ id: String) -> Bool {
         do {
             guard let disk = disk else { throw ClientError("本地存储不可用。") }
             guard let record = records.first(where: { $0.id == id }),
                   record.state == .complete, disk.verifiedFile(for: record) != nil else {
-                throw ClientError("只能把下载完成且存在的本地视频加入待删除队列。")
+                throw ClientError("只能把下载完成且存在的本地视频加入待删除列表。")
             }
             if isPendingDeletion(id) { return true }
-            let queue = pendingDeletionRecords
-            guard queue.count <= Self.deletionQueueLimit else {
-                throw ClientError("待删除索引异常，未自动删除任何视频；请先检查待删除列表。")
-            }
-            let ids = Array((queue.map(\.id) + [id]).suffix(Self.deletionQueueLimit))
+            let ids = pendingDeletionRecords.map(\.id) + [id]
             var next = records
             for index in next.indices { next[index].pendingDeletionOrder = ids.firstIndex(of: next[index].id) }
-            if queue.count == Self.deletionQueueLimit, let first = queue.first {
-                next.removeAll { $0.id == first.id }
-                let warning = try deleteLocally(first, saving: next)
-                deletionNotice = warning ?? "已加入待删除；已自动删除最早的手机副本：\(first.video.name)"
-            } else {
-                try disk.saveRecords(next)
-                records = next
-                deletionNotice = "已加入待删除（\(ids.count)/\(Self.deletionQueueLimit)），当前视频仍可继续播放。"
-            }
+            try disk.saveRecords(next)
+            records = next
+            deletionNotice = "已加入待删除列表（\(ids.count) 个）。不会自动删除，请在本地视频列表顶部点击“一键删除”。"
             return true
         } catch {
-            errorMessage = "未加入待删除，原队列保留：\(error.localizedDescription)"
+            errorMessage = "未加入待删除列表，原列表保留：\(error.localizedDescription)"
             return false
         }
     }
