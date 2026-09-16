@@ -39,8 +39,18 @@ final class PlaylistPlaybackModel: ObservableObject {
         return "\(index + 1) / \(ids.count)"
     }
 
-    // A gesture resolves once onEnded. Validate the next local file BEFORE
-    // closing the current engine; boundaries/errors must not interrupt playback.
+    func neighbor(_ direction: LocalPlaybackPlaylist.Direction) -> DownloadRecord? {
+        let availableRecords = Dictionary(uniqueKeysWithValues: store.localPlaylistRecords.map { ($0.id, $0) })
+        guard let id = playlist.candidates(direction, available: Set(availableRecords.keys)).first else { return nil }
+        return availableRecords[id]
+    }
+
+    func canMove(_ direction: LocalPlaybackPlaylist.Direction) -> Bool {
+        neighbor(direction) != nil
+    }
+
+    // Validate the next local file BEFORE closing the current engine; boundaries
+    // and missing-file errors must never interrupt current playback.
     @discardableResult func move(_ direction: LocalPlaybackPlaylist.Direction) -> Bool {
         guard !closed, !switching else { return false }
         let available = Set(store.localPlaylistRecords.map(\.id))
