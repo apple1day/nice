@@ -6,7 +6,7 @@ work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/Sources/NiceVideos" "$work/Tests/NiceVideosTests"
 cp NiceVideos/LocalPlaybackPlaylist.swift NiceVideos/PlaybackControlsState.swift "$work/Sources/NiceVideos/"
-cp Tests/LocalPlaylistTests.swift "$work/Tests/NiceVideosTests/"
+cp Tests/LocalPlaylistTests.swift Tests/PagingGestureTests.swift "$work/Tests/NiceVideosTests/"
 cat > "$work/Package.swift" <<'PACKAGE'
 // swift-tools-version: 5.9
 import PackageDescription
