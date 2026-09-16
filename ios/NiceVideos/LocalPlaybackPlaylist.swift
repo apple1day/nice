@@ -67,7 +67,9 @@ enum PlaylistSwipe {
         let distanceThreshold = min(140, max(54, viewportHeight * 0.16))
         let flickThreshold = min(180, max(82, viewportHeight * 0.24))
         let distanceCommit = abs(vertical) >= distanceThreshold
-        let flickCommit = abs(predictedVertical) >= flickThreshold && abs(predictedVertical) > abs(vertical) * 1.18
+        let sameDirection = (vertical < 0) == (predictedVertical < 0)
+        let flickCommit = sameDirection && abs(predictedVertical) >= flickThreshold &&
+            abs(predictedVertical) > abs(vertical) * 1.18
         guard distanceCommit || flickCommit else { return nil }
 
         let decidingValue = flickCommit ? predictedVertical : vertical
