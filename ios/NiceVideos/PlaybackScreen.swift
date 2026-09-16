@@ -185,6 +185,11 @@ private struct PlaylistPlayerHost: View {
     var body: some View { PlaylistPlayerView(playlist: playlist, model: playlist.player) }
 }
 
+private struct PageDragState: Equatable {
+    var active = false
+    var offset: CGFloat = 0
+}
+
 private struct PlaylistPlayerView: View {
     @EnvironmentObject private var store: VideoStore
     @Environment(\.dismiss) private var dismiss
@@ -195,26 +200,45 @@ private struct PlaylistPlayerView: View {
     @State private var controls = PlaybackControlsState()
     @State private var draftSeconds: Double = 0
     @State private var showsPlaylist = false
-    @GestureState private var draggingSurface = false
+    @GestureState private var pageDrag = PageDragState()
+    @State private var settledPageOffset: CGFloat = 0
+    @State private var pageAnimating = false
     private var request: PlaybackRequest { playlist.current }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
     private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist }
     private var showsPause: Bool { model.phase == .playing || model.phase == .opening }
-    private var canNavigate: Bool { scenePhase == .active && !controls.isScrubbing && store.errorMessage == nil && !showsPlaylist }
+    private var canNavigate: Bool {
+        scenePhase == .active && !controls.isScrubbing && store.errorMessage == nil &&
+        !showsPlaylist && !pageAnimating
+    }
 
     var body: some View {
         NavigationStack {
             GeometryReader { proxy in
+                let viewportHeight = max(proxy.size.height, 1)
+                let pageOffset = pageAnimating ? settledPageOffset : pageDrag.offset
                 ZStack {
                     Color.black.ignoresSafeArea()
+
+                    if let next = playlist.neighbor(.next) {
+                        pagingPreview(record: next, label: "下一个视频")
+                            .offset(y: -viewportHeight + pageOffset)
+                    }
+                    if let previous = playlist.neighbor(.previous) {
+                        pagingPreview(record: previous, label: "上一个视频")
+                            .offset(y: viewportHeight + pageOffset)
+                    }
+
                     VLCVideoSurface(model: model)
                         .id(request.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .ignoresSafeArea(.container, edges: controls.isFullscreen ? .all : [])
+                        .offset(y: pageOffset)
                         .allowsHitTesting(false)
                         .accessibilityIdentifier("offlineVideoSurface")
+
                     Rectangle().fill(Color.clear).contentShape(Rectangle())
-                        .gesture(surfaceGesture)
+                        .gesture(surfaceGesture(viewportHeight: viewportHeight))
                         .accessibilityElement()
                         .accessibilityLabel("视频画面，上滑上一条，下滑下一条")
                         .accessibilityAddTraits(.isButton)
@@ -223,6 +247,7 @@ private struct PlaylistPlayerView: View {
                         .accessibilityAction(named: Text("下一个视频")) { navigate(.next) }
                         .accessibilityIdentifier("playbackSurfaceToggle")
                 }
+                .clipped()
                 .overlay(alignment: .top) {
                     if controls.isFullscreen {
                         fullscreenHeader
@@ -260,6 +285,12 @@ private struct PlaylistPlayerView: View {
         message: { Text(store.errorMessage ?? "") }
         .onChange(of: request.id) { _, _ in
             draftSeconds = 0
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                settledPageOffset = 0
+                pageAnimating = false
+            }
             controls.setScrubbing(false, at: now)
             controls.setNavigating(false, at: now)
             controls.setPlaying(model.phase == .playing, at: now)
@@ -269,12 +300,15 @@ private struct PlaylistPlayerView: View {
         .onChange(of: model.phase, initial: true) { _, phase in
             controls.setPlaying(phase == .playing, at: now)
         }
-        .onChange(of: draggingSurface) { _, value in controls.setNavigating(value, at: now) }
+        .onChange(of: pageDrag.active) { _, value in controls.setNavigating(value || pageAnimating, at: now) }
         .onChange(of: hasMessage, initial: true) { _, value in controls.setPresentingAlert(value, at: now) }
         .onChange(of: voiceOverEnabled, initial: true) { _, value in controls.setVoiceOverEnabled(value, at: now) }
         .onChange(of: scenePhase, initial: true) { _, phase in
             controls.setSceneActive(phase == .active, at: now)
-            if phase != .active { model.pause() }
+            if phase != .active {
+                model.pause()
+                resetPagingImmediately()
+            }
         }
         .task(id: controls.hideDeadline) {
             guard let deadline = controls.hideDeadline else { return }
@@ -287,18 +321,124 @@ private struct PlaylistPlayerView: View {
         .onDisappear { closePlayback() }
     }
 
-    private var surfaceGesture: some Gesture {
-        DragGesture(minimumDistance: 20)
-            .updating($draggingSurface) { _, value, _ in value = true }
+    private func surfaceGesture(viewportHeight: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 6)
+            .updating($pageDrag) { value, state, _ in
+                guard canNavigate else { return }
+                state.active = true
+                state.offset = CGFloat(PlaylistSwipe.interactiveOffset(
+                    horizontal: Double(value.translation.width),
+                    vertical: Double(value.translation.height),
+                    viewportHeight: Double(viewportHeight),
+                    hasPrevious: playlist.canMove(.previous),
+                    hasNext: playlist.canMove(.next)
+                ))
+            }
             .onEnded { value in
-                controls.setNavigating(false, at: now)
-                guard let direction = PlaylistSwipe.direction(
-                    horizontal: Double(value.translation.width), vertical: Double(value.translation.height)
-                ) else { revealControls(); return }
-                navigate(direction)
+                finishPageSwipe(value, viewportHeight: viewportHeight)
             }
             .exclusively(before: TapGesture().onEnded { _ in toggleControls() })
     }
+
+    private func finishPageSwipe(_ value: DragGesture.Value, viewportHeight: CGFloat) {
+        controls.setNavigating(false, at: now)
+        guard canNavigate else { return }
+
+        let currentOffset = CGFloat(PlaylistSwipe.interactiveOffset(
+            horizontal: Double(value.translation.width),
+            vertical: Double(value.translation.height),
+            viewportHeight: Double(viewportHeight),
+            hasPrevious: playlist.canMove(.previous),
+            hasNext: playlist.canMove(.next)
+        ))
+        let direction = PlaylistSwipe.pagingDirection(
+            horizontal: Double(value.translation.width),
+            vertical: Double(value.translation.height),
+            predictedVertical: Double(value.predictedEndTranslation.height),
+            viewportHeight: Double(viewportHeight)
+        )
+
+        guard let direction else {
+            animatePageBack(from: currentOffset)
+            return
+        }
+        guard playlist.canMove(direction) else {
+            _ = playlist.move(direction) // Publish first/last-item notice.
+            animatePageBack(from: currentOffset)
+            return
+        }
+
+        pageAnimating = true
+        settledPageOffset = currentOffset
+        let target = direction == .previous ? -viewportHeight : viewportHeight
+        controls.setNavigating(true, at: now)
+        withAnimation(.interactiveSpring(response: 0.22, dampingFraction: 0.94, blendDuration: 0.04)) {
+            settledPageOffset = target
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+            guard pageAnimating else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                _ = playlist.move(direction)
+                settledPageOffset = 0
+                pageAnimating = false
+            }
+            controls.setNavigating(false, at: now)
+            revealControls()
+        }
+    }
+
+    private func animatePageBack(from offset: CGFloat) {
+        pageAnimating = true
+        settledPageOffset = offset
+        controls.setNavigating(true, at: now)
+        withAnimation(.spring(response: 0.30, dampingFraction: 0.82, blendDuration: 0.05)) {
+            settledPageOffset = 0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+            pageAnimating = false
+            controls.setNavigating(false, at: now)
+            revealControls()
+        }
+    }
+
+    private func resetPagingImmediately() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            settledPageOffset = 0
+            pageAnimating = false
+        }
+        controls.setNavigating(false, at: now)
+    }
+
+    private func pagingPreview(record: DownloadRecord, label: String) -> some View {
+        ZStack {
+            Color.black
+            LinearGradient(
+                colors: [.black.opacity(0.3), .secondary.opacity(0.18), .black.opacity(0.75)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            VStack(spacing: 14) {
+                Image(systemName: "film.stack")
+                    .font(.system(size: 48, weight: .medium))
+                Text(label).font(.caption).foregroundStyle(.secondary)
+                Text(record.video.name)
+                    .font(.headline)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(3)
+                    .padding(.horizontal, 32)
+            }
+            .foregroundStyle(.white)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
     private func toggleControls() {
         withAnimation(.easeInOut(duration: 0.2)) { controls.surfaceTapped(at: now) }
     }
@@ -441,5 +581,9 @@ private struct PlaylistPlayerView: View {
         }
     }
     private func revealControls() { controls.interacted(at: now) }
-    private func closePlayback() { controls.stop(); playlist.close() }
+    private func closePlayback() {
+        resetPagingImmediately()
+        controls.stop()
+        playlist.close()
+    }
 }
