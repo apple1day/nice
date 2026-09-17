@@ -220,12 +220,12 @@ private struct PlaylistPlayerView: View {
                 ZStack {
                     Color.black.ignoresSafeArea()
 
-                    if let next = playlist.neighbor(.next) {
-                        pagingPreview(record: next, label: "下一个视频")
-                            .offset(y: -viewportHeight + pageOffset)
-                    }
                     if let previous = playlist.neighbor(.previous) {
                         pagingPreview(record: previous, label: "上一个视频")
+                            .offset(y: -viewportHeight + pageOffset)
+                    }
+                    if let next = playlist.neighbor(.next) {
+                        pagingPreview(record: next, label: "下一个视频")
                             .offset(y: viewportHeight + pageOffset)
                     }
 
@@ -240,7 +240,7 @@ private struct PlaylistPlayerView: View {
                     Rectangle().fill(Color.clear).contentShape(Rectangle())
                         .gesture(surfaceGesture(viewportHeight: viewportHeight))
                         .accessibilityElement()
-                        .accessibilityLabel("视频画面，上滑上一条，下滑下一条")
+                        .accessibilityLabel("视频画面，上滑下一个，下滑上一个")
                         .accessibilityAddTraits(.isButton)
                         .accessibilityAction { toggleControls() }
                         .accessibilityAction(named: Text("上一个视频")) { navigate(.previous) }
@@ -363,14 +363,14 @@ private struct PlaylistPlayerView: View {
             return
         }
         guard playlist.canMove(direction) else {
-            _ = playlist.move(direction) // Publish first/last-item notice.
+            _ = playlist.move(direction)
             animatePageBack(from: currentOffset)
             return
         }
 
         pageAnimating = true
         settledPageOffset = currentOffset
-        let target = direction == .previous ? -viewportHeight : viewportHeight
+        let target = direction == .next ? -viewportHeight : viewportHeight
         controls.setNavigating(true, at: now)
         withAnimation(.interactiveSpring(response: 0.22, dampingFraction: 0.94, blendDuration: 0.04)) {
             settledPageOffset = target
@@ -465,7 +465,7 @@ private struct PlaylistPlayerView: View {
             if let notice = playlist.notice { Text(notice).font(.caption).lineLimit(2) }
             if let notice = store.deletionNotice { Text(notice).font(.caption2).lineLimit(2) }
             HStack(spacing: 8) {
-                Text("上滑上一条 · 下滑下一条").font(.caption2)
+                Text("上滑下一个 · 下滑上一个").font(.caption2)
                 Spacer(minLength: 4)
                 Button { revealControls(); showsPlaylist = true } label: {
                     Label(playlist.positionLabel, systemImage: "list.bullet")
@@ -558,7 +558,7 @@ private struct PlaylistPlayerView: View {
         NavigationStack {
             List {
                 Section {
-                    Text("本次打开时的全部本地视频，按本地列表顺序播放。上滑上一条，下滑下一条；横屏控制栏也可直接切换上一个和下一个。")
+                    Text("本次打开时的全部本地视频，按本地列表顺序播放。上滑下一个，下滑上一个；横屏控制栏也可直接切换上一个和下一个。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 ForEach(playlist.entries) { record in
