@@ -36,23 +36,22 @@ struct LocalPlaybackPlaylist {
     }
 }
 
-// Paging keeps the user-requested direction: swipe UP -> previous, DOWN -> next.
-// Unlike the original binary 64pt recognizer, the new path lets the page follow
-// the finger, accepts a quick flick through predictedEndTranslation and applies
-// rubber-band resistance at the first/last item.
+// Short-video paging direction: swipe UP -> next, swipe DOWN -> previous.
+// The page follows the finger, accepts a quick flick through
+// predictedEndTranslation and applies rubber-band resistance at the boundaries.
 enum PlaylistSwipe {
     static let minimumDistance: Double = 64
     static let verticalDominance: Double = 1.35
     static let pagingVerticalDominance: Double = 1.08
     static let boundaryResistance: Double = 0.18
 
-    // Legacy deterministic recognizer retained for accessibility/tests and any
-    // call site that does not have viewport/predicted-end information.
+    // Deterministic recognizer retained for accessibility/tests and call sites
+    // without viewport/predicted-end information.
     static func direction(horizontal: Double, vertical: Double) -> LocalPlaybackPlaylist.Direction? {
         guard horizontal.isFinite, vertical.isFinite,
               abs(vertical) >= minimumDistance,
               abs(vertical) > abs(horizontal) * verticalDominance else { return nil }
-        return vertical < 0 ? .previous : .next
+        return vertical < 0 ? .next : .previous
     }
 
     static func pagingDirection(horizontal: Double, vertical: Double,
@@ -73,7 +72,7 @@ enum PlaylistSwipe {
         guard distanceCommit || flickCommit else { return nil }
 
         let decidingValue = flickCommit ? predictedVertical : vertical
-        return decidingValue < 0 ? .previous : .next
+        return decidingValue < 0 ? .next : .previous
     }
 
     static func interactiveOffset(horizontal: Double, vertical: Double,
@@ -84,8 +83,9 @@ enum PlaylistSwipe {
               abs(vertical) > abs(horizontal) * pagingVerticalDominance else { return 0 }
 
         let bounded = min(viewportHeight, max(-viewportHeight, vertical))
-        if bounded < 0, !hasPrevious { return bounded * boundaryResistance }
-        if bounded > 0, !hasNext { return bounded * boundaryResistance }
+        // Upward drag requests NEXT; downward drag requests PREVIOUS.
+        if bounded < 0, !hasNext { return bounded * boundaryResistance }
+        if bounded > 0, !hasPrevious { return bounded * boundaryResistance }
         return bounded
     }
 }
