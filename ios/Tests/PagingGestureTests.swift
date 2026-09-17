@@ -22,13 +22,15 @@ final class PagingGestureTests: XCTestCase {
     }
 
     func testBoundaryUsesRubberBandInsteadOfHardStop() {
+        // Up requests NEXT, so lack of next item resists upward movement.
         let up = PlaylistSwipe.interactiveOffset(
             horizontal: 0, vertical: -200, viewportHeight: 800,
-            hasPrevious: false, hasNext: true
+            hasPrevious: true, hasNext: false
         )
+        // Down requests PREVIOUS, so lack of previous item resists downward movement.
         let down = PlaylistSwipe.interactiveOffset(
             horizontal: 0, vertical: 200, viewportHeight: 800,
-            hasPrevious: true, hasNext: false
+            hasPrevious: false, hasNext: true
         )
         XCTAssertEqual(up, -36, accuracy: 0.001)
         XCTAssertEqual(down, 36, accuracy: 0.001)
@@ -49,13 +51,13 @@ final class PagingGestureTests: XCTestCase {
             PlaylistSwipe.pagingDirection(
                 horizontal: 5, vertical: -130, predictedVertical: -150, viewportHeight: 800
             ),
-            .previous
+            .next
         )
         XCTAssertEqual(
             PlaylistSwipe.pagingDirection(
                 horizontal: 5, vertical: 130, predictedVertical: 150, viewportHeight: 800
             ),
-            .next
+            .previous
         )
     }
 
@@ -64,13 +66,13 @@ final class PagingGestureTests: XCTestCase {
             PlaylistSwipe.pagingDirection(
                 horizontal: 4, vertical: -55, predictedVertical: -320, viewportHeight: 800
             ),
-            .previous
+            .next
         )
         XCTAssertEqual(
             PlaylistSwipe.pagingDirection(
                 horizontal: 4, vertical: 55, predictedVertical: 320, viewportHeight: 800
             ),
-            .next
+            .previous
         )
     }
 
