@@ -2,9 +2,9 @@ import XCTest
 @testable import NiceVideos
 
 final class LocalPlaylistTests: XCTestCase {
-    func testUpMeansPreviousAndDownMeansNext() {
-        XCTAssertEqual(PlaylistSwipe.direction(horizontal: 0, vertical: -100), .previous)
-        XCTAssertEqual(PlaylistSwipe.direction(horizontal: 0, vertical: 100), .next)
+    func testUpMeansNextAndDownMeansPrevious() {
+        XCTAssertEqual(PlaylistSwipe.direction(horizontal: 0, vertical: -100), .next)
+        XCTAssertEqual(PlaylistSwipe.direction(horizontal: 0, vertical: 100), .previous)
     }
     func testSmallDragsAndHorizontalScrubsDoNotSwitch() {
         XCTAssertNil(PlaylistSwipe.direction(horizontal: 0, vertical: -63))
@@ -14,8 +14,8 @@ final class LocalPlaylistTests: XCTestCase {
         XCTAssertNil(PlaylistSwipe.direction(horizontal: 100, vertical: 135))
     }
     func testThresholdAndVerticalDominance() {
-        XCTAssertEqual(PlaylistSwipe.direction(horizontal: 10, vertical: -64), .previous)
-        XCTAssertEqual(PlaylistSwipe.direction(horizontal: 100, vertical: 136), .next)
+        XCTAssertEqual(PlaylistSwipe.direction(horizontal: 10, vertical: -64), .next)
+        XCTAssertEqual(PlaylistSwipe.direction(horizontal: 100, vertical: 136), .previous)
     }
     func testInvalidCoordinatesAreIgnored() {
         for value in [Double.nan, .infinity, -.infinity] {
