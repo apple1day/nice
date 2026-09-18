@@ -134,7 +134,8 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             defaults.removeObject(forKey: "position." + id)
         }
         let id = video.storageID(server: base)
-        if let existing = records.first(where: { $0.id == id }) {
+        let existing = records.first(where: { $0.id == id })
+        if let existing {
             if existing.state == .downloading { return }
             if existing.state == .complete, disk.verifiedFile(for: existing) != nil { return }
         }
@@ -144,7 +145,8 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         var request = URLRequest(url: try ServerAddress.endpoint(video.downloadUrl, on: base))
         request.allowsCellularAccess = defaults.bool(forKey: "allowCellular")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        let record = DownloadRecord(video: video, server: base)
+        var record = DownloadRecord(video: video, server: base)
+        record.favorite = existing?.favorite ?? false
         let previous = records
         records.removeAll { $0.id == id }
         records.append(record)
@@ -173,6 +175,31 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             deletionNotice = warning ?? "已删除手机副本：\(current.video.name)"
         } catch { errorMessage = "删除本地文件失败：\(error.localizedDescription)" }
     }
+
+    func isFavorite(_ id: String) -> Bool {
+        records.first(where: { $0.id == id })?.isFavorite == true
+    }
+
+    @discardableResult func toggleFavorite(_ id: String) -> Bool {
+        do {
+            guard let disk = disk else { throw ClientError("本地存储不可用。") }
+            guard let index = records.firstIndex(where: { $0.id == id }),
+                  records[index].state == .complete,
+                  disk.verifiedFile(for: records[index]) != nil else {
+                throw ClientError("只能收藏已经下载完成且存在的本地视频。")
+            }
+            var next = records
+            next[index].favorite = !next[index].isFavorite
+            let result = next[index].isFavorite
+            try disk.saveRecords(next)
+            records = next
+            return result
+        } catch {
+            errorMessage = "更新收藏状态失败：\(error.localizedDescription)"
+            return isFavorite(id)
+        }
+    }
+
     func play(_ video: Video) {
         guard let record = record(for: video), record.state == .complete else {
             errorMessage = "请先下载视频，下载完成后才能本地播放。"
