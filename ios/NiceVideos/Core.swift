@@ -68,9 +68,11 @@ struct DownloadRecord: Codable, Identifiable, Equatable {
     var attempt: String
     var state: DownloadState
     var message: String?
-    // Optional for backwards-compatible decoding of v1 downloads.json.
-    // Persist queue order with the records, never in a separate, drifting index.
+    // Optional fields keep old downloads.json files backward-compatible.
+    // Persist queue/favorite state with the record instead of a separate index.
     var pendingDeletionOrder: Int?
+    var favorite: Bool?
+    var isFavorite: Bool { favorite == true }
     var taskToken: String { id + "|" + attempt }
     var fileName: String { id + "." + video.fileExtension }
     init(video: Video, server: URL) {
@@ -81,6 +83,7 @@ struct DownloadRecord: Codable, Identifiable, Equatable {
         state = .downloading
         message = nil
         pendingDeletionOrder = nil
+        favorite = false
     }
 }
 struct DownloadManifest: Codable {
