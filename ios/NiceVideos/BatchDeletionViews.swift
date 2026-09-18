@@ -38,7 +38,15 @@ struct OfflineView: View {
                             Image(systemName: "play.circle.fill").font(.title)
                         }
                         VStack(alignment: .leading, spacing: 5) {
-                            Text(record.video.name).foregroundStyle(.primary).lineLimit(2)
+                            HStack(spacing: 6) {
+                                Text(record.video.name).foregroundStyle(.primary).lineLimit(2)
+                                if record.isFavorite {
+                                    Image(systemName: "star.fill")
+                                        .foregroundStyle(.yellow)
+                                        .accessibilityLabel("已收藏")
+                                        .accessibilityIdentifier("favoriteBadge.\(record.id)")
+                                }
+                            }
                             Text("\(record.video.fileExtension.uppercased()) · \(record.video.sizeLabel)")
                                 .font(.caption).foregroundStyle(.secondary)
                             if store.isPendingDeletion(record.id) {
