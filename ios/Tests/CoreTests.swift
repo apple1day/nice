@@ -97,6 +97,54 @@ final class CoreTests: XCTestCase {
         let manifest = try JSONDecoder().decode(DownloadManifest.self, from: Data(contentsOf: disk.root.appendingPathComponent("downloads.json")))
         XCTAssertEqual(manifest.version, 1)
     }
+    func testOldDownloadRecordWithoutFavoriteStillDecodes() throws {
+        let (_, record) = try fixture()
+        let json = """
+        {
+          "id": "\(record.id)",
+          "video": {
+            "name": "demo.mp4",
+            "size": 4,
+            "contentType": "video/mp4",
+            "url": "/api/stream/demo.mp4",
+            "downloadUrl": "/api/download/demo.mp4"
+          },
+          "server": "\(record.server)",
+          "attempt": "\(record.attempt)",
+          "state": "complete"
+        }
+        """
+        let decoded = try JSONDecoder().decode(DownloadRecord.self, from: Data(json.utf8))
+        XCTAssertFalse(decoded.isFavorite)
+        XCTAssertNil(decoded.favorite)
+    }
+
+    @MainActor func testFavoriteTogglePersistsAcrossRelaunch() throws {
+        let (disk, record) = try fixture()
+        let defaults = try isolatedDefaults()
+        let store = VideoStore(storage: disk, defaults: defaults, restoreDownloads: false)
+
+        XCTAssertFalse(store.isFavorite(record.id))
+        XCTAssertTrue(store.toggleFavorite(record.id))
+        XCTAssertTrue(store.isFavorite(record.id))
+
+        let relaunched = VideoStore(
+            storage: try LocalStorage(root: disk.root),
+            defaults: defaults,
+            restoreDownloads: false
+        )
+        XCTAssertTrue(relaunched.isFavorite(record.id))
+        XCTAssertFalse(relaunched.toggleFavorite(record.id))
+        XCTAssertFalse(relaunched.isFavorite(record.id))
+
+        let secondRelaunch = VideoStore(
+            storage: try LocalStorage(root: disk.root),
+            defaults: defaults,
+            restoreDownloads: false
+        )
+        XCTAssertFalse(secondRelaunch.isFavorite(record.id))
+    }
+
     func testIncompleteFileNotAvailableOffline() throws {
         let (disk, record) = try fixture()
         try Data([1, 2]).write(to: disk.destination(for: record))
