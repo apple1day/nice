@@ -508,6 +508,7 @@ private struct PlaylistPlayerView: View {
                     .accessibilityLabel(showsPause ? "暂停" : "播放")
                     .accessibilityIdentifier("togglePlaybackButton")
                     .frame(minWidth: 0, maxWidth: .infinity)
+                transportFavoriteButton.frame(minWidth: 0, maxWidth: .infinity)
                 transportDeleteButton.frame(minWidth: 0, maxWidth: .infinity)
                 Button { revealControls(); model.seek(to: model.seconds + 15) } label: {
                     Image(systemName: "goforward.15").frame(width: 44, height: 52)
@@ -538,6 +539,23 @@ private struct PlaylistPlayerView: View {
         .onTapGesture { revealControls() }
         .accessibilityIdentifier("playbackTransportControls")
     }
+    private var transportFavoriteButton: some View {
+        let favorite = store.isFavorite(request.key)
+        return Button {
+            revealControls()
+            store.toggleFavorite(request.key)
+        } label: {
+            VStack(spacing: 2) {
+                Image(systemName: favorite ? "star.fill" : "star").font(.title2)
+                Text(favorite ? "已收藏" : "收藏").font(.caption2).lineLimit(1)
+            }.frame(minWidth: 44, minHeight: 52)
+        }
+        .foregroundStyle(favorite ? Color.yellow : Color.white)
+        .accessibilityLabel(favorite ? "取消收藏当前视频" : "收藏当前视频")
+        .accessibilityValue(favorite ? "已收藏" : "未收藏")
+        .accessibilityIdentifier("favoriteVideoButton")
+    }
+
     private var transportDeleteButton: some View {
         let queued = store.isPendingDeletion(request.key)
         return Button {
@@ -570,6 +588,11 @@ private struct PlaylistPlayerView: View {
                             Image(systemName: record.id == request.key ? "play.fill" : "film")
                             Text(record.video.name).lineLimit(2)
                             Spacer(minLength: 4)
+                            if record.isFavorite {
+                                Image(systemName: "star.fill")
+                                    .foregroundStyle(.yellow)
+                                    .accessibilityLabel("已收藏")
+                            }
                             if store.isPendingDeletion(record.id) { Image(systemName: "trash").foregroundStyle(.orange) }
                         }.padding(.vertical, 4)
                     }.accessibilityIdentifier("playlistItem_" + record.id)
