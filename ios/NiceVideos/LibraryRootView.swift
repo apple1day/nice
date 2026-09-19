@@ -30,6 +30,8 @@ struct LibraryRootView: View {
                 .tabItem { Label("服务器", systemImage: "server.rack") }
             NavigationStack { TransfersView() }
                 .tabItem { Label("下载", systemImage: "arrow.down.circle") }
+            NavigationStack { LocalUploadView(store: store) }
+                .tabItem { Label("上传", systemImage: "arrow.up.circle") }
             NavigationStack { SettingsView() }
                 .tabItem { Label("设置", systemImage: "gearshape") }
         }

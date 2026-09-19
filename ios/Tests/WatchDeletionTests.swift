@@ -40,7 +40,7 @@ final class WatchDeletionTests: XCTestCase {
             XCTAssertNotNil(disk.verifiedFile(for: record), record.video.name)
             XCTAssertEqual(defaults.double(forKey: "position." + record.id), 12)
         }
-        XCTAssertTrue(store.deletionNotice?.contains("不会自动删除") == true)
+        XCTAssertTrue(store.deletionNotice?.contains("删除待删除") == true)
     }
 
     @MainActor func testRepeatedMarkIsIdempotentAndDoesNotReorder() throws {
@@ -107,8 +107,8 @@ final class WatchDeletionTests: XCTestCase {
         store.playLocal(entries[0])
         let request = try XCTUnwrap(store.playback)
         XCTAssertEqual(store.deleteAllPendingVideos(), 0)
-        XCTAssertEqual(ids(store), [entries[0].id])
         XCTAssertNotNil(disk.verifiedFile(for: entries[0]))
+        XCTAssertEqual(ids(store), [entries[0].id])
         XCTAssertNotNil(store.errorMessage)
         store.errorMessage = nil
         store.playbackDidClose(request)

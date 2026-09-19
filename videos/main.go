@@ -45,7 +45,7 @@ var videoExts = map[string]string{
 	".avi":  "video/x-msvideo",
 	".mkv":  "video/x-matroska",
 	".flv":  "video/x-flv",
-	".wmv":  "video/x-ms-wmv",
+	".wmv": "video/x-ms-wmv",
 	".ts":   "video/mp2t",
 	".m3u8": "application/vnd.apple.mpegurl",
 }
@@ -550,7 +550,7 @@ func main() {
 	mux.HandleFunc("/api/upload", uploadVideo)
 	mux.Handle("/", spaHandler())
 
-	handler := logRequest(cors(mux))
+	handler := logRequest(cors(withNativeUploads(mux, videoDir)))
 
 	addr := ":" + port
 	log.Printf("视频站点已启动: http://localhost%s", addr)
