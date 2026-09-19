@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import Combine
 @testable import NiceVideos
 
 private final class PlaylistTestEngine: LocalPlaybackEngine {
@@ -28,6 +29,7 @@ private final class PlaylistEnginePool {
         return engine
     }
 }
+private final class RequestProbe { var ids: [String] = [] }
 private struct PlaylistFixture {
     let disk: LocalStorage
     let records: [DownloadRecord]
@@ -36,6 +38,7 @@ private struct PlaylistFixture {
     let anchor: PlaybackRequest
     let model: PlaylistPlaybackModel
     let pool: PlaylistEnginePool
+    let requests: RequestProbe
 }
 
 final class PlaylistPlaybackTests: XCTestCase {
@@ -59,15 +62,19 @@ final class PlaylistPlaybackTests: XCTestCase {
         store.playLocal(records[start])
         let anchor = try XCTUnwrap(store.playback)
         let pool = PlaylistEnginePool()
+        let requests = RequestProbe()
         let model = PlaylistPlaybackModel(request: anchor, store: store, engineFactory: { pool.make() },
-                                          defaults: defaults, manageAudioSession: false)
+                                          defaults: defaults, manageAudioSession: false, requestResolver: { id in
+            requests.ids.append(id)
+            return try store.localPlaybackRequest(for: id)
+        })
         addTeardownBlock { @MainActor in
             model.close()
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: root)
         }
         return PlaylistFixture(disk: disk, records: records, defaults: defaults, store: store,
-                               anchor: anchor, model: model, pool: pool)
+                               anchor: anchor, model: model, pool: pool, requests: requests)
     }
 
     @MainActor func testAllLocalVideosAvailableWithoutServerOrCatalog() throws {
@@ -168,12 +175,17 @@ final class PlaylistPlaybackTests: XCTestCase {
         f.store.removeFromDevice(f.records[1])
         XCTAssertNil(f.disk.verifiedFile(for: f.records[1]))
     }
-    @MainActor func testFIFODeletesOldCoverAnchorAndPlaylistSkipsIt() throws {
+    @MainActor func testManualDeletionUpdatesCachedPlaylistWithoutAutomaticEviction() throws {
         let f = try fixture()
         for index in 0..<4 {
             if index > 0 { XCTAssertTrue(f.model.move(.next)) }
             XCTAssertTrue(f.store.markForDeletion(f.model.current.key))
         }
+        // Marking four clips must retain all files. Only an explicit list action deletes.
+        for record in f.records { XCTAssertNotNil(f.disk.verifiedFile(for: record)) }
+        XCTAssertEqual(f.store.pendingDeletionRecords.count, 4)
+        XCTAssertEqual(f.model.positionLabel, "4 / 5")
+        XCTAssertEqual(f.store.deleteAllPendingVideos(ids: [f.records[0].id]), 1)
         XCTAssertNil(f.disk.verifiedFile(for: f.records[0]))
         XCTAssertEqual(f.store.pendingDeletionRecords.map(\.id), Array(f.records[1...3]).map(\.id))
         XCTAssertEqual(f.model.entries.map(\.id), Array(f.records[1...4]).map(\.id))
@@ -193,7 +205,7 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertEqual(f.defaults.double(forKey: "position." + f.records[0].id), 17)
         XCTAssertEqual(f.model.player.seconds, 40)
     }
-    @MainActor func testRapidSwipesAndLateDrawableMountCannotStartOldEngines() throws {
+    @MainActor func testRapidButtonNavigationAndLateDrawableMountCannotStartOldEngines() throws {
         let f = try fixture()
         let first = f.model.player
         let late = f.pool.engines[0].onUpdate
@@ -246,5 +258,95 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertNotNil(f.store.playback)
         XCTAssertTrue(f.model.move(.previous))
         XCTAssertEqual(f.model.current.key, f.records[3].id)
+    }
+
+    @MainActor func testLargeLibraryControlReadsAndSeeksDoNotResolveFiles() throws {
+        let f = try fixture(count: 600, start: 300)
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].tick(10)
+        for index in 0..<500 {
+            XCTAssertEqual(f.model.entries.count, 600)
+            XCTAssertEqual(f.model.positionLabel, "301 / 600")
+            XCTAssertEqual(f.model.neighbor(.previous)?.id, f.records[299].id)
+            XCTAssertEqual(f.model.neighbor(.next)?.id, f.records[301].id)
+            XCTAssertTrue(f.model.canMove(.previous))
+            XCTAssertTrue(f.model.canMove(.next))
+            f.model.player.seek(to: Double(index % 90))
+        }
+        XCTAssertTrue(f.requests.ids.isEmpty, "Displaying/seeking must not resolve playlist files")
+        XCTAssertEqual(f.pool.engines.count, 1)
+        XCTAssertEqual(f.pool.engines[0].loaded.count, 1)
+        XCTAssertEqual(f.pool.engines[0].stopCount, 0)
+    }
+
+    @MainActor func testNextValidatesOnlyTheRequestedNeighbor() throws {
+        let f = try fixture(count: 20)
+        XCTAssertTrue(f.requests.ids.isEmpty)
+        XCTAssertTrue(f.model.move(.next))
+        XCTAssertEqual(f.requests.ids, [f.records[1].id])
+    }
+
+    @MainActor func testMissingNeighborIsCheckedLazilyWithoutScanningOtherFiles() throws {
+        let f = try fixture(count: 20)
+        try f.disk.remove(f.records[1])
+        for _ in 0..<100 {
+            // Metadata remains usable without touching the missing file.
+            XCTAssertEqual(f.model.neighbor(.next)?.id, f.records[1].id)
+            XCTAssertEqual(f.model.entries.count, 20)
+        }
+        XCTAssertTrue(f.requests.ids.isEmpty)
+        XCTAssertTrue(f.model.move(.next))
+        XCTAssertEqual(f.requests.ids, [f.records[1].id, f.records[2].id])
+        XCTAssertEqual(f.model.current.key, f.records[2].id)
+    }
+
+    @MainActor func testDirectSelectionDoesNotValidateInterveningClips() throws {
+        let f = try fixture(count: 20)
+        XCTAssertTrue(f.model.select(f.records[19].id))
+        XCTAssertEqual(f.requests.ids, [f.records[19].id])
+    }
+
+    @MainActor func testFavoriteAndPendingMetadataUpdateWithoutResolvingPlaylist() throws {
+        let f = try fixture()
+        XCTAssertTrue(f.store.toggleFavorite(f.records[0].id))
+        XCTAssertEqual(f.model.currentEntry?.isFavorite, true)
+        XCTAssertTrue(f.model.entries[0].isFavorite)
+        XCTAssertTrue(f.store.markForDeletion(f.records[0].id))
+        XCTAssertNotNil(f.model.currentEntry?.pendingDeletionOrder)
+        XCTAssertTrue(f.store.unmarkForDeletion(f.records[0].id))
+        XCTAssertNil(f.model.currentEntry?.pendingDeletionOrder)
+        XCTAssertTrue(f.requests.ids.isEmpty)
+    }
+
+    @MainActor func testDeletingOtherItemsRefreshesNeighborAndPositionCache() throws {
+        let f = try fixture(start: 2)
+        f.store.removeFromDevice(f.records[0])
+        f.store.removeFromDevice(f.records[1])
+        XCTAssertEqual(f.model.entries.map(\.id), Array(f.records[2...4]).map(\.id))
+        XCTAssertEqual(f.model.positionLabel, "1 / 3")
+        XCTAssertFalse(f.model.canMove(.previous))
+        XCTAssertEqual(f.model.neighbor(.next)?.id, f.records[3].id)
+        XCTAssertTrue(f.requests.ids.isEmpty)
+    }
+
+    @MainActor func testCloseCancelsMetadataSubscription() throws {
+        let f = try fixture()
+        f.model.close()
+        XCTAssertTrue(f.store.toggleFavorite(f.records[0].id))
+        XCTAssertEqual(f.model.currentEntry?.isFavorite, false)
+        XCTAssertFalse(f.model.canMove(.next))
+        XCTAssertFalse(f.model.select(f.records[1].id))
+        XCTAssertTrue(f.requests.ids.isEmpty)
+    }
+
+    @MainActor func testUnchangedPlaybackSnapshotsDoNotPublishRepeatedly() throws {
+        let f = try fixture()
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].tick(12)
+        var updates = 0
+        let subscription = f.model.player.objectWillChange.sink { _ in updates += 1 }
+        for _ in 0..<100 { f.pool.engines[0].tick(12) }
+        XCTAssertEqual(updates, 0)
+        withExtendedLifetime(subscription) {}
     }
 }
