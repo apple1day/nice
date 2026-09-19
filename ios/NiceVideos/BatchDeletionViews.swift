@@ -1,104 +1,105 @@
 import SwiftUI
 
+// Only this tiny adapter observes the broad store. The actual list observes its
+// metadata-only model, not download progress or playback presentation changes.
 struct OfflineView: View {
     @EnvironmentObject private var store: VideoStore
+    var body: some View { OfflineLibraryContent(store: store) }
+}
+
+private struct OfflineLibraryContent: View {
+    let store: VideoStore
+    @StateObject private var library: LocalLibraryModel
     @State private var search = ""
     @State private var selection = BatchSelection()
     @State private var deletion: BatchDeletionRequest?
     @State private var result: BatchDeletionResult?
 
-    private var filtered: [DownloadRecord] {
-        store.completed.filter { search.isEmpty || $0.video.name.localizedCaseInsensitiveContains(search) }
+    init(store: VideoStore) {
+        self.store = store
+        _library = StateObject(wrappedValue: LocalLibraryModel(store: store))
     }
-    private var visibleTokens: [String] { filtered.map(\.taskToken) }
-    private var selected: [DownloadRecord] { filtered.filter { selection.contains($0.taskToken) } }
-
+    private var selected: [DownloadRecord] {
+        library.visibleRows.map(\.record).filter { selection.contains($0.taskToken) }
+    }
     var body: some View {
         List {
             Section {
-                Label("所有播放均读取手机文件，无需服务器在线。", systemImage: "checkmark.shield")
-                    .font(.footnote).foregroundStyle(.secondary)
-                Text("\(store.completed.count) 个视频 · \(ByteCountFormatter.string(fromByteCount: store.usedBytes, countStyle: .file))")
+                HStack {
+                    Text(library.summary)
+                    Spacer(minLength: 8)
+                    if !library.pendingRecords.isEmpty {
+                        Text("待删除 \(library.pendingRecords.count)").foregroundStyle(.orange)
+                    }
+                }.font(.footnote)
                 if selection.isSelecting {
-                    Text("点击视频勾选；全选仅针对当前搜索结果。")
-                        .font(.footnote).foregroundStyle(.secondary)
+                    Text("全选仅针对当前搜索结果。").font(.caption).foregroundStyle(.secondary)
+                }
+                if let notice = library.notice {
+                    Text(notice).font(.caption).foregroundStyle(.secondary)
                 }
             }
             if let result = result { BatchDeletionResultSection(result: result) }
-            if !selection.isSelecting { PendingDeletionSection() }
-            ForEach(filtered) { record in
+            ForEach(library.visibleRows) { row in
                 Button {
-                    if selection.isSelecting { selection.toggle(record.taskToken) }
-                    else { store.playLocal(record) }
+                    if selection.isSelecting { selection.toggle(row.record.taskToken) }
+                    else { store.playLocal(row.record) }
                 } label: {
-                    HStack {
-                        if selection.isSelecting {
-                            SelectionIndicator(selected: selection.contains(record.taskToken))
-                        } else {
-                            Image(systemName: "play.circle.fill").font(.title)
-                        }
-                        VStack(alignment: .leading, spacing: 5) {
-                            HStack(spacing: 6) {
-                                Text(record.video.name).foregroundStyle(.primary).lineLimit(2)
-                                if record.isFavorite {
-                                    Image(systemName: "star.fill")
-                                        .foregroundStyle(.yellow)
-                                        .accessibilityLabel("已收藏")
-                                        .accessibilityIdentifier("favoriteBadge.\(record.id)")
-                                }
-                            }
-                            Text("\(record.video.fileExtension.uppercased()) · \(record.video.sizeLabel)")
-                                .font(.caption).foregroundStyle(.secondary)
-                            if store.isPendingDeletion(record.id) {
-                                Label("待删除", systemImage: "trash").font(.caption).foregroundStyle(.orange)
-                            }
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.vertical, 4)
-                    .contentShape(Rectangle())
+                    LocalVideoRowLabel(row: row, selecting: selection.isSelecting,
+                                       selected: selection.contains(row.record.taskToken)).equatable()
                 }
                 .buttonStyle(.plain)
                 .accessibilityValue(selection.isSelecting
-                                    ? (selection.contains(record.taskToken) ? "已选择" : "未选择") : "本地播放")
-                .accessibilityIdentifier("localVideoRow.\(record.id)")
+                    ? (selection.contains(row.record.taskToken) ? "已选择" : "未选择")
+                    : (row.record.hasWatched ? "已观看，本地播放" : "未观看，本地播放"))
+                .accessibilityIdentifier("localVideoRow.\(row.id)")
                 .swipeActions(allowsFullSwipe: false) {
                     if !selection.isSelecting {
                         Button("删除", role: .destructive) {
-                            deletion = BatchDeletionRequest(scope: .localVideos, records: [record])
-                        }.disabled(store.restoring)
+                            deletion = BatchDeletionRequest(scope: .localVideos, records: [row.record])
+                        }.disabled(library.restoring)
+                    }
+                }
+                .contextMenu {
+                    if !selection.isSelecting && row.record.pendingDeletionOrder != nil {
+                        Button("撤销待删除") { store.unmarkForDeletion(row.id) }
                     }
                 }
             }
-            if filtered.isEmpty {
+            if library.visibleRows.isEmpty {
                 ContentUnavailableView(search.isEmpty ? "暂无本地视频" : "没有匹配的视频", systemImage: "internaldrive",
-                    description: Text("在「设置」连接视频站，再到「服务器」下载。完成后即可在此离线播放。"))
+                    description: Text("在「服务器」下载视频后即可离线播放。"))
             }
         }
         .navigationTitle("本地视频")
         .searchable(text: $search, prompt: "搜索本地视频")
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                PendingDeleteToolbarButton(records: library.pendingRecords, disabled: library.restoring) { snapshot in
+                    store.deletePendingVideos(snapshot)
+                    selection.retainVisible(library.visibleTokens)
+                }
                 if selection.isSelecting {
-                    Button(selection.allSelected(in: visibleTokens) ? "取消全选" : "全选") {
-                        selection.toggleAll(in: visibleTokens)
-                    }.disabled(filtered.isEmpty)
+                    Button(selection.allSelected(in: library.visibleTokens) ? "取消全选" : "全选") {
+                        selection.toggleAll(in: library.visibleTokens)
+                    }.disabled(library.visibleRows.isEmpty)
                     Button("取消") { selection.cancel() }
                 } else {
                     Button("选择") { result = nil; selection.begin() }
-                        .disabled(filtered.isEmpty || store.restoring)
+                        .disabled(library.visibleRows.isEmpty || library.restoring)
                         .accessibilityIdentifier("selectLocalVideosButton")
                 }
             }
         }
         .safeAreaInset(edge: .bottom) {
             if selection.isSelecting {
-                BatchDeletionFooter(count: selected.count, disabled: store.restoring) {
+                BatchDeletionFooter(count: selection.tokens.count, disabled: library.restoring) {
                     deletion = BatchDeletionRequest(scope: .localVideos, records: selected)
                 }
             }
         }
-        .onChange(of: visibleTokens) { _, tokens in selection.retainVisible(tokens) }
+        .onChange(of: search) { _, value in library.setSearch(value) }
+        .onChange(of: library.visibleTokens) { _, tokens in selection.retainVisible(tokens) }
         .confirmationDialog(deletion?.title ?? "删除本地视频？", isPresented: Binding(
             get: { deletion != nil }, set: { if !$0 { deletion = nil } }
         ), titleVisibility: .visible, presenting: deletion) { snapshot in
@@ -106,14 +107,70 @@ struct OfflineView: View {
             Button("取消", role: .cancel) { deletion = nil }
         } message: { snapshot in Text(snapshot.message) }
     }
-
     private func performDeletion(_ snapshot: BatchDeletionRequest) {
         deletion = nil
         let outcome = store.deleteBatch(snapshot)
         result = outcome
-        selection.retainVisible(visibleTokens)
-        // Keep failed rows selected so they can be retried; successful rows vanish.
+        selection.retainVisible(library.visibleTokens)
         if outcome.failures.isEmpty { selection.cancel() }
+    }
+}
+
+private struct LocalVideoRowLabel: View, Equatable {
+    let row: LocalLibraryRow
+    let selecting: Bool
+    let selected: Bool
+    var body: some View {
+        HStack(spacing: 12) {
+            if selecting { SelectionIndicator(selected: selected) }
+            else { Image(systemName: "play.circle.fill").font(.title) }
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text(row.record.video.name).foregroundStyle(.primary).lineLimit(2)
+                    if row.record.isFavorite {
+                        Image(systemName: "star.fill").foregroundStyle(.yellow)
+                            .accessibilityLabel("已收藏").accessibilityIdentifier("favoriteBadge.\(row.id)")
+                    }
+                }
+                Text(row.subtitle).font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 10) {
+                    Label(row.record.hasWatched ? "已观看" : "未观看",
+                          systemImage: row.record.hasWatched ? "eye.fill" : "eye")
+                        .foregroundStyle(row.record.hasWatched ? Color.secondary : Color.accentColor)
+                        .accessibilityIdentifier("watchedBadge.\(row.id)")
+                    if row.record.pendingDeletionOrder != nil {
+                        Label("待删除", systemImage: "trash").foregroundStyle(.orange)
+                    }
+                }.font(.caption)
+            }
+            Spacer(minLength: 0)
+        }.padding(.vertical, 4).contentShape(Rectangle())
+    }
+}
+
+private struct PendingDeleteToolbarButton: View {
+    let records: [DownloadRecord]
+    let disabled: Bool
+    let action: ([DownloadRecord]) -> Void
+    @State private var confirmed: [DownloadRecord] = []
+    @State private var showConfirmation = false
+    var body: some View {
+        Button("删除待删除", role: .destructive) {
+            confirmed = records
+            showConfirmation = true
+        }
+        .disabled(disabled || records.isEmpty)
+        .accessibilityIdentifier("deleteAllPendingVideosButton")
+        .confirmationDialog("删除这 \(confirmed.count) 个待删除视频？", isPresented: $showConfirmation,
+                            titleVisibility: .visible) {
+            Button("确认删除手机副本", role: .destructive) {
+                action(confirmed)
+                confirmed = []
+            }
+            Button("取消", role: .cancel) { confirmed = [] }
+        } message: {
+            Text("删除本次确认时的待删除手机副本，不受搜索条件影响。不会删除服务器文件；正在播放、已撤销标记或重新下载的项目会保留。")
+        }
     }
 }
 

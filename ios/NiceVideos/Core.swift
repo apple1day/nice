@@ -69,10 +69,13 @@ struct DownloadRecord: Codable, Identifiable, Equatable {
     var state: DownloadState
     var message: String?
     // Optional fields keep old downloads.json files backward-compatible.
-    // Persist queue/favorite state with the record instead of a separate index.
+    // No timestamp is invented for existing downloads: their saved order is used.
     var pendingDeletionOrder: Int?
     var favorite: Bool?
+    var downloadedAt: Date?
+    var watched: Bool?
     var isFavorite: Bool { favorite == true }
+    var hasWatched: Bool { watched == true }
     var taskToken: String { id + "|" + attempt }
     var fileName: String { id + "." + video.fileExtension }
     init(video: Video, server: URL) {
@@ -84,6 +87,8 @@ struct DownloadRecord: Codable, Identifiable, Equatable {
         message = nil
         pendingDeletionOrder = nil
         favorite = false
+        downloadedAt = nil
+        watched = false
     }
 }
 struct DownloadManifest: Codable {
@@ -108,7 +113,10 @@ final class LocalStorage {
     let root: URL
     private let media: URL
     private let fm = FileManager.default
-    init(root: URL? = nil) throws {
+    // Optional instrumentation for regression tests; no file I/O or logging.
+    private let onVerify: ((String) -> Void)?
+    init(root: URL? = nil, onVerify: ((String) -> Void)? = nil) throws {
+        self.onVerify = onVerify
         self.root = try root ?? FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: true
@@ -149,6 +157,7 @@ final class LocalStorage {
         return media.appendingPathComponent(record.fileName, isDirectory: false)
     }
     func verifiedFile(for record: DownloadRecord) -> URL? {
+        onVerify?(record.id)
         guard let file = try? destination(for: record),
               let attrs = try? fm.attributesOfItem(atPath: file.path),
               attrs[.type] as? FileAttributeType == .typeRegular,

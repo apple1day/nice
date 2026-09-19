@@ -54,6 +54,9 @@ final class PlaylistPlaybackTests: XCTestCase {
                               downloadUrl: "/api/download/\(name)")
             var record = DownloadRecord(video: video, server: try ServerAddress.normalize("http://127.0.0.1:\(8100 + index)"))
             record.state = .complete
+            // Explicit newest-first dates retain the fixture's display order.
+            // Legacy reverse order is covered separately by LibraryPoliciesTests.
+            record.downloadedAt = Date(timeIntervalSince1970: Double(count - index))
             try Data([1, 2, 3, 4]).write(to: disk.destination(for: record))
             records.append(record)
         }
@@ -112,7 +115,7 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertEqual(f.pool.engines[0].stopCount, 1)
         XCTAssertEqual(f.defaults.double(forKey: "position." + f.records[0].id), 12)
         XCTAssertEqual(f.pool.previousWasStoppedBeforeCreation, [true])
-        XCTAssertEqual(f.pool.engines[1].playCount, 0) // Starts only after drawable mounting.
+        XCTAssertEqual(f.pool.engines[1].playCount, 0)
     }
     @MainActor func testMissingNextFileIsSkipped() throws {
         let f = try fixture()
@@ -181,7 +184,6 @@ final class PlaylistPlaybackTests: XCTestCase {
             if index > 0 { XCTAssertTrue(f.model.move(.next)) }
             XCTAssertTrue(f.store.markForDeletion(f.model.current.key))
         }
-        // Marking four clips must retain all files. Only an explicit list action deletes.
         for record in f.records { XCTAssertNotNil(f.disk.verifiedFile(for: record)) }
         XCTAssertEqual(f.store.pendingDeletionRecords.count, 4)
         XCTAssertEqual(f.model.positionLabel, "4 / 5")
@@ -259,7 +261,6 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertTrue(f.model.move(.previous))
         XCTAssertEqual(f.model.current.key, f.records[3].id)
     }
-
     @MainActor func testLargeLibraryControlReadsAndSeeksDoNotResolveFiles() throws {
         let f = try fixture(count: 600, start: 300)
         f.model.player.attach(to: UIView())
@@ -278,19 +279,16 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertEqual(f.pool.engines[0].loaded.count, 1)
         XCTAssertEqual(f.pool.engines[0].stopCount, 0)
     }
-
     @MainActor func testNextValidatesOnlyTheRequestedNeighbor() throws {
         let f = try fixture(count: 20)
         XCTAssertTrue(f.requests.ids.isEmpty)
         XCTAssertTrue(f.model.move(.next))
         XCTAssertEqual(f.requests.ids, [f.records[1].id])
     }
-
     @MainActor func testMissingNeighborIsCheckedLazilyWithoutScanningOtherFiles() throws {
         let f = try fixture(count: 20)
         try f.disk.remove(f.records[1])
         for _ in 0..<100 {
-            // Metadata remains usable without touching the missing file.
             XCTAssertEqual(f.model.neighbor(.next)?.id, f.records[1].id)
             XCTAssertEqual(f.model.entries.count, 20)
         }
@@ -299,13 +297,11 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertEqual(f.requests.ids, [f.records[1].id, f.records[2].id])
         XCTAssertEqual(f.model.current.key, f.records[2].id)
     }
-
     @MainActor func testDirectSelectionDoesNotValidateInterveningClips() throws {
         let f = try fixture(count: 20)
         XCTAssertTrue(f.model.select(f.records[19].id))
         XCTAssertEqual(f.requests.ids, [f.records[19].id])
     }
-
     @MainActor func testFavoriteAndPendingMetadataUpdateWithoutResolvingPlaylist() throws {
         let f = try fixture()
         XCTAssertTrue(f.store.toggleFavorite(f.records[0].id))
@@ -317,7 +313,6 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertNil(f.model.currentEntry?.pendingDeletionOrder)
         XCTAssertTrue(f.requests.ids.isEmpty)
     }
-
     @MainActor func testDeletingOtherItemsRefreshesNeighborAndPositionCache() throws {
         let f = try fixture(start: 2)
         f.store.removeFromDevice(f.records[0])
@@ -328,7 +323,6 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertEqual(f.model.neighbor(.next)?.id, f.records[3].id)
         XCTAssertTrue(f.requests.ids.isEmpty)
     }
-
     @MainActor func testCloseCancelsMetadataSubscription() throws {
         let f = try fixture()
         f.model.close()
@@ -338,7 +332,6 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertFalse(f.model.select(f.records[1].id))
         XCTAssertTrue(f.requests.ids.isEmpty)
     }
-
     @MainActor func testUnchangedPlaybackSnapshotsDoNotPublishRepeatedly() throws {
         let f = try fixture()
         f.model.player.attach(to: UIView())

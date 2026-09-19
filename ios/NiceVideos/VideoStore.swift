@@ -7,7 +7,9 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     static let sessionID = (Bundle.main.bundleIdentifier ?? "com.anxiong.nicevideos") + ".downloads.v1"
     @Published private(set) var server: String
     @Published private(set) var videos: [Video] = []
-    @Published private(set) var records: [DownloadRecord] = []
+    @Published private(set) var records: [DownloadRecord] = [] {
+        didSet { rebuildRecordCache() }
+    }
     @Published private(set) var progress: [String: Double] = [:]
     @Published private(set) var loading = false
     @Published private(set) var restoring = true
@@ -18,8 +20,12 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     var backgroundCompletion: (() -> Void)?
     private let defaults: UserDefaults
     private var disk: LocalStorage?
-    // The cover binding can become nil BEFORE VLC stops. Keep the lease until
-    // PlaybackScreen closes the model, so a deletion cannot race its bookmark write.
+    private var recordsByID: [String: DownloadRecord] = [:]
+    private var completedCache: [DownloadRecord] = []
+    private var unfinishedCache: [DownloadRecord] = []
+    private var pendingCache: [DownloadRecord] = []
+    private var usedBytesCache: Int64 = 0
+    // Keep the lease until the engine closes, including cover dismissal.
     private var playbackSession: PlaybackRequest?
     private var catalogs: [String: [Video]] = [:]
     private var active: [String: URLSessionDownloadTask] = [:]
@@ -38,8 +44,6 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         return URLSession(configuration: config, delegate: self, delegateQueue: .main)
     }()
 
-    // Tests supply an isolated directory/defaults and disable OS transfer restoration.
-    // Startup NEVER fetches the remote catalog, and playback NEVER needs a session.
     init(storage: LocalStorage? = nil, defaults: UserDefaults = .standard, restoreDownloads: Bool = true) {
         self.defaults = defaults
         server = defaults.string(forKey: "server") ?? ""
@@ -50,24 +54,65 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             try storage.recoverRemovals(records: records) { id in
                 defaults.removeObject(forKey: "position." + id)
             }
-            disk = storage // Publish only after safe recovery; never overwrite unreadable/missing recovery state.
+            disk = storage
+            migrateLegacyWatchFlags()
             do { catalogs = try storage.loadCatalogs() }
             catch { catalogNotice = "列表缓存读取失败；本地下载不受影响。" }
             videos = catalogs[server] ?? []
-            reconcileFiles()
+            // A completed manifest entry is displayed without stat/open. Only
+            // interrupted transfers need startup recovery. Explicit play validates
+            // its target; the active root never rescans all files on foreground.
+            reconcileFiles(ids: Set(unfinishedCache.map(\.id)))
         } catch { errorMessage = "本地存储读取失败：\(error.localizedDescription)" }
         if restoreDownloads { restoreTransfers() } else { restoring = false }
     }
-    var completed: [DownloadRecord] { records.filter { $0.state == .complete } }
-    var unfinished: [DownloadRecord] { records.filter { $0.state != .complete } }
-    var usedBytes: Int64 { completed.reduce(0) { $0 + $1.video.size } }
+
+    private func rebuildRecordCache() {
+        recordsByID = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
+        completedCache = records.filter { $0.state == .complete }
+        unfinishedCache = records.filter { $0.state != .complete }
+        usedBytesCache = completedCache.reduce(0) { $0 + $1.video.size }
+        pendingCache = records.filter { $0.pendingDeletionOrder != nil }.sorted {
+            let a = $0.pendingDeletionOrder ?? 0
+            let b = $1.pendingDeletionOrder ?? 0
+            return a == b ? $0.id < $1.id : a < b
+        }
+    }
+    var completed: [DownloadRecord] { completedCache }
+    var unfinished: [DownloadRecord] { unfinishedCache }
+    var usedBytes: Int64 { usedBytesCache }
+
+    private func migrateLegacyWatchFlags() {
+        guard let disk = disk else { return }
+        var next = records
+        for index in next.indices where next[index].watched == nil {
+            let position = defaults.double(forKey: "position." + next[index].id)
+            if position.isFinite && position > 0 { next[index].watched = true }
+        }
+        guard next != records else { return }
+        do { try disk.saveRecords(next); records = next }
+        catch { errorMessage = "旧观看标记保存失败，原索引已保留：\(error.localizedDescription)" }
+    }
+    // Called only by a live engine after playing with video output, once per clip.
+    // No video-file checks, no changes to download order, favorites or deletion.
+    func markWatched(_ id: String) {
+        guard playbackSession?.key == id,
+              let index = records.firstIndex(where: { $0.id == id }),
+              records[index].state == .complete, !records[index].hasWatched,
+              let disk = disk else { return }
+        var next = records
+        next[index].watched = true
+        do { try disk.saveRecords(next); records = next }
+        catch { errorMessage = "观看标记保存失败：\(error.localizedDescription)" }
+    }
+
     func configureServer(_ input: String) {
         do {
             let base = try ServerAddress.normalize(input)
             server = base.absoluteString
             defaults.set(server, forKey: "server")
             videos = catalogs[server] ?? []
-            refresh() // Explicit user action only.
+            refresh()
         } catch { errorMessage = error.localizedDescription }
     }
     func refresh() {
@@ -110,7 +155,8 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     }
     func record(for video: Video) -> DownloadRecord? {
         guard let base = try? ServerAddress.normalize(server) else { return nil }
-        return records.first { $0.id == video.storageID(server: base) }
+        // Hash once, not once for every record in a linear search.
+        return recordsByID[video.storageID(server: base)]
     }
     func download(_ video: Video) {
         do { try begin(video, from: ServerAddress.normalize(server)) }
@@ -134,8 +180,8 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             defaults.removeObject(forKey: "position." + id)
         }
         let id = video.storageID(server: base)
-        let existing = records.first(where: { $0.id == id })
-        if let existing {
+        let existing = recordsByID[id]
+        if let existing = existing {
             if existing.state == .downloading { return }
             if existing.state == .complete, disk.verifiedFile(for: existing) != nil { return }
         }
@@ -147,39 +193,40 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         var record = DownloadRecord(video: video, server: base)
         record.favorite = existing?.favorite ?? false
+        record.watched = existing?.watched ?? false
         let previous = records
-        records.removeAll { $0.id == id }
-        records.append(record)
-        do { try disk.saveRecords(records) } catch { records = previous; throw error }
+        var next = records.filter { $0.id != id }
+        next.append(record)
+        try disk.saveRecords(next)
+        records = next
         let task = session.downloadTask(with: request)
         task.taskDescription = record.taskToken
         task.countOfBytesClientExpectsToReceive = video.size
         active[id] = task
         progress[id] = 0
         task.resume()
+        _ = previous // The prior manifest is never published away before a successful save.
     }
     func cancel(_ record: DownloadRecord) {
         guard let index = records.firstIndex(where: { $0.taskToken == record.taskToken }),
               records[index].state == .downloading else { return }
-        records[index].state = .failed
-        records[index].message = "已取消。重新下载会从头开始。"
+        var next = records
+        next[index].state = .failed
+        next[index].message = "已取消。重新下载会从头开始。"
+        records = next
         active.removeValue(forKey: record.id)?.cancel()
         progress.removeValue(forKey: record.id)
         lastProgress.removeValue(forKey: record.id)
         saveRecords()
     }
     func removeFromDevice(_ record: DownloadRecord) {
-        guard let current = records.first(where: { $0.taskToken == record.taskToken }) else { return }
+        guard let current = recordsByID[record.id], current.taskToken == record.taskToken else { return }
         do {
             let warning = try deleteLocally(current, saving: records.filter { $0.id != current.id })
             deletionNotice = warning ?? "已删除手机副本：\(current.video.name)"
         } catch { errorMessage = "删除本地文件失败：\(error.localizedDescription)" }
     }
-
-    func isFavorite(_ id: String) -> Bool {
-        records.first(where: { $0.id == id })?.isFavorite == true
-    }
-
+    func isFavorite(_ id: String) -> Bool { recordsByID[id]?.isFavorite == true }
     @discardableResult func toggleFavorite(_ id: String) -> Bool {
         do {
             guard let disk = disk else { throw ClientError("本地存储不可用。") }
@@ -199,7 +246,6 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             return isFavorite(id)
         }
     }
-
     func play(_ video: Video) {
         guard let record = record(for: video), record.state == .complete else {
             errorMessage = "请先下载视频，下载完成后才能本地播放。"
@@ -216,17 +262,13 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             playback = request
         } catch {
             errorMessage = error.localizedDescription
-            reconcileFiles()
+            reconcileFiles(ids: [record.id])
         }
     }
-
-    // All verified local downloads in the same order as the unfiltered local
-    // library. No server setting, catalog, reachability check or URLSession.
-    var localPlaylistRecords: [DownloadRecord] {
-        completed.filter { disk?.verifiedFile(for: $0) != nil }
-    }
+    // Compatibility accessor: metadata only; opening a target still validates it.
+    var localPlaylistRecords: [DownloadRecord] { completedCache }
     func localPlaybackRequest(for id: String) throws -> PlaybackRequest {
-        guard let record = records.first(where: { $0.id == id }),
+        guard let record = recordsByID[id],
               record.state == .complete, let file = disk?.verifiedFile(for: record) else {
             throw ClientError("本地文件缺失或下载未完成，请重新下载。")
         }
@@ -237,22 +279,16 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         guard playback != nil, playbackSession?.id == old.id else {
             throw ClientError("播放会话已结束，请重新打开本地视频。")
         }
-        // Revalidate the target before stopping anything. Reject caller-supplied
-        // paths even when they happen to be valid local media elsewhere.
         let verified = try localPlaybackRequest(for: next.key)
         guard verified.url == next.url else { throw ClientError("播放文件与本地索引不一致。") }
         stopCurrent()
         playbackSession = next
         deletionNotice = nil
-        // Keep playback (the presentation anchor) unchanged: switching must not
-        // dismiss/re-present the cover or reset fullscreen/auto-hide UI state.
     }
     private func isPlaybackProtected(_ id: String) -> Bool {
-        // Once a playlist has switched, the old cover item is NOT an active file.
         if let current = playbackSession { return current.key == id }
         return playback?.key == id
     }
-    // Called AFTER PlaybackModel.close(). Old drawables cannot release a new lease.
     func playbackDidClose(_ request: PlaybackRequest) {
         if playbackSession?.id == request.id {
             playbackSession = nil
@@ -261,23 +297,24 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             playback = nil
         }
     }
-    func reconcileFiles() {
+    // Explicit maintenance only when ids is nil. Playback/list rendering never
+    // calls this with all records. Mutations are published once, not per file.
+    func reconcileFiles(ids: Set<String>? = nil) {
         guard let disk = disk else { return }
-        var changed = false
-        for i in records.indices {
-            if disk.verifiedFile(for: records[i]) != nil {
-                if records[i].state != .complete {
-                    records[i].state = .complete
-                    records[i].message = nil
-                    changed = true
+        var next = records
+        for i in next.indices where ids?.contains(next[i].id) ?? true {
+            if disk.verifiedFile(for: next[i]) != nil {
+                if next[i].state != .complete {
+                    next[i].state = .complete
+                    next[i].message = nil
+                    if next[i].downloadedAt == nil { next[i].downloadedAt = Date() }
                 }
-            } else if records[i].state == .complete {
-                records[i].state = .failed
-                records[i].message = "本地文件缺失或大小异常，请重新下载。"
-                changed = true
+            } else if next[i].state == .complete {
+                next[i].state = .failed
+                next[i].message = "本地文件缺失或大小异常，请重新下载。"
             }
         }
-        if changed { saveRecords() }
+        if next != records { records = next; saveRecords() }
     }
     private func saveRecords() {
         do { try disk?.saveRecords(records) }
@@ -298,12 +335,14 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
                     self.active[record.id] = download
                     if download.state == .suspended { download.resume() }
                 }
-                for i in self.records.indices where self.records[i].state == .downloading {
-                    if !live.contains(self.records[i].taskToken) {
-                        self.records[i].state = .failed
-                        self.records[i].message = "系统中已无此下载任务，可能被强制退出中断，可重新下载。"
+                var next = self.records
+                for i in next.indices where next[i].state == .downloading {
+                    if !live.contains(next[i].taskToken) {
+                        next[i].state = .failed
+                        next[i].message = "系统中已无此下载任务，可能被强制退出中断，可重新下载。"
                     }
                 }
+                if next != self.records { self.records = next }
                 self.restoring = false
                 self.saveRecords()
             }
@@ -326,27 +365,33 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let index = index(for: downloadTask), records[index].state == .downloading else { return }
         let record = records[index]
+        var next = records
         do {
             guard let disk = disk else { throw ClientError("本地存储不可用。") }
             try disk.finish(temp: location, response: downloadTask.response, record: record)
-            records[index].state = .complete
-            records[index].message = nil
+            next[index].state = .complete
+            next[index].message = nil
+            next[index].downloadedAt = Date()
             progress[record.id] = 1
         } catch {
-            records[index].state = .failed
-            records[index].message = error.localizedDescription
+            next[index].state = .failed
+            next[index].message = error.localizedDescription
         }
+        records = next
         active.removeValue(forKey: record.id)
         lastProgress.removeValue(forKey: record.id)
         saveRecords()
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let index = index(for: task), records[index].state == .downloading, let error = error else { return }
-        records[index].state = .failed
-        records[index].message = error.localizedDescription + "；可重新下载（从头开始）。"
-        active.removeValue(forKey: records[index].id)
-        progress.removeValue(forKey: records[index].id)
-        lastProgress.removeValue(forKey: records[index].id)
+        var next = records
+        next[index].state = .failed
+        next[index].message = error.localizedDescription + "；可重新下载（从头开始）。"
+        let id = next[index].id
+        records = next
+        active.removeValue(forKey: id)
+        progress.removeValue(forKey: id)
+        lastProgress.removeValue(forKey: id)
         saveRecords()
     }
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
@@ -357,48 +402,37 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
 }
 
 extension VideoStore {
-    var pendingDeletionRecords: [DownloadRecord] {
-        records.filter { $0.pendingDeletionOrder != nil }.sorted {
-            let left = $0.pendingDeletionOrder ?? 0
-            let right = $1.pendingDeletionOrder ?? 0
-            return left == right ? $0.id < $1.id : left < right
-        }
-    }
-    func isPendingDeletion(_ id: String) -> Bool {
-        records.contains { $0.id == id && $0.pendingDeletionOrder != nil }
-    }
-
-    // Marking never removes a file. The queue has no item limit and is persisted
-    // with the download manifest. Actual deletion only happens after the list-page
-    // "一键删除" confirmation calls deleteAllPendingVideos.
+    var pendingDeletionRecords: [DownloadRecord] { pendingCache }
+    func isPendingDeletion(_ id: String) -> Bool { recordsByID[id]?.pendingDeletionOrder != nil }
     @discardableResult func markForDeletion(_ id: String) -> Bool {
         do {
             guard let disk = disk else { throw ClientError("本地存储不可用。") }
-            guard let record = records.first(where: { $0.id == id }),
-                  record.state == .complete, disk.verifiedFile(for: record) != nil else {
+            guard let record = recordsByID[id], record.state == .complete,
+                  disk.verifiedFile(for: record) != nil else {
                 throw ClientError("只能把下载完成且存在的本地视频加入待删除列表。")
             }
             if isPendingDeletion(id) { return true }
             let ids = pendingDeletionRecords.map(\.id) + [id]
+            let order = Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($0.element, $0.offset) })
             var next = records
-            for index in next.indices { next[index].pendingDeletionOrder = ids.firstIndex(of: next[index].id) }
+            for index in next.indices { next[index].pendingDeletionOrder = order[next[index].id] }
             try disk.saveRecords(next)
             records = next
-            deletionNotice = "已加入待删除列表（\(ids.count) 个）。不会自动删除，请在本地视频列表顶部点击“一键删除”。"
+            deletionNotice = "已加入待删除列表（\(ids.count) 个），请在列表顶部点击“删除待删除”。"
             return true
         } catch {
             errorMessage = "未加入待删除列表，原列表保留：\(error.localizedDescription)"
             return false
         }
     }
-
     @discardableResult func unmarkForDeletion(_ id: String) -> Bool {
         guard isPendingDeletion(id) else { return true }
         do {
             guard let disk = disk else { throw ClientError("本地存储不可用。") }
             let ids = pendingDeletionRecords.map(\.id).filter { $0 != id }
+            let order = Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($0.element, $0.offset) })
             var next = records
-            for index in next.indices { next[index].pendingDeletionOrder = ids.firstIndex(of: next[index].id) }
+            for index in next.indices { next[index].pendingDeletionOrder = order[next[index].id] }
             try disk.saveRecords(next)
             records = next
             deletionNotice = "已撤销待删除，手机文件保留。"
@@ -408,9 +442,12 @@ extension VideoStore {
             return false
         }
     }
-
-    // A confirmation dialog may supply a snapshot of IDs. Never expand its scope
-    // to unrelated downloads or to videos added after the confirmation opened.
+    // A stale confirmation must not delete a fresh re-download of the same ID.
+    @discardableResult func deletePendingVideos(_ snapshot: [DownloadRecord]) -> Int {
+        let tokens = Set(snapshot.map(\.taskToken))
+        let ids = pendingDeletionRecords.filter { tokens.contains($0.taskToken) }.map(\.id)
+        return deleteAllPendingVideos(ids: ids)
+    }
     @discardableResult func deleteAllPendingVideos(ids: [String]? = nil) -> Int {
         let selected = ids.map { Set($0) }
         let queue = pendingDeletionRecords.filter { selected?.contains($0.id) ?? true }
@@ -432,7 +469,6 @@ extension VideoStore {
         }
         return deleted
     }
-
     private func deleteLocally(_ record: DownloadRecord, saving next: [DownloadRecord]) throws -> String? {
         guard !isPlaybackProtected(record.id) else {
             throw ClientError("此视频仍在播放，请先关闭播放器后重试。")

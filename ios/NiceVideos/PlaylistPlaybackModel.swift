@@ -34,10 +34,15 @@ final class PlaylistPlaybackModel: ObservableObject {
         self.manageAudioSession = manageAudioSession
         resolveRequest = requestResolver ?? { try store.localPlaybackRequest(for: $0) }
         current = request
-        // Completed is an in-memory manifest query, NOT localPlaylistRecords
-        // (which performs filesystem checks). Only the selected target is opened.
-        playlist = LocalPlaybackPlaylist(ids: store.completed.map(\.id), currentID: request.key)
-        player = PlaybackModel(request: request, engine: engineFactory(), defaults: defaults,
+        // Match the visible library order, newest completion first, without stat.
+        // Snapshot it once: watching/favoriting and new downloads cannot reshuffle
+        // the active playlist under the user's previous/next buttons.
+        let ordered = LocalLibraryOrder.newestFirst(store.completed, completedAt: { $0.downloadedAt })
+        playlist = LocalPlaybackPlaylist(ids: ordered.map(\.id), currentID: request.key)
+        let engine = WatchedPlaybackEngine(base: engineFactory()) { [weak store] in
+            store?.markWatched(request.key)
+        }
+        player = PlaybackModel(request: request, engine: engine, defaults: defaults,
                                manageAudioSession: manageAudioSession)
         recordSubscription = store.$records.removeDuplicates().sink { [weak self] records in
             // @Published emits before store.records is assigned. Use the emitted
@@ -107,10 +112,12 @@ final class PlaylistPlaybackModel: ObservableObject {
         switching = true
         defer { switching = false }
         do {
-            // Keep the store's target-only revalidation and playback lease. Never
-            // trade file/deletion safety for speed, or stop the current player first.
+            // Keep target-only validation and the deletion lease.
             try store.transitionPlayback(from: current, to: next) { player.close() }
-            let nextPlayer = PlaybackModel(request: next, engine: engineFactory(), defaults: defaults,
+            let engine = WatchedPlaybackEngine(base: engineFactory()) { [weak store] in
+                store?.markWatched(next.key)
+            }
+            let nextPlayer = PlaybackModel(request: next, engine: engine, defaults: defaults,
                                            manageAudioSession: manageAudioSession)
             playlist.select(next.key)
             current = next

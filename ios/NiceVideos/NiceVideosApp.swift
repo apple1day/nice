@@ -13,8 +13,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 @main
 struct NiceVideosApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var store = VideoStore.shared
+    // The root subscribes only to presentation changes, not every progress tick.
+    private let store = VideoStore.shared
     var body: some Scene {
-        WindowGroup { UpdatedRootView().environmentObject(store) }
+        WindowGroup { LibraryRootView(store: store).environmentObject(store) }
     }
 }
