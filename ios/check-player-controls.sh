@@ -8,7 +8,7 @@ scratch="$(mktemp -d "${TMPDIR:-/tmp}/nice-controls.XXXXXX")"
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$scratch/Sources/NiceVideos" "$scratch/Tests/NiceVideosTests"
 cp NiceVideos/PlaybackControlsState.swift "$scratch/Sources/NiceVideos/"
-cp Tests/PlaybackControlsTests.swift "$scratch/Tests/NiceVideosTests/"
+cp Tests/PlaybackControlsTests.swift Tests/PlayerButtonPressTests.swift "$scratch/Tests/NiceVideosTests/"
 cat > "$scratch/Package.swift" <<'PACKAGE'
 // swift-tools-version: 5.9
 import PackageDescription

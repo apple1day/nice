@@ -108,6 +108,31 @@ final class PlaylistPlaybackModel: ObservableObject {
         catch { notice = "无法切换：\(error.localizedDescription)"; return false }
     }
 
+    // Explicit metadata action, independent of seeking, decoder readiness and
+    // cached button appearance. A stale press must never mark a different clip.
+    @discardableResult func markCurrentForDeletion(expectedRequestID: UUID) -> Bool {
+        guard !closed, !switching, store.playback != nil,
+              current.id == expectedRequestID else {
+            notice = "视频已切换或播放器已关闭，请重新点击当前视频的删除按钮。"
+            return false
+        }
+        let id = current.key
+        if store.isPendingDeletion(id) {
+            // Repeated taps acknowledge the persisted state: no write, no file
+            // checks, no undo, no automatic deletion and no queue reordering.
+            notice = "已在待删除列表（\(store.pendingDeletionRecords.count) 个）。请回到列表点“删除待删除”。"
+            return true
+        }
+        guard store.markForDeletion(id) else {
+            // The store reports the actual storage/file error through its alert.
+            // Do not show a successful checkmark before the atomic save succeeds.
+            notice = "未加入待删除，请查看错误提示后重试。"
+            return false
+        }
+        notice = "已加入待删除（\(store.pendingDeletionRecords.count) 个）。请回到列表点“删除待删除”。"
+        return true
+    }
+
     private func transition(to next: PlaybackRequest) -> Bool {
         switching = true
         defer { switching = false }

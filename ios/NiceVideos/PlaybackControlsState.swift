@@ -14,6 +14,8 @@ struct PlaybackControlsState {
     private(set) var voiceOverEnabled = false
     private(set) var isPresentingAlert = false
     private(set) var hideDeadline: TimeInterval?
+    private var pressedControls = Set<UUID>()
+    var isPressingControl: Bool { !pressedControls.isEmpty }
 
     init(hideDelay: TimeInterval = Self.defaultHideDelay) {
         self.hideDelay = hideDelay.isFinite && hideDelay > 0 && hideDelay <= 60
@@ -21,7 +23,7 @@ struct PlaybackControlsState {
     }
 
     private var canHide: Bool {
-        isPlaying && isSceneActive && !isScrubbing && !isNavigating && !voiceOverEnabled && !isPresentingAlert
+        isPlaying && isSceneActive && !isScrubbing && !isNavigating && !isPressingControl && !voiceOverEnabled && !isPresentingAlert
     }
 
     mutating func interacted(at now: TimeInterval) {
@@ -45,6 +47,23 @@ struct PlaybackControlsState {
         interacted(at: now)
     }
 
+    // Each button owns a token: one finger releasing or an old view disappearing
+    // must not release another button's hold. Button actions still fire on release.
+    mutating func setControlPressed(_ token: UUID, pressed: Bool, at now: TimeInterval) {
+        guard isSceneActive else { pressedControls.remove(token); return }
+        let changed: Bool
+        if pressed { changed = pressedControls.insert(token).inserted }
+        else { changed = pressedControls.remove(token) != nil }
+        guard changed else { return }
+        interacted(at: now)
+    }
+
+    mutating func resetControlPresses(at now: TimeInterval) {
+        guard !pressedControls.isEmpty else { return }
+        pressedControls.removeAll()
+        if isSceneActive { interacted(at: now) }
+    }
+
     mutating func setScrubbing(_ value: Bool, at now: TimeInterval) {
         isScrubbing = value
         interacted(at: now)
@@ -62,7 +81,7 @@ struct PlaybackControlsState {
 
     mutating func setSceneActive(_ value: Bool, at now: TimeInterval) {
         isSceneActive = value
-        if !value { isScrubbing = false; isNavigating = false }
+        if !value { isScrubbing = false; isNavigating = false; pressedControls.removeAll() }
         interacted(at: now)
     }
 
@@ -89,5 +108,6 @@ struct PlaybackControlsState {
         isSceneActive = false
         isScrubbing = false
         isNavigating = false
+        pressedControls.removeAll()
     }
 }

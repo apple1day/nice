@@ -212,6 +212,10 @@ private struct PlaybackProgressView: View {
         .onChange(of: isEnabled) { _, enabled in
             if !enabled { draftSeconds = nil; onEditingChanged(false) }
         }
+        .onChange(of: model.seekable) { _, seekable in
+            // A decoder state change may disable the Slider mid-tracking.
+            if !seekable { draftSeconds = nil; onEditingChanged(false) }
+        }
         .onDisappear { draftSeconds = nil; onEditingChanged(false) }
     }
 }
@@ -228,6 +232,33 @@ private struct PlaylistPlayerHost: View {
         _playlist = StateObject(wrappedValue: PlaylistPlaybackModel(request: request, store: store))
     }
     var body: some View { PlaylistPlayerView(playlist: playlist, model: playlist.player) }
+}
+
+// Observe the system Button's press state instead of installing an ancestor
+// tap/drag recognizer. This preserves native cancellation and accessibility.
+private struct PlaybackTransportButtonStyle: ButtonStyle {
+    let onPressChanged: (UUID, Bool) -> Void
+    func makeBody(configuration: Configuration) -> some View {
+        PlaybackButtonPressSurface(label: configuration.label,
+                                   isPressed: configuration.isPressed,
+                                   onPressChanged: onPressChanged)
+    }
+}
+
+private struct PlaybackButtonPressSurface<Label: View>: View {
+    let label: Label
+    let isPressed: Bool
+    let onPressChanged: (UUID, Bool) -> Void
+    @State private var pressToken = UUID()
+    var body: some View {
+        label
+            .contentShape(Rectangle())
+            .opacity(isPressed ? 0.55 : 1)
+            .background(isPressed ? Color.white.opacity(0.12) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8))
+            .onChange(of: isPressed) { _, pressed in onPressChanged(pressToken, pressed) }
+            .onDisappear { onPressChanged(pressToken, false) }
+    }
 }
 
 private struct PlaylistPlayerView: View {
@@ -304,6 +335,7 @@ private struct PlaylistPlayerView: View {
         )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
         message: { Text(store.errorMessage ?? "") }
         .onChange(of: request.id) { _, _ in
+            controls.resetControlPresses(at: now)
             controls.setScrubbing(false, at: now)
             controls.setPlaying(model.phase == .playing, at: now)
             controls.interacted(at: now)
@@ -367,8 +399,10 @@ private struct PlaylistPlayerView: View {
         VStack(spacing: 4) {
             if model.phase == .opening { ProgressView("打开本地文件…").tint(.white).font(.caption) }
             if let message = model.message { Text(message).font(.caption).foregroundStyle(.red).lineLimit(2) }
-            if let notice = playlist.notice { Text(notice).font(.caption).lineLimit(2) }
-            if let notice = store.deletionNotice { Text(notice).font(.caption2).lineLimit(2) }
+            if let notice = playlist.notice ?? store.deletionNotice {
+                Text(notice).font(.caption).lineLimit(2)
+                    .accessibilityIdentifier("playbackActionNotice")
+            }
             HStack(spacing: 8) {
                 if !isLandscape { navigationButton(.previous, compact: false) }
                 Spacer(minLength: 4)
@@ -422,9 +456,16 @@ private struct PlaylistPlayerView: View {
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 4)
-        .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
-        .contentShape(Rectangle())
-        .onTapGesture { revealControls() }
+        .background {
+            // Only the backdrop receives gap taps; no parent gesture competes
+            // with Button's own activation or the Slider's tracking.
+            LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom)
+                .contentShape(Rectangle())
+                .onTapGesture { revealControls() }
+        }
+        .buttonStyle(PlaybackTransportButtonStyle { token, pressed in
+            controls.setControlPressed(token, pressed: pressed, at: now)
+        })
         .accessibilityIdentifier("playbackTransportControls")
     }
     private var transportFavoriteButton: some View {
@@ -436,9 +477,13 @@ private struct PlaylistPlayerView: View {
             VStack(spacing: 2) {
                 Image(systemName: favorite ? "star.fill" : "star").font(.title2)
                 Text(favorite ? "已收藏" : "收藏").font(.caption2).lineLimit(1)
-            }.frame(minWidth: 44, minHeight: 52)
+            }
+            .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52)
+            .contentShape(Rectangle())
         }
-        .disabled(!canNavigate)
+        // Metadata changes do not seek or switch files; a Slider editing flag
+        // (including a late end-editing callback) must not disable these actions.
+        .disabled(!canInteract)
         .foregroundStyle(favorite ? Color.yellow : Color.white)
         .accessibilityLabel(favorite ? "取消收藏当前视频" : "收藏当前视频")
         .accessibilityValue(favorite ? "已收藏" : "未收藏")
@@ -447,18 +492,26 @@ private struct PlaylistPlayerView: View {
 
     private var transportDeleteButton: some View {
         let queued = playlist.currentEntry?.pendingDeletionOrder != nil
+        let displayedRequestID = request.id
         return Button {
             revealControls()
-            if !queued { store.markForDeletion(request.key) }
+            let success = playlist.markCurrentForDeletion(expectedRequestID: displayedRequestID)
+            UINotificationFeedbackGenerator().notificationOccurred(success ? .success : .error)
         } label: {
             VStack(spacing: 2) {
                 Image(systemName: queued ? "checkmark.circle.fill" : "trash").font(.title2)
-                Text("删除").font(.caption2).lineLimit(1)
-            }.frame(minWidth: 44, minHeight: 52)
+                Text(queued ? "待删除" : "删除").font(.caption2).lineLimit(1)
+            }
+            // Expand the LABEL, not just the outer Button layout, so the entire
+            // equal-width slot (including its whitespace) is actually tappable.
+            .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52)
+            .contentShape(Rectangle())
         }
-        .disabled(queued || !canNavigate)
+        .disabled(!canInteract)
         .tint(.orange).foregroundStyle(.orange)
-        .accessibilityLabel(queued ? "当前视频已加入待删除列表" : "将当前视频加入待删除列表")
+        .accessibilityLabel(queued ? "当前视频已加入待删除列表，点击查看提示" : "将当前视频加入待删除列表")
+        .accessibilityValue(queued ? "待删除" : "未标记")
+        .accessibilityHint("仅标记；回到本地列表点击删除待删除，确认后才会删除手机副本")
         .accessibilityIdentifier("watchDeleteButton")
     }
     private var playlistSheet: some View {
