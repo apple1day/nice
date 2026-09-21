@@ -96,6 +96,7 @@ struct SettingsView: View {
     @State private var draft = ""
     var body: some View {
         Form {
+            SigningStatusSection()
             Section("视频服务器（仅列表与下载使用）") {
                 TextField("http://192.168.19.70:8106", text: $draft)
                     .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)

@@ -24,7 +24,10 @@ struct LibraryRootView: View {
     }
     var body: some View {
         TabView {
-            NavigationStack { OfflineView() }
+            NavigationStack {
+                OfflineView()
+                    .safeAreaInset(edge: .top, spacing: 0) { SigningExpiryBanner() }
+            }
                 .tabItem { Label("本地", systemImage: "internaldrive") }
             NavigationStack { ServerCatalogView() }
                 .tabItem { Label("服务器", systemImage: "server.rack") }
@@ -35,6 +38,7 @@ struct LibraryRootView: View {
             NavigationStack { SettingsView() }
                 .tabItem { Label("设置", systemImage: "gearshape") }
         }
+        .background { SigningLifecycleView() }
         .fullScreenCover(item: Binding(
             get: { presentation.playback }, set: { store.playback = $0 }
         )) { request in

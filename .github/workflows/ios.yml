@@ -26,6 +26,8 @@ jobs:
           done
       - name: Test project repair, signing preservation and XML checks without pyexpat
         run: python3 -m unittest discover -s ios/tools -p 'test_*.py' -v
+      - name: Test signing expiry and notification scheduling
+        run: bash ios/check-signing.sh
       - name: Test batch selection and stale task pruning
         run: bash ios/check-batch-delete.sh
       - name: Test recoverable local file deletion
