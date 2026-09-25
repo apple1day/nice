@@ -14,60 +14,18 @@ struct RootView: View {
             NavigationStack { SettingsView() }
                 .tabItem { Label("设置", systemImage: "gearshape") }
         }
-        .fullScreenCover(item: $store.playback) { request in PlaybackScreen(request: request) }
+        .fullScreenCover(item: $store.playback) { request in
+            PlaybackScreen(request: request).environmentObject(store)
+        }
         .alert("提示", isPresented: Binding(
-            get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } }
+            get: { store.playback == nil && store.errorMessage != nil },
+            set: { if !$0 { store.errorMessage = nil } }
         )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
         message: { Text(store.errorMessage ?? "") }
         // Intentionally NO startup refresh, reachability gate, or login gate.
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { store.reconcileFiles() }
         }
-    }
-}
-
-struct OfflineView: View {
-    @EnvironmentObject private var store: VideoStore
-    @State private var search = ""
-    @State private var deletion: DownloadRecord?
-    private var filtered: [DownloadRecord] {
-        store.completed.filter { search.isEmpty || $0.video.name.localizedCaseInsensitiveContains(search) }
-    }
-    var body: some View {
-        List {
-            Section {
-                Label("所有播放均读取手机文件，无需服务器在线。", systemImage: "checkmark.shield")
-                    .font(.footnote).foregroundStyle(.secondary)
-                Text("\(store.completed.count) 个视频 · \(ByteCountFormatter.string(fromByteCount: store.usedBytes, countStyle: .file))")
-            }
-            ForEach(filtered) { record in
-                Button { store.playLocal(record) } label: {
-                    HStack {
-                        Image(systemName: "play.circle.fill").font(.title)
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(record.video.name).foregroundStyle(.primary).lineLimit(2)
-                            Text("\(record.video.fileExtension.uppercased()) · \(record.video.sizeLabel)")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }.padding(.vertical, 4)
-                }
-                .swipeActions { Button("删除", role: .destructive) { deletion = record } }
-            }
-            if filtered.isEmpty {
-                ContentUnavailableView(search.isEmpty ? "暂无本地视频" : "没有匹配的视频", systemImage: "internaldrive",
-                    description: Text("在「设置」连接视频站，再到「服务器」下载。完成后即可在此离线播放。"))
-            }
-        }
-        .navigationTitle("本地视频")
-        .searchable(text: $search, prompt: "搜索本地视频")
-        .confirmationDialog("仅删除手机中的文件？", isPresented: Binding(
-            get: { deletion != nil }, set: { if !$0 { deletion = nil } }
-        ), titleVisibility: .visible) {
-            Button("删除本地文件", role: .destructive) {
-                if let record = deletion { store.removeFromDevice(record) }
-                deletion = nil
-            }
-        } message: { Text("不会删除服务器上的视频。") }
     }
 }
 
@@ -80,6 +38,7 @@ struct CatalogView: View {
     }
     var body: some View {
         List {
+            PendingDeletionSection()
             Section {
                 Text("服务器仅用于获取列表和下载。播放前必须下载完成。")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -97,6 +56,9 @@ struct CatalogView: View {
                     Label(video.name, systemImage: "film").font(.headline).lineLimit(2)
                     Text("\(video.sizeLabel) · \(video.fileExtension.uppercased())")
                         .font(.caption).foregroundStyle(.secondary)
+                    if let record = record, store.isPendingDeletion(record.id) {
+                        Label("手机副本待删除", systemImage: "trash").font(.caption).foregroundStyle(.orange)
+                    }
                     if !video.supportsOffline {
                         Text("暂不下载此格式；播放清单不是独立视频。")
                             .font(.caption).foregroundStyle(.secondary)
@@ -128,40 +90,6 @@ struct CatalogView: View {
     }
 }
 
-struct TransfersView: View {
-    @EnvironmentObject private var store: VideoStore
-    var body: some View {
-        List {
-            Section {
-                Text("默认禁用新下载的蜂窝数据。后台传输由 iOS 调度；手动上划强退会中断任务，失败重试从头下载。")
-                    .font(.footnote).foregroundStyle(.secondary)
-                if store.restoring { ProgressView("恢复系统下载任务") }
-            }
-            ForEach(store.unfinished) { record in
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(record.video.name).font(.headline)
-                    if record.state == .downloading {
-                        ProgressView(value: store.progress[record.id] ?? 0)
-                        HStack {
-                            Text("\(Int((store.progress[record.id] ?? 0) * 100))% · \(record.video.sizeLabel)").font(.caption)
-                            Spacer()
-                            Button("取消") { store.cancel(record) }
-                        }
-                    } else {
-                        Text(record.message ?? "下载失败").font(.caption).foregroundStyle(.secondary)
-                        HStack {
-                            Button("重新下载") { store.retry(record) }.disabled(store.restoring)
-                            Spacer()
-                            Button("移除记录", role: .destructive) { store.removeFromDevice(record) }
-                        }
-                    }
-                }.padding(.vertical, 5).buttonStyle(.borderless)
-            }
-            if store.unfinished.isEmpty { Text("没有进行中或失败的任务。下载完成的视频在「本地」。").foregroundStyle(.secondary) }
-        }.navigationTitle("下载任务")
-    }
-}
-
 struct SettingsView: View {
     @EnvironmentObject private var store: VideoStore
     @AppStorage("allowCellular") private var allowCellular = false
@@ -177,7 +105,7 @@ struct SettingsView: View {
             }
             Section("下载网络") {
                 Toggle("允许新下载使用蜂窝数据", isOn: $allowCellular)
-                Text("只影响新创建的任务；已有任务需要取消后重试。")
+                Text("只影响新创建的任务；已有任务需要取消重试。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("离线播放器") {

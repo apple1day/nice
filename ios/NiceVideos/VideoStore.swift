@@ -5,6 +5,7 @@ import Combine
 final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     static let shared = VideoStore()
     static let sessionID = (Bundle.main.bundleIdentifier ?? "com.anxiong.nicevideos") + ".downloads.v1"
+    static let deletionQueueLimit = 3
     @Published private(set) var server: String
     @Published private(set) var videos: [Video] = []
     @Published private(set) var records: [DownloadRecord] = []
@@ -12,11 +13,15 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     @Published private(set) var loading = false
     @Published private(set) var restoring = true
     @Published private(set) var catalogNotice: String?
+    @Published private(set) var deletionNotice: String?
     @Published var errorMessage: String?
     @Published var playback: PlaybackRequest?
     var backgroundCompletion: (() -> Void)?
     private let defaults: UserDefaults
     private var disk: LocalStorage?
+    // The cover binding can become nil BEFORE VLC stops. Keep the lease until
+    // PlaybackScreen closes the model, so a deletion cannot race its bookmark write.
+    private var playbackSession: PlaybackRequest?
     private var catalogs: [String: [Video]] = [:]
     private var active: [String: URLSessionDownloadTask] = [:]
     private var lastProgress: [String: Date] = [:]
@@ -43,7 +48,10 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         do {
             let storage = try storage ?? LocalStorage()
             records = try storage.loadRecords()
-            disk = storage // Only publish after a readable manifest; never overwrite corrupt data.
+            try storage.recoverRemovals(records: records) { id in
+                defaults.removeObject(forKey: "position." + id)
+            }
+            disk = storage // Publish only after safe recovery; never overwrite unreadable/missing recovery state.
             do { catalogs = try storage.loadCatalogs() }
             catch { catalogNotice = "列表缓存读取失败；本地下载不受影响。" }
             videos = catalogs[server] ?? []
@@ -123,10 +131,16 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         guard !restoring else { throw ClientError("正在恢复下载任务；本地播放不受影响。") }
         guard let disk = disk else { throw ClientError("本地存储不可用，无法开始下载。") }
         guard video.supportsOffline else { throw OfflineMediaPolicy.Failure.unsupported }
+        try disk.recoverRemovals(records: records) { id in
+            defaults.removeObject(forKey: "position." + id)
+        }
         let id = video.storageID(server: base)
         if let existing = records.first(where: { $0.id == id }) {
             if existing.state == .downloading { return }
             if existing.state == .complete, disk.verifiedFile(for: existing) != nil { return }
+        }
+        guard !isPlaybackProtected(id) else {
+            throw ClientError("请先关闭正在播放的视频，再重新下载。")
         }
         var request = URLRequest(url: try ServerAddress.endpoint(video.downloadUrl, on: base))
         request.allowsCellularAccess = defaults.bool(forKey: "allowCellular")
@@ -154,16 +168,10 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         saveRecords()
     }
     func removeFromDevice(_ record: DownloadRecord) {
+        guard let current = records.first(where: { $0.taskToken == record.taskToken }) else { return }
         do {
-            guard let disk = disk else { throw ClientError("本地存储不可用。") }
-            if playback?.key == record.id { playback = nil }
-            try disk.remove(record)
-            active.removeValue(forKey: record.id)?.cancel()
-            records.removeAll { $0.id == record.id }
-            progress.removeValue(forKey: record.id)
-            lastProgress.removeValue(forKey: record.id)
-            defaults.removeObject(forKey: "position." + record.id)
-            saveRecords()
+            let warning = try deleteLocally(current, saving: records.filter { $0.id != current.id })
+            deletionNotice = warning ?? "已删除手机副本：\(current.video.name)"
         } catch { errorMessage = "删除本地文件失败：\(error.localizedDescription)" }
     }
     func play(_ video: Video) {
@@ -174,15 +182,57 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         playLocal(record)
     }
     func playLocal(_ record: DownloadRecord) {
+        guard playbackSession == nil && playback == nil else { return }
         do {
-            guard let current = records.first(where: { $0.id == record.id }),
-                  current.state == .complete, let file = disk?.verifiedFile(for: current) else {
-                throw ClientError("本地文件缺失或下载未完成，请重新下载。")
-            }
-            playback = try PlaybackRequest(key: current.id, title: current.video.name, url: file)
+            let request = try localPlaybackRequest(for: record.id)
+            playbackSession = request
+            deletionNotice = nil
+            playback = request
         } catch {
             errorMessage = error.localizedDescription
             reconcileFiles()
+        }
+    }
+
+    // All verified local downloads in the same order as the unfiltered local
+    // library. No server setting, catalog, reachability check or URLSession.
+    var localPlaylistRecords: [DownloadRecord] {
+        completed.filter { disk?.verifiedFile(for: $0) != nil }
+    }
+    func localPlaybackRequest(for id: String) throws -> PlaybackRequest {
+        guard let record = records.first(where: { $0.id == id }),
+              record.state == .complete, let file = disk?.verifiedFile(for: record) else {
+            throw ClientError("本地文件缺失或下载未完成，请重新下载。")
+        }
+        return try PlaybackRequest(key: record.id, title: record.video.name, url: file)
+    }
+    func transitionPlayback(from old: PlaybackRequest, to next: PlaybackRequest,
+                            stopCurrent: () -> Void) throws {
+        guard playback != nil, playbackSession?.id == old.id else {
+            throw ClientError("播放会话已结束，请重新打开本地视频。")
+        }
+        // Revalidate the target before stopping anything. Reject caller-supplied
+        // paths even when they happen to be valid local media elsewhere.
+        let verified = try localPlaybackRequest(for: next.key)
+        guard verified.url == next.url else { throw ClientError("播放文件与本地索引不一致。") }
+        stopCurrent()
+        playbackSession = next
+        deletionNotice = nil
+        // Keep playback (the presentation anchor) unchanged: switching must not
+        // dismiss/re-present the cover or reset fullscreen/auto-hide UI state.
+    }
+    private func isPlaybackProtected(_ id: String) -> Bool {
+        // Once a playlist has switched, the old cover item is NOT an active file.
+        if let current = playbackSession { return current.key == id }
+        return playback?.key == id
+    }
+    // Called AFTER PlaybackModel.close(). Old drawables cannot release a new lease.
+    func playbackDidClose(_ request: PlaybackRequest) {
+        if playbackSession?.id == request.id {
+            playbackSession = nil
+            playback = nil
+        } else if playbackSession == nil && playback?.id == request.id {
+            playback = nil
         }
     }
     func reconcileFiles() {
@@ -277,5 +327,152 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         let completion = backgroundCompletion
         backgroundCompletion = nil
         completion?()
+    }
+}
+
+extension VideoStore {
+    var pendingDeletionRecords: [DownloadRecord] {
+        records.filter { $0.pendingDeletionOrder != nil }.sorted {
+            let left = $0.pendingDeletionOrder ?? 0
+            let right = $1.pendingDeletionOrder ?? 0
+            return left == right ? $0.id < $1.id : left < right
+        }
+    }
+    func isPendingDeletion(_ id: String) -> Bool {
+        records.contains { $0.id == id && $0.pendingDeletionOrder != nil }
+    }
+
+    // Returns false on failure; no fourth entry is admitted unless FIFO deletion
+    // and the new queue are committed together. Duplicate taps never reorder it.
+    @discardableResult func markForDeletion(_ id: String) -> Bool {
+        do {
+            guard let disk = disk else { throw ClientError("本地存储不可用。") }
+            guard let record = records.first(where: { $0.id == id }),
+                  record.state == .complete, disk.verifiedFile(for: record) != nil else {
+                throw ClientError("只能把下载完成且存在的本地视频加入待删除队列。")
+            }
+            if isPendingDeletion(id) { return true }
+            let queue = pendingDeletionRecords
+            guard queue.count <= Self.deletionQueueLimit else {
+                throw ClientError("待删除索引异常，未自动删除任何视频；请先检查待删除列表。")
+            }
+            let ids = Array((queue.map(\.id) + [id]).suffix(Self.deletionQueueLimit))
+            var next = records
+            for index in next.indices { next[index].pendingDeletionOrder = ids.firstIndex(of: next[index].id) }
+            if queue.count == Self.deletionQueueLimit, let first = queue.first {
+                next.removeAll { $0.id == first.id }
+                let warning = try deleteLocally(first, saving: next)
+                deletionNotice = warning ?? "已加入待删除；已自动删除最早的手机副本：\(first.video.name)"
+            } else {
+                try disk.saveRecords(next)
+                records = next
+                deletionNotice = "已加入待删除（\(ids.count)/\(Self.deletionQueueLimit)），当前视频仍可继续播放。"
+            }
+            return true
+        } catch {
+            errorMessage = "未加入待删除，原队列保留：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    @discardableResult func unmarkForDeletion(_ id: String) -> Bool {
+        guard isPendingDeletion(id) else { return true }
+        do {
+            guard let disk = disk else { throw ClientError("本地存储不可用。") }
+            let ids = pendingDeletionRecords.map(\.id).filter { $0 != id }
+            var next = records
+            for index in next.indices { next[index].pendingDeletionOrder = ids.firstIndex(of: next[index].id) }
+            try disk.saveRecords(next)
+            records = next
+            deletionNotice = "已撤销待删除，手机文件保留。"
+            return true
+        } catch {
+            errorMessage = "撤销待删除失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    // A confirmation dialog may supply a snapshot of IDs. Never expand its scope
+    // to unrelated downloads or to videos added after the confirmation opened.
+    @discardableResult func deleteAllPendingVideos(ids: [String]? = nil) -> Int {
+        let selected = ids.map { Set($0) }
+        let queue = pendingDeletionRecords.filter { selected?.contains($0.id) ?? true }
+        guard !queue.isEmpty else { return 0 }
+        var deleted = 0
+        var failures: [String] = []
+        var warnings: [String] = []
+        for record in queue {
+            do {
+                if let warning = try deleteLocally(record, saving: records.filter { $0.id != record.id }) {
+                    warnings.append(warning)
+                }
+                deleted += 1
+            } catch { failures.append("\(record.video.name)：\(error.localizedDescription)") }
+        }
+        deletionNotice = "已删除 \(deleted) 个待删除手机副本，剩余 \(pendingDeletionRecords.count) 个。"
+        if !failures.isEmpty || !warnings.isEmpty {
+            errorMessage = (["部分项目未删除或空间回收未完成，详情如下："] + failures + warnings).joined(separator: "\n")
+        }
+        return deleted
+    }
+
+    private func deleteLocally(_ record: DownloadRecord, saving next: [DownloadRecord]) throws -> String? {
+        guard !isPlaybackProtected(record.id) else {
+            throw ClientError("此视频仍在播放，请先关闭播放器后重试。")
+        }
+        guard let disk = disk else { throw ClientError("本地存储不可用。") }
+        try disk.recoverRemovals(records: records) { id in
+            defaults.removeObject(forKey: "position." + id)
+        }
+        let warning = try disk.removeAndSave(record, records: next)
+        records = next
+        active.removeValue(forKey: record.id)?.cancel()
+        progress.removeValue(forKey: record.id)
+        lastProgress.removeValue(forKey: record.id)
+        defaults.removeObject(forKey: "position." + record.id)
+        return warning
+    }
+}
+
+extension VideoStore {
+    // Keep on the same main queue as URLSession delegates. Each removal reuses
+    // the recoverable file/index transaction and only cancels a task AFTER the
+    // manifest commit. A failed commit leaves its task, file and bookmark intact.
+    @discardableResult func removeBatch(_ request: BatchRemovalRequest) -> BatchRemovalResult {
+        precondition(Thread.isMainThread)
+        var result = BatchRemovalResult()
+        guard !request.records.isEmpty else { return result }
+        guard request.scope != .downloadTasks || !restoring else {
+            result.failures = ["正在恢复系统下载任务，请恢复完成后重试。"]
+            errorMessage = result.failures[0]
+            return result
+        }
+        for snapshot in request.records {
+            guard let current = request.currentRecord(for: snapshot, in: records) else {
+                result.skippedCount += 1
+                continue
+            }
+            do {
+                // Do not turn a stale task dialog into a local-file deletion,
+                // even if a complete file was recovered before the UI updated.
+                if request.scope == .downloadTasks, disk?.verifiedFile(for: current) != nil {
+                    result.skippedCount += 1
+                    continue
+                }
+                if let warning = try deleteLocally(current, saving: records.filter { $0.id != current.id }) {
+                    result.warnings.append("\(current.video.name)：\(warning)")
+                }
+                result.removedCount += 1
+            } catch {
+                result.failures.append("\(current.video.name)：\(error.localizedDescription)")
+            }
+        }
+        deletionNotice = result.summary(for: request.scope)
+        let details = result.failures + result.warnings
+        errorMessage = details.isEmpty ? nil : (
+            [result.summary(for: request.scope)] + Array(details.prefix(12)) +
+            (details.count > 12 ? ["另有 \(details.count - 12) 项未删除或空间回收未完成。"] : [])
+        ).joined(separator: "\n")
+        return result
     }
 }
