@@ -131,7 +131,6 @@ struct SettingsView: View {
                                     .disabled(store.loading)
                             } else {
                                 Button("连接") { store.connectServer(address) }
-                                    .disabled(store.loading)
                             }
                         }
                     }
