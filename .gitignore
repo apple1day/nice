@@ -20,3 +20,4 @@ bin-release/
 node_modules/
 screenshots
 .user_data/
+videos/.env

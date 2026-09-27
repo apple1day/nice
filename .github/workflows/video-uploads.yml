@@ -1,0 +1,33 @@
+name: Video uploads
+on:
+  push:
+    paths: ['videos/**', 'ios/**', '.github/workflows/video-uploads.yml']
+  pull_request:
+    paths: ['videos/**', 'ios/**', '.github/workflows/video-uploads.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: videos/go.mod
+          cache: false
+      - name: Test server uploads and existing handlers
+        working-directory: videos
+        env:
+          VIDEO_DIR: ${{ runner.temp }}/native-upload-media
+          STATIC_DIR: ${{ runner.temp }}/native-upload-static
+          DATA_DIR: ${{ runner.temp }}/native-upload-data
+        run: go test -race ./...
+  policies:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash ios/check-upload.sh
+      - run: python3 -m unittest discover -s ios/tools -p test_upload_hot_path.py -v

@@ -68,6 +68,14 @@ struct DownloadRecord: Codable, Identifiable, Equatable {
     var attempt: String
     var state: DownloadState
     var message: String?
+    // Optional fields keep old downloads.json files backward-compatible.
+    // No timestamp is invented for existing downloads: their saved order is used.
+    var pendingDeletionOrder: Int?
+    var favorite: Bool?
+    var downloadedAt: Date?
+    var watched: Bool?
+    var isFavorite: Bool { favorite == true }
+    var hasWatched: Bool { watched == true }
     var taskToken: String { id + "|" + attempt }
     var fileName: String { id + "." + video.fileExtension }
     init(video: Video, server: URL) {
@@ -77,6 +85,10 @@ struct DownloadRecord: Codable, Identifiable, Equatable {
         attempt = UUID().uuidString
         state = .downloading
         message = nil
+        pendingDeletionOrder = nil
+        favorite = false
+        downloadedAt = nil
+        watched = false
     }
 }
 struct DownloadManifest: Codable {
@@ -101,7 +113,10 @@ final class LocalStorage {
     let root: URL
     private let media: URL
     private let fm = FileManager.default
-    init(root: URL? = nil) throws {
+    // Optional instrumentation for regression tests; no file I/O or logging.
+    private let onVerify: ((String) -> Void)?
+    init(root: URL? = nil, onVerify: ((String) -> Void)? = nil) throws {
+        self.onVerify = onVerify
         self.root = try root ?? FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: true
@@ -142,6 +157,7 @@ final class LocalStorage {
         return media.appendingPathComponent(record.fileName, isDirectory: false)
     }
     func verifiedFile(for record: DownloadRecord) -> URL? {
+        onVerify?(record.id)
         guard let file = try? destination(for: record),
               let attrs = try? fm.attributesOfItem(atPath: file.path),
               attrs[.type] as? FileAttributeType == .typeRegular,
@@ -174,5 +190,44 @@ final class LocalStorage {
     func remove(_ record: DownloadRecord) throws {
         let file = try destination(for: record)
         if fm.fileExists(atPath: file.path) { try fm.removeItem(at: file) }
+    }
+
+    // Returns only after the prospective records/queue have committed. A failed
+    // write rolls the video back. Never delete a file first and then hope to save.
+    func removeAndSave(_ record: DownloadRecord, records: [DownloadRecord]) throws -> String? {
+        guard !records.contains(where: { $0.id == record.id }) else {
+            throw ClientError("删除事务仍然引用原视频，已停止删除。")
+        }
+        return try LocalRemovalTransaction.commit(
+            file: destination(for: record),
+            staged: root.appendingPathComponent("RemovalStaging", isDirectory: true)
+                .appendingPathComponent(record.fileName)
+        ) { try self.saveRecords(records) }
+    }
+
+    // Run before reconciliation and before accepting re-downloads, so an old
+    // staged deletion can never resurrect itself as a new download of the same ID.
+    func recoverRemovals(records: [DownloadRecord], onCommittedRemoval: (String) -> Void = { _ in }) throws {
+        let directory = root.appendingPathComponent("RemovalStaging", isDirectory: true)
+        guard let type = try LocalRemovalTransaction.itemType(at: directory) else { return }
+        guard type == .typeDirectory else { throw ClientError("删除暂存目录异常，已保留文件。") }
+        let files = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        guard files.isEmpty || fm.fileExists(atPath: root.appendingPathComponent("downloads.json").path) else {
+            throw ClientError("下载索引缺失，无法确定删除是否提交；暂存视频已保留，请勿卸载 App。")
+        }
+        let referenced = Set(records.map(\.fileName))
+        for staged in files {
+            let id = staged.deletingPathExtension().lastPathComponent
+            guard id.count == 64, id.allSatisfy({ "0123456789abcdef".contains($0) }),
+                  OfflineMediaPolicy.extensions.contains(staged.pathExtension) else {
+                throw ClientError("删除暂存目录存在未知文件，已保留并停止自动处理。")
+            }
+            let keep = referenced.contains(staged.lastPathComponent)
+            try LocalRemovalTransaction.recover(
+                file: media.appendingPathComponent(staged.lastPathComponent),
+                staged: staged, isReferenced: keep
+            )
+            if !keep { onCommittedRemoval(id) }
+        }
     }
 }
