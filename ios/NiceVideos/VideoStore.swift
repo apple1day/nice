@@ -6,6 +6,7 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     static let shared = VideoStore()
     static let sessionID = (Bundle.main.bundleIdentifier ?? "com.anxiong.nicevideos") + ".downloads.v1"
     @Published private(set) var server: String
+    @Published private(set) var servers: [String]
     @Published private(set) var videos: [Video] = []
     @Published private(set) var records: [DownloadRecord] = [] {
         didSet { rebuildRecordCache() }
@@ -46,8 +47,18 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
 
     init(storage: LocalStorage? = nil, defaults: UserDefaults = .standard, restoreDownloads: Bool = true) {
         self.defaults = defaults
-        server = defaults.string(forKey: "server") ?? ""
+        let currentServer = defaults.string(forKey: "server") ?? ""
+        let storedServers = defaults.stringArray(forKey: "servers") ?? []
+        var normalizedServers: [String] = []
+        for candidate in storedServers + (currentServer.isEmpty ? [] : [currentServer]) {
+            guard let normalized = try? ServerAddress.normalize(candidate).absoluteString,
+                  !normalizedServers.contains(normalized) else { continue }
+            normalizedServers.append(normalized)
+        }
+        server = (try? ServerAddress.normalize(currentServer).absoluteString) ?? ""
+        servers = normalizedServers
         super.init()
+        defaults.set(servers, forKey: "servers")
         do {
             let storage = try storage ?? LocalStorage()
             records = try storage.loadRecords()
@@ -106,14 +117,46 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         catch { errorMessage = "观看标记保存失败：\(error.localizedDescription)" }
     }
 
-    func configureServer(_ input: String) {
+    @discardableResult
+    func addServer(_ input: String) -> Bool {
         do {
-            let base = try ServerAddress.normalize(input)
-            server = base.absoluteString
+            let normalized = try ServerAddress.normalize(input).absoluteString
+            if !servers.contains(normalized) {
+                servers.append(normalized)
+                defaults.set(servers, forKey: "servers")
+            }
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func connectServer(_ input: String) {
+        do {
+            let normalized = try ServerAddress.normalize(input).absoluteString
+            if !servers.contains(normalized) {
+                servers.append(normalized)
+                defaults.set(servers, forKey: "servers")
+            }
+            guard server != normalized else {
+                refresh()
+                return
+            }
+            refreshTask?.cancel()
+            refreshID = UUID()
+            server = normalized
             defaults.set(server, forKey: "server")
             videos = catalogs[server] ?? []
+            catalogNotice = nil
             refresh()
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    // Compatibility for older call sites: save the address and make it active.
+    func configureServer(_ input: String) {
+        guard addServer(input) else { return }
+        connectServer(input)
     }
     func refresh() {
         guard !server.isEmpty else { return }
