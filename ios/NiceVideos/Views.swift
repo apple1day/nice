@@ -94,6 +94,7 @@ struct SettingsView: View {
     @EnvironmentObject private var store: VideoStore
     @AppStorage("allowCellular") private var allowCellular = false
     @State private var draft = ""
+    @FocusState private var serverFieldFocused: Bool
     var body: some View {
         Form {
             SigningStatusSection()
@@ -103,8 +104,11 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
+                        .focused($serverFieldFocused)
+                        .submitLabel(.done)
+                        .onSubmit { addDraftServer() }
                     Button("添加") {
-                        if store.addServer(draft) { draft = "" }
+                        addDraftServer()
                     }
                     .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
@@ -127,10 +131,16 @@ struct SettingsView: View {
                             }
                             Spacer()
                             if store.server == address {
-                                Button("刷新") { store.refresh() }
-                                    .disabled(store.loading)
+                                Button("刷新") {
+                                    serverFieldFocused = false
+                                    store.refresh()
+                                }
+                                .disabled(store.loading)
                             } else {
-                                Button("连接") { store.connectServer(address) }
+                                Button("连接") {
+                                    serverFieldFocused = false
+                                    store.connectServer(address)
+                                }
                             }
                         }
                     }
@@ -157,7 +167,22 @@ struct SettingsView: View {
                 Text("现有 Go 后端没有鉴权。仅在可信局域网使用，不要直接把 8106 暴露到公网。")
                     .font(.footnote)
             }
-        }.navigationTitle("设置").onAppear { draft = store.server }
+        }
+        .navigationTitle("设置")
+        .scrollDismissesKeyboard(.interactively)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("完成") { serverFieldFocused = false }
+            }
+        }
+        .onAppear { draft = store.server }
+    }
+
+    private func addDraftServer() {
+        guard store.addServer(draft) else { return }
+        draft = ""
+        serverFieldFocused = false
     }
 }
 
