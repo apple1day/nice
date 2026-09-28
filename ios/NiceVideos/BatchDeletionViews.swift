@@ -155,7 +155,7 @@ private struct PendingDeleteToolbarButton: View {
     @State private var confirmed: [DownloadRecord] = []
     @State private var showConfirmation = false
     var body: some View {
-        Button("删除待删除", role: .destructive) {
+        Button("一键删除待删除的视频", role: .destructive) {
             confirmed = records
             showConfirmation = true
         }

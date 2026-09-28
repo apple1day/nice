@@ -98,10 +98,47 @@ struct SettingsView: View {
         Form {
             SigningStatusSection()
             Section("视频服务器（仅列表与下载使用）") {
-                TextField("http://192.168.19.70:8106", text: $draft)
-                    .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-                Button("保存并读取视频列表") { store.configureServer(draft) }
-                Text("真机填写 Mac 的局域网地址，不要填写 localhost。播放本地视频不需要配置服务器。")
+                HStack {
+                    TextField("http://192.168.19.70:8106", text: $draft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                    Button("添加") {
+                        if store.addServer(draft) { draft = "" }
+                    }
+                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+
+                if store.servers.isEmpty {
+                    Text("还没有保存服务器地址。")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(store.servers, id: \.self) { address in
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(address)
+                                    .font(.footnote)
+                                    .textSelection(.enabled)
+                                if store.server == address {
+                                    Label("当前连接", systemImage: "checkmark.circle.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.green)
+                                }
+                            }
+                            Spacer()
+                            if store.server == address {
+                                Button("刷新") { store.refresh() }
+                                    .disabled(store.loading)
+                            } else {
+                                Button("连接") { store.connectServer(address) }
+                            }
+                        }
+                    }
+                }
+
+                Text("可以保存多个 Mac/服务器地址，点击每个地址右侧的“连接”即可切换。切换后会读取该服务器的视频列表；本地已下载视频不会被删除。")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Text("真机填写服务器的局域网地址，不要填写 localhost。播放本地视频不需要配置服务器。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("下载网络") {
