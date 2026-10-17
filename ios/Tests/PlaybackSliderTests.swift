@@ -159,14 +159,15 @@ private final class ScrubObserver: PlaybackScrubObserver {
 
     func testVoiceOverAdjustmentsCommitOnceWithoutTouchUp() {
         let (controller, slider, observer) = fixture()
+        XCTAssertTrue(slider.isAccessibilityElement)
         XCTAssertTrue(slider.accessibilityTraits.contains(.adjustable))
         slider.accessibilityIncrement()
         let increased = Double(slider.value)
-        XCTAssertGreaterThan(increased, 20)
+        XCTAssertEqual(increased, 35)
         XCTAssertEqual(observer.commits, [increased])
         slider.accessibilityDecrement()
         let decreased = Double(slider.value)
-        XCTAssertLessThan(decreased, increased)
+        XCTAssertEqual(decreased, 20)
         XCTAssertEqual(observer.commits, [increased, decreased])
         XCTAssertFalse(controller.isEditing(in: slider))
         slider.finishScrubbing()
@@ -180,12 +181,56 @@ private final class ScrubObserver: PlaybackScrubObserver {
         slider.sendActions(for: .valueChanged)
         slider.accessibilityIncrement()
         XCTAssertFalse(controller.isEditing(in: slider))
+        XCTAssertEqual(slider.value, 75)
         XCTAssertEqual(observer.commits, [Double(slider.value)])
         slider.endTracking(nil, with: nil)
         XCTAssertEqual(observer.commits.count, 1)
         slider.isEnabled = false
+        XCTAssertTrue(slider.accessibilityTraits.contains(.notEnabled))
         slider.accessibilityIncrement()
         slider.accessibilityDecrement()
         XCTAssertEqual(observer.commits.count, 1)
+    }
+
+    func testVoiceOverClampsAtBothEndsWithoutRepeatingBoundarySeeks() {
+        let (controller, slider, observer) = fixture()
+        slider.value = 97
+        slider.accessibilityIncrement()
+        slider.accessibilityIncrement()
+        XCTAssertEqual(slider.value, 100)
+        XCTAssertEqual(observer.commits, [100])
+        slider.value = 3
+        slider.accessibilityDecrement()
+        slider.accessibilityDecrement()
+        XCTAssertEqual(slider.value, 0)
+        XCTAssertEqual(observer.commits, [100, 0])
+        XCTAssertFalse(controller.isEditing(in: slider))
+    }
+
+    func testVoiceOverStepRemainsFifteenSecondsForLongMedia() {
+        let (controller, slider, observer) = fixture()
+        slider.maximumValue = 36_000
+        slider.value = 1_000
+        slider.accessibilityIncrement()
+        slider.accessibilityDecrement()
+        XCTAssertEqual(observer.commits, [1_015, 1_000])
+        XCTAssertFalse(controller.isEditing(in: slider))
+    }
+
+    func testVoiceOverHandlesMediaShorterThanOneStepAndDisabledRecovery() {
+        let (controller, slider, observer) = fixture()
+        slider.maximumValue = 2.5
+        slider.value = 1
+        slider.accessibilityIncrement()
+        XCTAssertEqual(observer.commits, [2.5])
+        slider.isEnabled = false
+        slider.accessibilityDecrement()
+        XCTAssertEqual(observer.commits, [2.5])
+        slider.isEnabled = true
+        XCTAssertFalse(slider.accessibilityTraits.contains(.notEnabled))
+        XCTAssertTrue(slider.accessibilityTraits.contains(.adjustable))
+        slider.accessibilityDecrement()
+        XCTAssertEqual(observer.commits, [2.5, 0])
+        XCTAssertFalse(controller.isEditing(in: slider))
     }
 }

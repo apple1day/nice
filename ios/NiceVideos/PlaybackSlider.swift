@@ -112,7 +112,10 @@ final class PlaybackTrackingSlider: UISlider {
         isContinuous = true
         minimumTrackTintColor = .white
         maximumTrackTintColor = UIColor.white.withAlphaComponent(0.35)
+        isAccessibilityElement = true
+        accessibilityTraits.insert(.adjustable)
         accessibilityLabel = "播放进度"
+        accessibilityHint = "向上或向下轻扫，前进或后退15秒。"
         accessibilityIdentifier = "playbackProgressSlider"
         addTarget(self, action: #selector(valueDidChange), for: .valueChanged)
     }
@@ -121,7 +124,12 @@ final class PlaybackTrackingSlider: UISlider {
 
     override var isEnabled: Bool {
         didSet {
-            if !isEnabled { cancelTracking(with: nil) }
+            if isEnabled {
+                accessibilityTraits.remove(.notEnabled)
+            } else {
+                accessibilityTraits.insert(.notEnabled)
+                cancelTracking(with: nil)
+            }
         }
     }
 
@@ -165,21 +173,29 @@ final class PlaybackTrackingSlider: UISlider {
     }
 
     override func accessibilityIncrement() {
-        guard isEnabled else { return }
-        scrubController?.cancel()
-        let previous = value
-        super.accessibilityIncrement()
-        refreshAccessibilityValue()
-        if value != previous { scrubController?.adjustAccessibility(in: self, seconds: Double(value)) }
+        adjustAccessibleProgress(by: 15)
     }
 
     override func accessibilityDecrement() {
+        adjustAccessibleProgress(by: -15)
+    }
+
+    private func adjustAccessibleProgress(by seconds: Double) {
         guard isEnabled else { return }
         scrubController?.cancel()
-        let previous = value
-        super.accessibilityDecrement()
+        let lower = Double(minimumValue), upper = Double(maximumValue)
+        let previous = Double(value)
+        guard lower.isFinite, upper.isFinite, previous.isFinite, upper > lower else { return }
+        let target = Float(min(upper, max(lower, previous + seconds)))
+        // Do not rely on superclass accessibility hooks to change the value.
+        // Own the adjustment explicitly, with the same 15-second steps as the
+        // transport buttons, even before accessibility services are activated.
+        guard target != value else { refreshAccessibilityValue(); return }
+        setValue(target, animated: false)
         refreshAccessibilityValue()
-        if value != previous { scrubController?.adjustAccessibility(in: self, seconds: Double(value)) }
+        // setValue does not send valueChanged. Commit once here; a late control
+        // event has no tracking token and cannot repeat this seek.
+        scrubController?.adjustAccessibility(in: self, seconds: Double(value))
     }
 
     // The touch callbacks route through these operations. They also let UIKit
