@@ -36,8 +36,13 @@ class LibraryHotPathTests(unittest.TestCase):
         ui = source("BatchDeletionViews.swift").split("struct TransfersView:")[0]
         toolbar = ui.split(".toolbar {", 1)[1].split(".safeAreaInset", 1)[0]
         self.assertLess(toolbar.index("PendingDeleteToolbarButton"), toolbar.index('Button("选择")'))
-        self.assertIn('Button("删除待删除", role: .destructive)', ui)
-        self.assertIn("confirmed = records", ui)
+        pending = ui.split("private struct PendingDeleteToolbarButton:", 1)[1]
+        # This guard checks the destructive action and its snapshot, not copy.
+        # The toolbar was renamed when server/local deletion were separated.
+        self.assertRegex(pending, r'Button\("[^"\n]+", role: \.destructive\)')
+        self.assertIn('.accessibilityIdentifier("deleteAllPendingVideosButton")', pending)
+        self.assertIn("confirmed = records", pending)
+        self.assertIn("action(confirmed)", pending)
         self.assertIn("store.deletePendingVideos(snapshot)", ui)
 
     def test_completion_and_watch_metadata_are_optional(self):

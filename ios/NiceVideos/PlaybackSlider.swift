@@ -1,0 +1,268 @@
+import SwiftUI
+import UIKit
+
+@MainActor protocol PlaybackScrubObserver: AnyObject {
+    func draftChanged(_ seconds: Double?)
+    func editingChanged(_ editing: Bool)
+    func commit(_ seconds: Double)
+}
+
+// The parent stores this reference without observing draft changes. Cancelling
+// is synchronous: the native tracking token is invalid before a button seeks,
+// switches clips or changes layout, without waiting for a SwiftUI update.
+@MainActor final class PlaybackScrubController {
+    private var session = PlaybackScrubSession()
+    private weak var slider: PlaybackTrackingSlider?
+    private weak var observer: PlaybackScrubObserver?
+    private var notificationRevision: UInt = 0
+
+    func bind(_ view: PlaybackTrackingSlider, observer: PlaybackScrubObserver) {
+        if slider !== view {
+            cancel(deferred: true)
+            slider = view
+            view.scrubController = self
+            self.observer = observer
+            publish(editingChanged: true, deferred: true)
+        } else {
+            self.observer = observer
+        }
+    }
+
+    func detach(_ view: PlaybackTrackingSlider) {
+        guard slider === view else { return }
+        cancel(deferred: true)
+        view.scrubController = nil
+        slider = nil
+    }
+
+    func cancel() { cancel(deferred: false) }
+
+    private func cancel(deferred: Bool) {
+        let wasEditing = session.cancel()
+        // Invalidate first. UISlider may synchronously emit more tracking events
+        // while it cancels; none of them may commit the old draft.
+        slider?.cancelTracking(with: nil)
+        if wasEditing { publish(editingChanged: true, deferred: deferred) }
+    }
+
+    func isEditing(in view: PlaybackTrackingSlider) -> Bool {
+        slider === view && session.isEditing
+    }
+
+    fileprivate func begin(in view: PlaybackTrackingSlider, seconds: Double) -> UUID? {
+        guard slider === view, let token = session.begin(at: seconds) else { return nil }
+        publish(editingChanged: true)
+        return token
+    }
+
+    fileprivate func update(in view: PlaybackTrackingSlider, token: UUID, seconds: Double) {
+        guard slider === view, session.update(seconds, token: token) else { return }
+        publish(editingChanged: false)
+    }
+
+    fileprivate func finish(in view: PlaybackTrackingSlider, token: UUID, seconds: Double) {
+        guard slider === view, session.update(seconds, token: token),
+              let target = session.finish(token: token) else { return }
+        publish(editingChanged: true)
+        observer?.commit(target)
+    }
+
+    fileprivate func cancelled(in view: PlaybackTrackingSlider, token: UUID?, deferred: Bool) {
+        guard slider === view, let token, session.token == token else { return }
+        session.cancel()
+        publish(editingChanged: true, deferred: deferred)
+    }
+
+    fileprivate func adjustAccessibility(in view: PlaybackTrackingSlider, seconds: Double) {
+        guard slider === view, seconds.isFinite else { return }
+        cancel()
+        // An accessibility adjustment is a complete operation, with no touch-up
+        // to wait for. Retain UISlider's native Adjustable accessibility behavior.
+        publish(editingChanged: true)
+        observer?.commit(seconds)
+    }
+
+    private func publish(editingChanged: Bool, deferred: Bool = false) {
+        notificationRevision &+= 1
+        let revision = notificationRevision
+        let draft = session.draftSeconds
+        let editing = session.isEditing
+        let deliver = { [weak self] in
+            guard let self, self.notificationRevision == revision else { return }
+            self.observer?.draftChanged(draft)
+            if editingChanged { self.observer?.editingChanged(editing) }
+        }
+        // Model updates / removal can happen inside SwiftUI's render pass.
+        // Invalidate the session now, but defer State writes. A subsequent drag
+        // advances the revision and rejects this old cancellation notification.
+        if deferred { DispatchQueue.main.async { deliver() } }
+        else { deliver() }
+    }
+}
+
+// UIKit exposes cancellation independently of successful endTracking, unlike a
+// single SwiftUI onEditingChanged Bool. No ancestor gesture competes with it.
+final class PlaybackTrackingSlider: UISlider {
+    fileprivate weak var scrubController: PlaybackScrubController?
+    private var trackingToken: UUID?
+    private var deferCancellationNotifications = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isContinuous = true
+        minimumTrackTintColor = .white
+        maximumTrackTintColor = UIColor.white.withAlphaComponent(0.35)
+        accessibilityLabel = "播放进度"
+        accessibilityIdentifier = "playbackProgressSlider"
+        addTarget(self, action: #selector(valueDidChange), for: .valueChanged)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var isEnabled: Bool {
+        didSet {
+            if !isEnabled { cancelTracking(with: nil) }
+        }
+    }
+
+    override func beginTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+        guard isEnabled, super.beginTracking(touch, with: event) else { return false }
+        guard beginScrubbing() else { super.cancelTracking(with: event); return false }
+        return true
+    }
+
+    override func continueTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+        guard trackingToken != nil else { return false }
+        let tracking = super.continueTracking(touch, with: event)
+        if !tracking { cancelTracking(with: event) }
+        return tracking
+    }
+
+    override func endTracking(_ touch: UITouch?, with event: UIEvent?) {
+        let token = trackingToken
+        super.endTracking(touch, with: event)
+        // super may cause cancellation, so recheck the token before committing.
+        guard let token, trackingToken == token, touch != nil else {
+            cancelTracking(with: event)
+            return
+        }
+        finishScrubbing()
+    }
+
+    override func cancelTracking(with event: UIEvent?) {
+        let token = trackingToken
+        trackingToken = nil
+        scrubController?.cancelled(in: self, token: token,
+                                   deferred: deferCancellationNotifications)
+        super.cancelTracking(with: event)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            performModelUpdate { cancelTracking(with: nil) }
+        }
+    }
+
+    override func accessibilityIncrement() {
+        guard isEnabled else { return }
+        scrubController?.cancel()
+        let previous = value
+        super.accessibilityIncrement()
+        refreshAccessibilityValue()
+        if value != previous { scrubController?.adjustAccessibility(in: self, seconds: Double(value)) }
+    }
+
+    override func accessibilityDecrement() {
+        guard isEnabled else { return }
+        scrubController?.cancel()
+        let previous = value
+        super.accessibilityDecrement()
+        refreshAccessibilityValue()
+        if value != previous { scrubController?.adjustAccessibility(in: self, seconds: Double(value)) }
+    }
+
+    // The touch callbacks route through these operations. They also let UIKit
+    // integration tests exercise actual control events without fabricating a
+    // UITouch or using private APIs.
+    @discardableResult
+    func beginScrubbing() -> Bool {
+        guard isEnabled else { return false }
+        trackingToken = scrubController?.begin(in: self, seconds: Double(value))
+        return trackingToken != nil
+    }
+
+    func finishScrubbing() {
+        guard let token = trackingToken else { return }
+        trackingToken = nil
+        scrubController?.finish(in: self, token: token, seconds: Double(value))
+        refreshAccessibilityValue()
+    }
+
+    @objc private func valueDidChange() {
+        refreshAccessibilityValue()
+        // A value event after cancellation is not a new drag. VoiceOver commits
+        // explicitly above, so neither path can seek twice or revive an old token.
+        guard let token = trackingToken else { return }
+        scrubController?.update(in: self, token: token, seconds: Double(value))
+    }
+
+    func performModelUpdate(_ update: () -> Void) {
+        let previous = deferCancellationNotifications
+        deferCancellationNotifications = true
+        update()
+        deferCancellationNotifications = previous
+    }
+
+    fileprivate func refreshAccessibilityValue() {
+        accessibilityValue = PlaybackPosition.label(Double(value)) + " / "
+            + PlaybackPosition.label(Double(maximumValue))
+    }
+}
+
+@MainActor struct PlaybackSlider: UIViewRepresentable {
+    let seconds: Double
+    let duration: Double
+    let isEnabled: Bool
+    let controller: PlaybackScrubController
+    let onDraftChanged: (Double?) -> Void
+    let onEditingChanged: (Bool) -> Void
+    let onCommit: (Double) -> Void
+
+    final class Coordinator: PlaybackScrubObserver {
+        var parent: PlaybackSlider
+        init(_ parent: PlaybackSlider) { self.parent = parent }
+        func draftChanged(_ seconds: Double?) { parent.onDraftChanged(seconds) }
+        func editingChanged(_ editing: Bool) { parent.onEditingChanged(editing) }
+        func commit(_ seconds: Double) {
+            if parent.isEnabled { parent.onCommit(seconds) }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> PlaybackTrackingSlider {
+        let slider = PlaybackTrackingSlider(frame: .zero)
+        controller.bind(slider, observer: context.coordinator)
+        return slider
+    }
+
+    func updateUIView(_ slider: PlaybackTrackingSlider, context: Context) {
+        context.coordinator.parent = self
+        controller.bind(slider, observer: context.coordinator)
+        slider.performModelUpdate {
+            let upper = duration.isFinite ? max(1, duration) : 1
+            slider.maximumValue = Float(min(upper, Double(Float.greatestFiniteMagnitude)))
+            slider.isEnabled = isEnabled
+            if !controller.isEditing(in: slider) {
+                let value = seconds.isFinite ? min(max(0, seconds), upper) : 0
+                slider.setValue(Float(min(value, Double(slider.maximumValue))), animated: false)
+            }
+            slider.refreshAccessibilityValue()
+        }
+    }
+
+    static func dismantleUIView(_ slider: PlaybackTrackingSlider, coordinator: Coordinator) {
+        coordinator.parent.controller.detach(slider)
+    }
+}

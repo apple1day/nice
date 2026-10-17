@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import MobileVLCKit
+import ObjectiveC
 
 enum PlaybackPhase: Equatable { case idle, opening, playing, paused, ended, failed }
 struct PlaybackSnapshot {
@@ -52,7 +53,10 @@ protocol LocalPlaybackEngine: AnyObject {
 
 final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDelegate {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
-    private let player = VLCMediaPlayer(options: ["--no-video-title-show", "--no-metadata-network-access"])
+    private static var lifetimeAssociationKey: UInt8 = 0
+    private let playerResource: BackgroundPlaybackResource<VLCMediaPlayer>
+    private weak var nativeLifetime: BackgroundPlaybackResource<NSObject>?
+    private var player: VLCMediaPlayer? { playerResource.resource }
     private var stopped = false
     private var loaded = false
 
@@ -65,25 +69,39 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     private var seekGate = SeekFeedbackGate()
 
     override init() {
+        let construction = NICEVLCPlayerConstruction(options: ["--no-video-title-show", "--no-metadata-network-access"])
+        playerResource = BackgroundPlaybackResource(construction?.player)
         super.init()
-        player.delegate = self
+        if let construction {
+            let lifetime = BackgroundPlaybackResource(construction.nativeReference)
+            // Associated objects are disposed after VLCMediaPlayer's dealloc
+            // releases its C reference. Its extra native reference therefore
+            // survives even a late main-queue callback owning the ObjC player.
+            objc_setAssociatedObject(construction.player, &Self.lifetimeAssociationKey,
+                                     lifetime, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            nativeLifetime = lifetime
+        }
+        player?.delegate = self
     }
     func attach(to view: UIView) {
-        guard !stopped else { return }
+        guard !stopped, let player else { return }
+        nativeLifetime?.keepAlive(view)
         player.drawable = view
     }
     func load(fileURL: URL) throws {
         guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
+        guard let player else { throw ClientError("播放器初始化失败，请关闭后重新打开视频。") }
         // Check again immediately before giving VLC a file, even for non-store callers.
         try OfflineMediaPolicy.validateLocalFile(fileURL)
         player.media = VLCMedia(path: fileURL.path)
         loaded = true
     }
-    func play() { if loaded && !stopped { player.play() } }
-    func pause() { if loaded && !stopped { player.pause() } }
+    func play() { if loaded && !stopped { player?.play() } }
+    func pause() { if loaded && !stopped { player?.pause() } }
     func seek(to seconds: Double) {
+        guard !stopped, let player else { return }
         let duration = Double(player.media?.length.intValue ?? 0) / 1000
-        guard !stopped, player.isSeekable,
+        guard player.isSeekable,
               let seconds = PlaybackPosition.clamp(seconds, duration: duration) else { return }
 
         // Do not issue a decoder seek for a sub-frame-sized correction.
@@ -103,15 +121,19 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     func stop() {
         guard !stopped else { return }
         stopped = true
-        player.delegate = nil
+        player?.delegate = nil
         onUpdate = nil
         callbackLock.lock()
         seekGate.clear()
         timePublishScheduled = false
         callbackLock.unlock()
-        if loaded { player.stop() }
-        player.drawable = nil
-        player.media = nil
+        // Pinned VLCKit 3.7.3 stop() submits stop_async; keep that request before
+        // returning to the store's existing session/deletion-lease transition.
+        // The expensive final C release runs only in the retirement queue.
+        if loaded { player?.stop() }
+        loaded = false
+        playerResource.retire()
+        nativeLifetime = nil
     }
     func mediaPlayerStateChanged(_ aNotification: Notification) {
         DispatchQueue.main.async { [weak self] in self?.publishNow() }
@@ -139,7 +161,14 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     }
 
     private func publishNow() {
-        guard !stopped else { return }
+        guard !stopped, let snapshot = makeSnapshot() else { return }
+        // No borrowed native player reference is held while clients receive an
+        // update: a client may close or switch the player from this callback.
+        onUpdate?(snapshot)
+    }
+
+    private func makeSnapshot() -> PlaybackSnapshot? {
+        guard !stopped, let player else { return nil }
         let phase: PlaybackPhase
         switch player.state {
         case .playing: phase = .playing
@@ -156,14 +185,14 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
         let displayedSeconds = seekGate.displayedSeconds(raw: rawSeconds, now: now)
         callbackLock.unlock()
 
-        onUpdate?(PlaybackSnapshot(
+        return PlaybackSnapshot(
             phase: phase,
             seconds: displayedSeconds,
             duration: max(0, Double(player.media?.length.intValue ?? 0) / 1000),
             seekable: player.isSeekable,
             hasVideo: player.hasVideoOut,
             error: phase == .failed ? "VLC 无法解码这个本地文件。请检查文件是否损坏、编码是否受支持，必要时重新下载。" : nil
-        ))
+        )
     }
     deinit { stop() }
 }

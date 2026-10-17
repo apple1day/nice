@@ -39,9 +39,13 @@ class PlayerHotPathTests(unittest.TestCase):
         self.assertNotIn("draftSeconds", parent)
         self.assertNotIn("store.", progress)
         self.assertNotIn("playlist.", progress)
-        self.assertIn("set: { draftSeconds = $0 }", progress)
-        self.assertIn("if !editing", progress)
-        self.assertIn("model.seek(to: target)", progress)
+        self.assertIn("PlaybackSlider(", progress)
+        self.assertIn("onDraftChanged: { draftSeconds = $0 }", progress)
+        self.assertIn("onCommit: { model.seek(to: $0) }", progress)
+        slider = source("PlaybackSlider.swift")
+        self.assertIn("session.finish(token: token)", slider)
+        for symbol in ("store.", "playlist.", "FileManager", "validateLocalFile"):
+            self.assertNotIn(symbol, slider)
 
     def test_seek_keeps_same_engine_without_file_checks(self) -> None:
         seek = self.player.split("func seek(to value:", 1)[1].split("private func receive", 1)[0]

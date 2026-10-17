@@ -181,42 +181,29 @@ private struct VLCVideoSurface: UIViewRepresentable {
 }
 
 // The drag draft belongs to this small view, not the whole player. No store,
-// playlist traversal or file validation is reachable from the Slider binding.
+// playlist traversal or file validation is reachable from the drag callbacks.
 private struct PlaybackProgressView: View {
     @ObservedObject var model: PlaybackModel
     let isEnabled: Bool
+    let scrubber: PlaybackScrubController
     let onEditingChanged: (Bool) -> Void
     @State private var draftSeconds: Double?
     private var displayedSeconds: Double { draftSeconds ?? model.seconds }
 
     var body: some View {
         VStack(spacing: 4) {
-            Slider(value: Binding(
-                get: { min(max(0, displayedSeconds), max(1, model.duration)) },
-                set: { draftSeconds = $0 }
-            ), in: 0...max(1, model.duration), onEditingChanged: { editing in
-                if !editing {
-                    if isEnabled, let target = draftSeconds { model.seek(to: target) }
-                    draftSeconds = nil
-                }
-                onEditingChanged(editing && isEnabled)
-            })
-            .tint(.white).disabled(!isEnabled || !model.seekable)
-            .accessibilityLabel("播放进度").accessibilityIdentifier("playbackProgressSlider")
+            PlaybackSlider(seconds: model.seconds, duration: model.duration,
+                           isEnabled: isEnabled && model.seekable, controller: scrubber,
+                           onDraftChanged: { draftSeconds = $0 },
+                           onEditingChanged: onEditingChanged,
+                           onCommit: { model.seek(to: $0) })
+                .frame(height: 44)
             HStack {
                 Text(PlaybackPosition.label(displayedSeconds))
                 Spacer()
                 Text(PlaybackPosition.label(model.duration))
             }.font(.caption.monospacedDigit())
         }
-        .onChange(of: isEnabled) { _, enabled in
-            if !enabled { draftSeconds = nil; onEditingChanged(false) }
-        }
-        .onChange(of: model.seekable) { _, seekable in
-            // A decoder state change may disable the Slider mid-tracking.
-            if !seekable { draftSeconds = nil; onEditingChanged(false) }
-        }
-        .onDisappear { draftSeconds = nil; onEditingChanged(false) }
     }
 }
 
@@ -246,6 +233,7 @@ private struct PlaybackTransportButtonStyle: ButtonStyle {
 }
 
 private struct PlaybackButtonPressSurface<Label: View>: View {
+    @Environment(\.isEnabled) private var isEnabled
     let label: Label
     let isPressed: Bool
     let onPressChanged: (UUID, Bool) -> Void
@@ -253,7 +241,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     var body: some View {
         label
             .contentShape(Rectangle())
-            .opacity(isPressed ? 0.55 : 1)
+            .opacity(isEnabled ? (isPressed ? 0.55 : 1) : 0.35)
             .background(isPressed ? Color.white.opacity(0.12) : Color.clear,
                         in: RoundedRectangle(cornerRadius: 8))
             .onChange(of: isPressed) { _, pressed in onPressChanged(pressToken, pressed) }
@@ -261,7 +249,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     }
 }
 
-private struct PlaylistPlayerView: View {
+@MainActor private struct PlaylistPlayerView: View {
     @EnvironmentObject private var store: VideoStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
@@ -269,13 +257,20 @@ private struct PlaylistPlayerView: View {
     @ObservedObject var playlist: PlaylistPlaybackModel
     @ObservedObject var model: PlaybackModel
     @State private var controls = PlaybackControlsState()
+    // Draft updates stay in PlaybackProgressView. This reference is only used
+    // to cancel the current native tracking session synchronously before actions.
+    @State private var scrubber = PlaybackScrubController()
     @State private var showsPlaylist = false
     private var request: PlaybackRequest { playlist.current }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
     private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist }
     private var showsPause: Bool { model.phase == .playing || model.phase == .opening }
     private var canInteract: Bool { scenePhase == .active && store.errorMessage == nil && !showsPlaylist }
-    private var canNavigate: Bool { canInteract && !controls.isScrubbing }
+    private var transportButtonStyle: PlaybackTransportButtonStyle {
+        PlaybackTransportButtonStyle { token, pressed in
+            controls.setControlPressed(token, pressed: pressed, at: now)
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -313,6 +308,7 @@ private struct PlaylistPlayerView: View {
                         .allowsHitTesting(controls.isVisible)
                         .accessibilityHidden(!controls.isVisible)
                 }
+                .onChange(of: proxy.size) { _, _ in cancelProgressInteraction() }
             }
             .background(.black)
             .navigationTitle(request.title)
@@ -322,7 +318,11 @@ private struct PlaylistPlayerView: View {
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("关闭") { closePlayback(); dismiss() }
+                    Button { closePlayback(); dismiss() } label: {
+                        Text("关闭").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                    }
+                    .buttonStyle(transportButtonStyle)
+                    .accessibilityIdentifier("closePlayerButton")
                 }
             }
         }
@@ -335,8 +335,8 @@ private struct PlaylistPlayerView: View {
         )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
         message: { Text(store.errorMessage ?? "") }
         .onChange(of: request.id) { _, _ in
+            cancelProgressInteraction()
             controls.resetControlPresses(at: now)
-            controls.setScrubbing(false, at: now)
             controls.setPlaying(model.phase == .playing, at: now)
             controls.interacted(at: now)
             if scenePhase != .active { model.pause() }
@@ -346,9 +346,12 @@ private struct PlaylistPlayerView: View {
         }
         .onChange(of: hasMessage, initial: true) { _, value in controls.setPresentingAlert(value, at: now) }
         .onChange(of: voiceOverEnabled, initial: true) { _, value in controls.setVoiceOverEnabled(value, at: now) }
+        .onChange(of: canInteract) { _, value in
+            if !value { cancelProgressInteraction() }
+        }
         .onChange(of: scenePhase, initial: true) { _, phase in
             controls.setSceneActive(phase == .active, at: now)
-            if phase != .active { model.pause() }
+            if phase != .active { cancelProgressInteraction(); model.pause() }
         }
         .task(id: controls.hideDeadline) {
             guard let deadline = controls.hideDeadline else { return }
@@ -365,8 +368,16 @@ private struct PlaylistPlayerView: View {
         withAnimation(.easeInOut(duration: 0.2)) { controls.surfaceTapped(at: now) }
     }
     private func navigate(_ direction: LocalPlaybackPlaylist.Direction) {
-        guard canNavigate else { return }
-        playlist.move(direction)
+        performTransportAction { playlist.move(direction) }
+    }
+    private func cancelProgressInteraction() {
+        scrubber.cancel()
+        controls.setScrubbing(false, at: now)
+    }
+    private func performTransportAction(_ action: () -> Void) {
+        guard canInteract else { return }
+        cancelProgressInteraction()
+        action()
         revealControls()
     }
     private func navigationButton(_ direction: LocalPlaybackPlaylist.Direction, compact: Bool) -> some View {
@@ -374,13 +385,15 @@ private struct PlaylistPlayerView: View {
         return Button { navigate(direction) } label: {
             if compact {
                 Image(systemName: previous ? "backward.end.fill" : "forward.end.fill")
-                    .frame(width: 44, height: 52)
+                    .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52)
+                    .contentShape(Rectangle())
             } else {
                 Label(previous ? "上一个" : "下一个", systemImage: previous ? "backward.end.fill" : "forward.end.fill")
-                    .font(.caption).frame(minHeight: 44)
+                    .font(.caption).frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
+                    .contentShape(Rectangle())
             }
         }
-        .disabled(!canNavigate || !playlist.canMove(direction))
+        .disabled(!canInteract || !playlist.canMove(direction))
         .accessibilityLabel(previous ? "上一个视频" : "下一个视频")
         .accessibilityIdentifier(previous ? "previousVideoButton" : "nextVideoButton")
     }
@@ -388,12 +401,15 @@ private struct PlaylistPlayerView: View {
         HStack(spacing: 12) {
             Text(request.title).font(.headline).lineLimit(1)
             Spacer(minLength: 4)
-            Button { closePlayback(); dismiss() } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
+            Button { closePlayback(); dismiss() } label: {
+                Image(systemName: "xmark").frame(width: 44, height: 44).contentShape(Rectangle())
+            }
                 .accessibilityLabel("关闭播放器").accessibilityIdentifier("closeFullscreenPlayer")
         }
         .foregroundStyle(.white).padding(.horizontal, 16)
         .background(LinearGradient(colors: [.black.opacity(0.8), .clear], startPoint: .top, endPoint: .bottom))
         .contentShape(Rectangle())
+        .buttonStyle(transportButtonStyle)
     }
     private func transportControls(isLandscape: Bool) -> some View {
         VStack(spacing: 4) {
@@ -406,48 +422,53 @@ private struct PlaylistPlayerView: View {
             HStack(spacing: 8) {
                 if !isLandscape { navigationButton(.previous, compact: false) }
                 Spacer(minLength: 4)
-                Button { revealControls(); showsPlaylist = true } label: {
+                Button { performTransportAction { showsPlaylist = true } } label: {
                     Label(playlist.positionLabel, systemImage: "list.bullet")
-                        .font(.caption.monospacedDigit()).padding(.vertical, 8)
+                        .font(.caption.monospacedDigit())
+                        .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
+                        .contentShape(Rectangle())
                 }
-                .disabled(!canNavigate)
+                .disabled(!canInteract)
                 .accessibilityLabel("本地播放列表 \(playlist.positionLabel)")
                 .accessibilityIdentifier("openLocalPlaylistButton")
                 Spacer(minLength: 4)
                 if !isLandscape { navigationButton(.next, compact: false) }
             }
-            PlaybackProgressView(model: model, isEnabled: canInteract) { editing in
+            PlaybackProgressView(model: model, isEnabled: canInteract, scrubber: scrubber) { editing in
                 controls.setScrubbing(editing, at: now)
             }.id(request.id)
             HStack(spacing: 0) {
                 if isLandscape {
                     navigationButton(.previous, compact: true).frame(minWidth: 0, maxWidth: .infinity)
                 }
-                Button { revealControls(); model.seek(to: model.seconds - 15) } label: {
-                    Image(systemName: "gobackward.15").frame(width: 44, height: 52)
-                }.disabled(!model.seekable || !canNavigate).accessibilityLabel("后退15秒")
+                Button { performTransportAction { model.seek(to: model.seconds - 15) } } label: {
+                    Image(systemName: "gobackward.15")
+                        .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52).contentShape(Rectangle())
+                }.disabled(!model.seekable || !canInteract).accessibilityLabel("后退15秒")
                     .frame(minWidth: 0, maxWidth: .infinity)
-                Button { revealControls(); model.toggle() } label: {
+                Button { performTransportAction { model.toggle() } } label: {
                     Image(systemName: showsPause ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 38)).frame(width: 44, height: 52)
-                }.disabled(model.phase == .failed || model.phase == .idle || !canNavigate)
+                        .font(.system(size: 38))
+                        .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52).contentShape(Rectangle())
+                }.disabled(model.phase == .failed || model.phase == .idle || !canInteract)
                     .accessibilityLabel(showsPause ? "暂停" : "播放")
                     .accessibilityIdentifier("togglePlaybackButton")
                     .frame(minWidth: 0, maxWidth: .infinity)
                 transportFavoriteButton.frame(minWidth: 0, maxWidth: .infinity)
                 transportDeleteButton.frame(minWidth: 0, maxWidth: .infinity)
-                Button { revealControls(); model.seek(to: model.seconds + 15) } label: {
-                    Image(systemName: "goforward.15").frame(width: 44, height: 52)
-                }.disabled(!model.seekable || !canNavigate).accessibilityLabel("前进15秒")
+                Button { performTransportAction { model.seek(to: model.seconds + 15) } } label: {
+                    Image(systemName: "goforward.15")
+                        .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52).contentShape(Rectangle())
+                }.disabled(!model.seekable || !canInteract).accessibilityLabel("前进15秒")
                     .frame(minWidth: 0, maxWidth: .infinity)
                 if isLandscape {
                     navigationButton(.next, compact: true).frame(minWidth: 0, maxWidth: .infinity)
                 }
-                Button { controls.toggleFullscreen(at: now) } label: {
+                Button { performTransportAction { controls.toggleFullscreen(at: now) } } label: {
                     Image(systemName: controls.isFullscreen
                           ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                        .frame(width: 44, height: 52)
-                }.disabled(!canNavigate)
+                        .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52).contentShape(Rectangle())
+                }.disabled(!canInteract)
                     .accessibilityLabel(controls.isFullscreen ? "退出全屏" : "全屏播放")
                     .accessibilityValue(controls.isFullscreen ? "全屏" : "普通")
                     .accessibilityIdentifier("toggleFullscreenButton")
@@ -463,9 +484,7 @@ private struct PlaylistPlayerView: View {
                 .contentShape(Rectangle())
                 .onTapGesture { revealControls() }
         }
-        .buttonStyle(PlaybackTransportButtonStyle { token, pressed in
-            controls.setControlPressed(token, pressed: pressed, at: now)
-        })
+        .buttonStyle(transportButtonStyle)
         .accessibilityIdentifier("playbackTransportControls")
     }
     private var transportFavoriteButton: some View {
@@ -546,5 +565,9 @@ private struct PlaylistPlayerView: View {
         }
     }
     private func revealControls() { controls.interacted(at: now) }
-    private func closePlayback() { controls.stop(); playlist.close() }
+    private func closePlayback() {
+        cancelProgressInteraction()
+        controls.stop()
+        playlist.close()
+    }
 }
