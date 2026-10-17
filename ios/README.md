@@ -65,6 +65,9 @@ CocoaPods 发布 spec 的 SHA256 校验值为：
 
 ## 测试
 
+播放器按钮失效的排查、修复行为和本机更新步骤见
+[播放器按钮响应修复](PLAYER_RESPONSIVENESS.md)。
+
 ```bash
 # 核心离线策略测试：Mac/Linux 都可运行（需要 Swift）
 bash ios/check-policy.sh

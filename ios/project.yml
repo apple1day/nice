@@ -29,6 +29,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anxiong.nicevideos
+        CLANG_ENABLE_OBJC_ARC: YES
+        SWIFT_OBJC_BRIDGING_HEADER: NiceVideos/NiceVideos-Bridging-Header.h
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: NiceVideos/Info.plist
         GENERATE_INFOPLIST_FILE: NO
