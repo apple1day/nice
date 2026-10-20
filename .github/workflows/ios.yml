@@ -34,6 +34,8 @@ jobs:
         run: bash ios/check-watch-delete.sh
       - name: Test fullscreen controls and auto-hide timing
         run: bash ios/check-player-controls.sh
+      - name: Test nonblocking player resource retirement
+        run: bash ios/check-player-teardown.sh
       - name: Test local playlist order and swipe directions
         run: bash ios/check-playlist.sh
       - name: Compile app and run offline policy, lifecycle, playlist, watch-delete, batch-delete and VLC decode tests
