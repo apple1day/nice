@@ -94,7 +94,7 @@ final class DownloadedServerDeletionTests: XCTestCase {
     }
 
     @MainActor
-    func testDownloadStateChangedAfterConfirmationIsSkipped() async throws {
+    func testDownloadStateChangedAfterSnapshotIsSkipped() async throws {
         let local = try record(video())
         let plan = DownloadedServerDeletionPlan(server: server, videos: [local.video], records: [local])
         for state in [DownloadState.downloading, .failed] {
@@ -124,7 +124,7 @@ final class DownloadedServerDeletionTests: XCTestCase {
     }
 
     @MainActor
-    func testServerSwitchBeforeConfirmationSendsNoDelete() async throws {
+    func testServerSwitchBeforeBatchSendsNoDelete() async throws {
         let local = try record(video())
         let plan = DownloadedServerDeletionPlan(server: server, videos: [local.video], records: [local])
         let result = await DownloadedServerDeletion.run(plan, currentServer: { self.otherServer },
@@ -151,7 +151,7 @@ final class DownloadedServerDeletionTests: XCTestCase {
     }
 
     @MainActor
-    func testNewDownloadAfterConfirmationIsNotIncluded() async throws {
+    func testNewDownloadAfterSnapshotIsNotIncluded() async throws {
         let first = try record(video("a.mp4")), later = try record(video("b.mp4"))
         let plan = DownloadedServerDeletionPlan(server: server, videos: [first.video, later.video], records: [first])
         let current = [first, later]
