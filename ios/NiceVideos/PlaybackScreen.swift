@@ -197,9 +197,11 @@ private struct PlaybackProgressView: View {
                            onDraftChanged: { draftSeconds = $0 },
                            onEditingChanged: onEditingChanged,
                            onCommit: { model.seek(to: $0) })
+                .frame(maxWidth: .infinity)
                 .frame(height: 44)
             HStack {
                 Text(PlaybackPosition.label(displayedSeconds))
+                    .accessibilityIdentifier("playbackElapsedTime")
                 Spacer()
                 Text(PlaybackPosition.label(model.duration))
             }.font(.caption.monospacedDigit())
@@ -571,3 +573,14 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         playlist.close()
     }
 }
+
+#if DEBUG
+// The UI-test fixture uses the production player hierarchy and a deterministic
+// engine, so real touch tests cover overlays, fullscreen and playlist changes.
+@MainActor struct PlaybackUITestPlayerView: View {
+    @ObservedObject var playlist: PlaylistPlaybackModel
+    var body: some View {
+        PlaylistPlayerView(playlist: playlist, model: playlist.player)
+    }
+}
+#endif

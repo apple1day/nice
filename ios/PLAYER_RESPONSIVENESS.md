@@ -1,9 +1,8 @@
-# 播放器按钮响应修复
+# 播放器按钮响应与进度拖动修复
 
-修复分支：`codex/ios-player-controls-freeze`。
-基础提交：`main` 的 `784eb5e2d3212ed67ff8a2e1f516618fefe40ae0`。
-最新功能分支 `codex/ios-dismiss-server-keyboard` 已通过 PR #8 合入该主分支，
-本次合并检查返回 `Already up to date`。
+按钮响应修复已通过 PR #9 合入 `main`。
+进度条触摸回归的补充修复位于 `codex/ios-server-management`（PR #10），
+与服务器删除、地址预填和键盘收起的更新一起交付。
 
 ## 两类故障及证据
 
@@ -43,8 +42,9 @@
 
 1. 进度拖动有独立会话 token。取消会立即使 token 和草稿失效，迟到的结束/数值
    事件不会再次提交旧进度或覆盖下一条视频。
-2. 使用原生 `UISlider` 处理正常结束、触摸取消、禁用及视图移除；保留 VoiceOver
-   调整进度的能力。草稿仍由进度子视图管理，拖动不扫描媒体库。
+2. 使用独立 `UIControl` 直接处理触摸坐标，整条 44pt 高的进度区域都能起拖；
+   不依赖 `UISlider` 内部的滑块命中和事件顺序。保持取消、禁用及视图移除保护，
+   保留 VoiceOver 调整进度。草稿仍由进度子视图管理，拖动不扫描媒体库。
 3. 切换、跳转、暂停、全屏和打开播放列表前同步取消当前拖动；这些离散按钮
    不再被一个残留的拖动布尔值永久禁用。
 4. 所有传输按钮的内部标签填满各自格子；关闭按钮也在按住时阻止自动隐藏。
@@ -55,14 +55,27 @@
 本次保留已有播放请求、位置保存、播放顺序和停止请求提交后的文件保护语义，
 没有把文件保护改成“等待所有解码线程退出后才解除”的新异步协议。
 
+## 进度条触摸回归
+
+原进度条测试直接调用拖动会话入口，没有覆盖系统真实触摸派发和 SwiftUI 中的
+命中范围，因此不能证明手指能够拖动。补充修复明确了进度条的全宽布局与 44pt
+触摸高度，从按下到松手直接映射坐标；播放时间刷新不覆盖正在拖动的草稿，
+松手只提交一次跳转，取消后的迟到事件不生效。
+
+新增 UI 测试通过实际屏幕坐标按住、拖动和松手，覆盖播放中正反拖动、暂停后拖动、
+全屏、横屏及切换到下一个视频后的拖动。测试使用生产播放器界面，只有播放引擎
+替换为确定性的测试引擎，并验证跳转调用和界面时间不会回弹。测试入口仅在 Debug
+构建加 `--ui-test-playback` 参数时启用，使用独立临时文件和设置；Release 不包含
+该入口。真实 VLC 解码仍由现有播放测试覆盖，目标 iPhone 的实际触感仍需真机验收。
+
 ## 本机更新
 
 保存并关闭 Xcode 工程窗口，在本机 `nice` / `git_nice` 仓库根目录运行：
 
 ```bash
 git fetch origin &&
-git switch codex/ios-player-controls-freeze &&
-git pull --ff-only origin codex/ios-player-controls-freeze &&
+git switch codex/ios-server-management &&
+git pull --ff-only origin codex/ios-server-management &&
 bash ios/repair-project.sh &&
 open ios/NiceVideos.xcworkspace
 ```
@@ -81,7 +94,7 @@ bash ios/check-playlist.sh
 # 工程与接线检查
 python3 -m unittest discover -s ios/tools -p 'test_*.py'
 
-# Mac + Xcode：完整 App、UIKit、播放模型与真实 VLC 解码
+# Mac + Xcode：完整 App、UIKit、真实触摸 UI 测试、播放模型与真实 VLC 解码
 bash ios/test.sh
 ```
 

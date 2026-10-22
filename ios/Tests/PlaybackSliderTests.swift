@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 @testable import NiceVideos
 
 private final class ScrubObserver: PlaybackScrubObserver {
@@ -11,8 +12,27 @@ private final class ScrubObserver: PlaybackScrubObserver {
     func commit(_ seconds: Double) { commits.append(seconds) }
 }
 
-// These exercise the real UISlider target-action and lifecycle implementation.
-// Only the OS's initial touch acquisition is bypassed; no UITouch is fabricated.
+@MainActor private struct PlaybackSliderTestHost: View {
+    let seconds: Double
+    let controller: PlaybackScrubController
+    let observer: ScrubObserver
+
+    var body: some View {
+        PlaybackSlider(seconds: seconds, duration: 100, isEnabled: true,
+                       controller: controller,
+                       onDraftChanged: observer.draftChanged,
+                       onEditingChanged: observer.editingChanged,
+                       onCommit: observer.commit)
+            .frame(maxWidth: .infinity)
+            .frame(height: 44)
+            .padding(.horizontal, 16)
+            .frame(width: 320, height: 160)
+    }
+}
+
+// Unit tests drive the control's coordinate, target-action and lifecycle seams.
+// Hosting tests check SwiftUI layout/hit testing; the UI test target separately
+// verifies OS touch acquisition, dragging and release. No UITouch is fabricated.
 @MainActor final class PlaybackSliderTests: XCTestCase {
     private func fixture() -> (PlaybackScrubController, PlaybackTrackingSlider, ScrubObserver) {
         let controller = PlaybackScrubController()
@@ -28,6 +48,132 @@ private final class ScrubObserver: PlaybackScrubObserver {
         await withCheckedContinuation { continuation in
             DispatchQueue.main.async { continuation.resume() }
         }
+    }
+
+    private func findSlider(in view: UIView) -> PlaybackTrackingSlider? {
+        if let slider = view as? PlaybackTrackingSlider { return slider }
+        for subview in view.subviews {
+            if let slider = findSlider(in: subview) { return slider }
+        }
+        return nil
+    }
+
+    private func hostedFixture(controller: PlaybackScrubController, observer: ScrubObserver) async throws
+        -> (UIWindow, UIHostingController<PlaybackSliderTestHost>, PlaybackTrackingSlider) {
+        let host = UIHostingController(rootView: PlaybackSliderTestHost(
+            seconds: 20, controller: controller, observer: observer))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 640))
+        window.rootViewController = host
+        window.isHidden = false
+        host.view.layoutIfNeeded()
+        await drainMainQueue()
+        host.view.layoutIfNeeded()
+        let slider = try XCTUnwrap(findSlider(in: host.view))
+        return (window, host, slider)
+    }
+
+    func testTrackPressAwayFromThumbDragsBothWaysAndClampsAtEdges() {
+        let (controller, slider, observer) = fixture()
+        // The thumb starts at 20. A press near the top of the 44pt surface
+        // must immediately acquire the track at 80, without touching the thumb.
+        XCTAssertTrue(slider.beginScrubbing(at: CGPoint(x: 234, y: 1)))
+        XCTAssertEqual(slider.value, 80)
+        XCTAssertEqual(observer.drafts.last ?? nil, 80)
+        XCTAssertTrue(controller.isEditing(in: slider))
+
+        XCTAssertTrue(slider.continueScrubbing(at: CGPoint(x: 330, y: 43)))
+        XCTAssertEqual(slider.value, 100)
+        XCTAssertTrue(slider.continueScrubbing(at: CGPoint(x: 66, y: 43)))
+        XCTAssertEqual(slider.value, 20)
+        XCTAssertTrue(slider.continueScrubbing(at: CGPoint(x: -30, y: 60)))
+        XCTAssertEqual(slider.value, 0)
+        XCTAssertTrue(observer.commits.isEmpty)
+
+        // The release coordinate is authoritative even without another move.
+        slider.finishScrubbing(at: CGPoint(x: 150, y: 43))
+        slider.finishScrubbing(at: CGPoint(x: 290, y: 43))
+        XCTAssertEqual(observer.commits, [50])
+        XCTAssertEqual(observer.editing, [true, false])
+        XCTAssertNil(observer.drafts.last ?? nil)
+        XCTAssertFalse(controller.isEditing(in: slider))
+    }
+
+    func testCancelledCoordinateDragRejectsLateMoveAndRelease() {
+        let (controller, slider, observer) = fixture()
+        XCTAssertTrue(slider.beginScrubbing(at: CGPoint(x: 234, y: 22)))
+        controller.cancel()
+
+        XCTAssertFalse(slider.continueScrubbing(at: CGPoint(x: 290, y: 22)))
+        slider.finishScrubbing(at: CGPoint(x: 66, y: 22))
+        XCTAssertEqual(slider.value, 80)
+        XCTAssertFalse(controller.isEditing(in: slider))
+        XCTAssertEqual(observer.editing, [true, false])
+        XCTAssertNil(observer.drafts.last ?? nil)
+        XCTAssertTrue(observer.commits.isEmpty)
+    }
+
+    func testDisabledOrInvalidGeometryCannotStartCoordinateDrag() {
+        let (controller, slider, observer) = fixture()
+        slider.isEnabled = false
+        XCTAssertFalse(slider.beginScrubbing(at: CGPoint(x: 150, y: 22)))
+        slider.isEnabled = true
+
+        for size in [CGSize(width: 20, height: 44), CGSize(width: 300, height: 0)] {
+            slider.bounds.size = size
+            XCTAssertFalse(slider.beginScrubbing())
+            XCTAssertFalse(slider.beginScrubbing(at: CGPoint(x: size.width / 2, y: size.height / 2)))
+        }
+        slider.bounds.size = CGSize(width: 300, height: 44)
+        XCTAssertFalse(slider.beginScrubbing(at: CGPoint(x: CGFloat.nan, y: 22)))
+        XCTAssertFalse(slider.beginScrubbing(at: CGPoint(x: 150, y: CGFloat.infinity)))
+        XCTAssertFalse(controller.isEditing(in: slider))
+        XCTAssertTrue(observer.editing.isEmpty)
+        XCTAssertTrue(observer.commits.isEmpty)
+    }
+
+    func testSwiftUIHostingProvidesFullWidthAndFortyFourPointHitSurface() async throws {
+        let controller = PlaybackScrubController()
+        let observer = ScrubObserver()
+        let (window, host, slider) = try await hostedFixture(controller: controller, observer: observer)
+        defer { window.isHidden = true }
+
+        XCTAssertGreaterThanOrEqual(slider.bounds.width, 280)
+        XCTAssertEqual(slider.bounds.height, 44, accuracy: 0.5)
+        for point in [CGPoint(x: 20, y: 1), CGPoint(x: slider.bounds.width - 20, y: 43)] {
+            let hostPoint = slider.convert(point, to: host.view)
+            XCTAssertTrue(host.view.hitTest(hostPoint, with: nil) === slider,
+                          "The full progress row must receive touches, including above and below the thumb.")
+        }
+    }
+
+    func testHostedPlaybackTimeUpdatesPreserveDragAndResumeAfterRelease() async throws {
+        let controller = PlaybackScrubController()
+        let observer = ScrubObserver()
+        let (window, host, slider) = try await hostedFixture(controller: controller, observer: observer)
+        defer { window.isHidden = true }
+        let midpoint = CGPoint(x: slider.bounds.midX, y: slider.bounds.midY)
+        XCTAssertTrue(slider.beginScrubbing(at: midpoint))
+        XCTAssertEqual(slider.value, 50)
+
+        host.rootView = PlaybackSliderTestHost(seconds: 27, controller: controller, observer: observer)
+        host.view.layoutIfNeeded()
+        await drainMainQueue()
+        host.view.layoutIfNeeded()
+        XCTAssertTrue(findSlider(in: host.view) === slider)
+        XCTAssertTrue(controller.isEditing(in: slider))
+        XCTAssertEqual(slider.value, 50)
+        XCTAssertEqual(observer.drafts.last ?? nil, 50)
+        XCTAssertTrue(observer.commits.isEmpty)
+
+        slider.finishScrubbing(at: midpoint)
+        XCTAssertEqual(observer.commits, [50])
+        host.rootView = PlaybackSliderTestHost(seconds: 56, controller: controller, observer: observer)
+        host.view.layoutIfNeeded()
+        await drainMainQueue()
+        host.view.layoutIfNeeded()
+        XCTAssertEqual(slider.value, 56)
+        XCTAssertFalse(controller.isEditing(in: slider))
+        XCTAssertEqual(observer.commits, [50])
     }
 
     func testValueChangedUpdatesDraftButCommitsOnlyOnFinish() {

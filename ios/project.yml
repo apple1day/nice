@@ -51,13 +51,28 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anxiong.nicevideos.tests
         GENERATE_INFOPLIST_FILE: YES
+  NiceVideosUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: NiceVideos
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anxiong.nicevideos.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: NiceVideos
 schemes:
   NiceVideos:
     build:
       targets:
         NiceVideos: all
         NiceVideosTests: [test]
+        NiceVideosUITests: [test]
     test:
+      config: Debug
       gatherCoverageData: true
       targets:
         - NiceVideosTests
+        - NiceVideosUITests

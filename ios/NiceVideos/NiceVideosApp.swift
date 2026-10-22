@@ -27,14 +27,29 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 @MainActor
 struct NiceVideosApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var signing = SigningStatusModel()
-    // The root subscribes only to presentation changes, not every progress tick.
-    private let store = VideoStore.shared
     var body: some Scene {
         WindowGroup {
-            LibraryRootView(store: store)
-                .environmentObject(store)
-                .environmentObject(signing)
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--ui-test-playback") {
+                PlaybackUITestFixtureView()
+            } else {
+                NiceVideosRootView()
+            }
+            #else
+            NiceVideosRootView()
+            #endif
         }
+    }
+}
+
+@MainActor private struct NiceVideosRootView: View {
+    @StateObject private var signing = SigningStatusModel()
+    // The test fixture never initializes the user's shared store or settings.
+    // The normal root subscribes only to presentation changes, not progress ticks.
+    private let store = VideoStore.shared
+    var body: some View {
+        LibraryRootView(store: store)
+            .environmentObject(store)
+            .environmentObject(signing)
     }
 }
