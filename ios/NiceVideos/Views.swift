@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct RootView: View {
     @EnvironmentObject private var store: VideoStore
@@ -94,7 +95,13 @@ struct SettingsView: View {
     @EnvironmentObject private var store: VideoStore
     @AppStorage("allowCellular") private var allowCellular = false
     @State private var draft = ""
+    @State private var pendingServerRemoval: String?
     @FocusState private var serverFieldFocused: Bool
+
+    private var serverDraftTemplate: String {
+        store.server.isEmpty ? (store.servers.last ?? "") : store.server
+    }
+
     var body: some View {
         Form {
             SigningStatusSection()
@@ -107,10 +114,13 @@ struct SettingsView: View {
                         .focused($serverFieldFocused)
                         .submitLabel(.done)
                         .onSubmit { addDraftServer() }
+                        .accessibilityIdentifier("serverAddressField")
                     Button("添加") {
                         addDraftServer()
                     }
+                    .buttonStyle(.borderless)
                     .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityIdentifier("addServerButton")
                 }
 
                 if store.servers.isEmpty {
@@ -132,21 +142,27 @@ struct SettingsView: View {
                             Spacer()
                             if store.server == address {
                                 Button("刷新") {
-                                    serverFieldFocused = false
+                                    dismissServerKeyboard()
                                     store.refresh()
                                 }
                                 .disabled(store.loading)
                             } else {
                                 Button("连接") {
-                                    serverFieldFocused = false
+                                    dismissServerKeyboard()
                                     store.connectServer(address)
                                 }
                             }
+                            Button("删除", role: .destructive) {
+                                dismissServerKeyboard()
+                                pendingServerRemoval = address
+                            }
+                            .accessibilityLabel("删除服务器 \(address)")
                         }
+                        .buttonStyle(.borderless)
                     }
                 }
 
-                Text("可以保存多个 Mac/服务器地址，点击每个地址右侧的“连接”即可切换。切换后会读取该服务器的视频列表；本地已下载视频不会被删除。")
+                Text("可直接修改输入框中的当前地址并添加，点击“连接”切换服务器。“删除”只移除保存的地址，保留手机视频和已有下载任务。")
                     .font(.footnote).foregroundStyle(.secondary)
                 Text("真机填写服务器的局域网地址，不要填写 localhost。播放本地视频不需要配置服务器。")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -173,16 +189,42 @@ struct SettingsView: View {
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
-                Button("完成") { serverFieldFocused = false }
+                Button("完成") { dismissServerKeyboard() }
             }
         }
-        .onAppear { draft = store.server }
+        .onAppear { draft = serverDraftTemplate }
+        .onChange(of: store.server) { _, _ in
+            draft = serverDraftTemplate
+        }
+        .onDisappear { dismissServerKeyboard() }
+        .alert("删除保存的服务器？", isPresented: Binding(
+            get: { pendingServerRemoval != nil },
+            set: { if !$0 { pendingServerRemoval = nil } }
+        ), presenting: pendingServerRemoval) { address in
+            Button("删除地址", role: .destructive) {
+                store.removeServer(address)
+                if draft == address { draft = serverDraftTemplate }
+                pendingServerRemoval = nil
+            }
+            Button("取消", role: .cancel) { pendingServerRemoval = nil }
+        } message: { address in
+            Text("\(address)\n\(store.server == address ? "删除后当前连接将清空，可手动连接其他服务器。\n" : "")只移除保存的地址，不会删除服务器或手机中的视频，也不会中断已有下载。")
+        }
     }
 
     private func addDraftServer() {
         guard store.addServer(draft) else { return }
-        draft = ""
+        // Keep a complete, normalized URL ready for the next IP/port edit.
+        draft = (try? ServerAddress.normalize(draft).absoluteString) ?? draft
+        dismissServerKeyboard()
+    }
+
+    private func dismissServerKeyboard() {
         serverFieldFocused = false
+        // Form updates can retain the UIKit first responder after FocusState
+        // changes, so explicitly dismiss it for button and keyboard submissions.
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                        to: nil, from: nil, for: nil)
     }
 }
 
