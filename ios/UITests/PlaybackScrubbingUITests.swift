@@ -114,13 +114,14 @@ import XCTest
     @discardableResult
     private func ensureControlsVisible(file: StaticString = #filePath, line: UInt = #line) throws -> CGRect {
         let progress = element("playbackProgressSlider")
-        // Only tap when hidden. Blindly tapping the surface can hide controls
-        // which are already visible and turn a gesture test into a timing race.
-        if !progress.isHittable {
-            let surface = element("playbackSurfaceToggle")
-            XCTAssertTrue(surface.exists, file: file, line: line)
-            surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2)).tap()
-        }
+        // The bottom-left point is inside the transport's 16pt horizontal
+        // padding in portrait, landscape and fullscreen. When visible, its
+        // background reveals controls and renews the deadline; when hidden,
+        // the underlying video surface shows them. It never toggles them off
+        // or activates a button, unlike tapping the middle of the video.
+        let surface = element("playbackSurfaceToggle")
+        XCTAssertTrue(surface.exists, file: file, line: line)
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.95)).tap()
         waitUntil("Progress must be visible and ready to receive real touches", file: file, line: line) {
             progress.isHittable
         }
@@ -153,6 +154,9 @@ import XCTest
     private func waitUntil(_ message: String, timeout: TimeInterval = 6,
                            file: StaticString = #filePath, line: UInt = #line,
                            _ condition: @escaping () -> Bool) {
+        // Predicate expectations defer their first poll. Use readiness already
+        // available now before spending the player's four-second visible window.
+        if condition() { return }
         let predicate = NSPredicate { _, _ in condition() }
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: nil)
         let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
