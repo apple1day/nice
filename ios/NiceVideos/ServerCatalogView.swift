@@ -36,7 +36,6 @@ struct ServerCatalogView: View {
     @State private var pendingServerDeletion: Video?
     @State private var pendingServerDeletionServer = ""
     @State private var deletingServerNames = Set<String>()
-    @State private var pendingDownloadedDeletion: DownloadedServerDeletionPlan?
     @State private var deletingDownloaded = false
     @State private var downloadedDeletionResult: DownloadedServerDeletionResult?
 
@@ -154,7 +153,6 @@ struct ServerCatalogView: View {
         }
         .onChange(of: store.server) { _, _ in
             pendingServerDeletion = nil
-            pendingDownloadedDeletion = nil
             downloadedDeletionResult = nil
             confirmAll = false
         }
@@ -163,25 +161,15 @@ struct ServerCatalogView: View {
     private var downloadedDeletionSection: some View {
         let plan = downloadedPlan
         return Section {
-            Text("一键清理当前服务器中已经完整下载到手机的视频，只删除服务器源文件，保留手机本地副本。未完成下载或本地文件缺失的项目不会删除。")
+            Text("点击后立即开始清理当前服务器中已经完整下载到手机的视频，只删除服务器源文件，保留手机本地副本。未完成下载或本地文件缺失的项目不会删除。")
                 .font(.footnote).foregroundStyle(.secondary)
             Button(role: .destructive) {
-                pendingDownloadedDeletion = plan
+                deleteDownloadedFromServer(plan)
             } label: {
                 Label("一键删除已经下载的视频（\(plan.records.count)）", systemImage: "trash")
             }
             .disabled(plan.records.isEmpty || store.restoring || store.loading || deletingFromServer)
             .accessibilityIdentifier("deleteDownloadedServerVideosButton")
-            .confirmationDialog("删除这 \(pendingDownloadedDeletion?.records.count ?? 0) 个已下载视频的服务器源文件？",
-                                isPresented: Binding(
-                                    get: { pendingDownloadedDeletion != nil },
-                                    set: { if !$0 { pendingDownloadedDeletion = nil } }
-                                ), titleVisibility: .visible, presenting: pendingDownloadedDeletion) { snapshot in
-                Button("确认删除服务器源文件", role: .destructive) { deleteDownloadedFromServer(snapshot) }
-                Button("取消", role: .cancel) { pendingDownloadedDeletion = nil }
-            } message: { snapshot in
-                Text("服务器：\(snapshot.server)\n只处理本次确认时已下载完成的视频，不受搜索条件影响。手机本地副本、收藏和待删除标记均保留。此操作不可撤销。")
-            }
             if deletingDownloaded {
                 ProgressView("正在删除服务器视频，请勿重复操作")
             }
@@ -245,7 +233,6 @@ struct ServerCatalogView: View {
     }
 
     private func deleteDownloadedFromServer(_ snapshot: DownloadedServerDeletionPlan) {
-        pendingDownloadedDeletion = nil
         guard !deletingFromServer else { return }
         deletingDownloaded = true
         downloadedDeletionResult = nil
