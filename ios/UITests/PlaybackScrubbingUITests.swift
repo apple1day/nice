@@ -35,7 +35,7 @@ import XCTest
     }
 
     func testPausedPlaybackRemainsPausedAfterDragging() throws {
-        ensureControlsVisible()
+        try ensureControlsVisible()
         element("togglePlaybackButton").tap()
         waitUntil("Pause should reach the playback model") {
             self.element("uiTestPlaybackPhase").label == "paused"
@@ -46,7 +46,7 @@ import XCTest
     }
 
     func testFullscreenLandscapeAndNextVideoKeepDraggingAvailable() throws {
-        ensureControlsVisible()
+        try ensureControlsVisible()
         element("toggleFullscreenButton").tap()
         waitUntil("The production player should enter fullscreen") {
             self.element("toggleFullscreenButton").value as? String == "全屏"
@@ -59,7 +59,7 @@ import XCTest
         }
         _ = try dragProgress(from: 0.60, to: 0.24, phase: "playing")
 
-        ensureControlsVisible()
+        try ensureControlsVisible()
         XCTAssertTrue(element("nextVideoButton").isEnabled)
         element("nextVideoButton").tap()
         waitUntil("Next should attach a new player to the production hierarchy") {
@@ -73,13 +73,17 @@ import XCTest
     private func dragProgress(from startFraction: CGFloat, to endFraction: CGFloat,
                               phase: String, file: StaticString = #filePath,
                               line: UInt = #line) throws -> Double {
-        ensureControlsVisible(file: file, line: line)
-        let progress = element("playbackProgressSlider")
-        XCTAssertGreaterThan(progress.frame.width, 120, "Progress must fill the controls", file: file, line: line)
-        XCTAssertGreaterThanOrEqual(progress.frame.height, 44, "Touch height must stay usable", file: file, line: line)
+        // Read probes before revealing the controls. Each AX lookup is a round
+        // trip, and the production player correctly auto-hides after four seconds.
         let seeksBefore = try integer("uiTestSeekCount")
-        let start = progress.coordinate(withNormalizedOffset: CGVector(dx: startFraction, dy: 0.5))
-        let end = progress.coordinate(withNormalizedOffset: CGVector(dx: endFraction, dy: 0.5))
+        let frame = try ensureControlsVisible(file: file, line: line)
+        XCTAssertGreaterThan(frame.width, 120, "Progress must fill the controls", file: file, line: line)
+        XCTAssertGreaterThanOrEqual(frame.height, 44, "Touch height must stay usable", file: file, line: line)
+        // Reuse the frame just observed, without resolving the slider again
+        // between showing the controls and putting the finger down.
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        let start = origin.withOffset(CGVector(dx: frame.minX + frame.width * startFraction, dy: frame.midY))
+        let end = origin.withOffset(CGVector(dx: frame.minX + frame.width * endFraction, dy: frame.midY))
         start.press(forDuration: 0.35, thenDragTo: end)
 
         waitUntil("Releasing a drag must perform exactly one engine seek", file: file, line: line) {
@@ -101,24 +105,31 @@ import XCTest
         XCTAssertLessThan(seconds, target + 6, "Playback should continue near the selected time", file: file, line: line)
 
         // Check the user's actual elapsed-time label as well as the engine probe.
-        ensureControlsVisible(file: file, line: line)
+        try ensureControlsVisible(file: file, line: line)
         let displayed = try displayedSeconds(element("playbackElapsedTime").label)
         XCTAssertEqual(displayed, try number("uiTestPlaybackSeconds"), accuracy: 2, file: file, line: line)
         return target
     }
 
-    private func ensureControlsVisible(file: StaticString = #filePath, line: UInt = #line) {
+    @discardableResult
+    private func ensureControlsVisible(file: StaticString = #filePath, line: UInt = #line) throws -> CGRect {
+        let progress = element("playbackProgressSlider")
         // Only tap when hidden. Blindly tapping the surface can hide controls
         // which are already visible and turn a gesture test into a timing race.
-        if !element("playbackProgressSlider").isHittable {
+        if !progress.isHittable {
             let surface = element("playbackSurfaceToggle")
             XCTAssertTrue(surface.exists, file: file, line: line)
             surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2)).tap()
         }
         waitUntil("Progress must be visible and ready to receive real touches", file: file, line: line) {
-            let progress = self.element("playbackProgressSlider")
-            return progress.isHittable && progress.isEnabled && progress.frame.width > 120
+            progress.isHittable
         }
+        // One snapshot supplies both properties. Do not perform three separate
+        // AX lookups on every visibility poll or conflate layout/enable failures.
+        let snapshot = try progress.snapshot()
+        XCTAssertTrue(snapshot.isEnabled, "Visible progress is disabled: \(snapshot.dictionaryRepresentation)",
+                      file: file, line: line)
+        return snapshot.frame
     }
 
     private func element(_ identifier: String) -> XCUIElement {
@@ -144,7 +155,36 @@ import XCTest
                            _ condition: @escaping () -> Bool) {
         let predicate = NSPredicate { _, _ in condition() }
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed,
-                       message, file: file, line: line)
+        let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
+        guard result != .completed else { return }
+
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Playback UI wait failure"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        let details = playbackFailureDiagnostics()
+        let hierarchy = app.debugDescription
+        let attachment = XCTAttachment(string: details + "\n\n" + hierarchy)
+        attachment.name = "Playback accessibility state"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        XCTFail(message + "\n" + details + "\n\n" + hierarchy, file: file, line: line)
+    }
+
+    private func playbackFailureDiagnostics() -> String {
+        func describe(_ candidate: XCUIElement) -> String {
+            guard candidate.exists else { return "exists=false" }
+            guard let snapshot = try? candidate.snapshot() else { return "exists=true, snapshot unavailable" }
+            return "exists=true, hittable=\(candidate.isHittable), enabled=\(snapshot.isEnabled), "
+                + "frame=\(snapshot.frame), width>120=\(snapshot.frame.width > 120), "
+                + "height>=44=\(snapshot.frame.height >= 44), "
+                + "identifier=\(snapshot.identifier), label=\(snapshot.label)"
+        }
+        // A label candidate is diagnostic only; gestures must still find the
+        // actual identifier so an inherited parent ID cannot silently pass.
+        let byLabel = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", "播放进度")).firstMatch
+        return "Progress by identifier: \(describe(element("playbackProgressSlider")))\n"
+            + "Progress by label: \(describe(byLabel))"
     }
 }

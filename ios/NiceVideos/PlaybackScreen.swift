@@ -199,6 +199,7 @@ private struct PlaybackProgressView: View {
                            onCommit: { model.seek(to: $0) })
                 .frame(maxWidth: .infinity)
                 .frame(height: 44)
+                .accessibilityIdentifier("playbackProgressSlider")
             HStack {
                 Text(PlaybackPosition.label(displayedSeconds))
                     .accessibilityIdentifier("playbackElapsedTime")
@@ -487,7 +488,8 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                 .onTapGesture { revealControls() }
         }
         .buttonStyle(transportButtonStyle)
-        .accessibilityIdentifier("playbackTransportControls")
+        // Keep identifiers on leaf controls. An identifier on this container
+        // replaces its descendants' identifiers in SwiftUI's accessibility tree.
     }
     private var transportFavoriteButton: some View {
         let favorite = playlist.currentEntry?.isFavorite == true
