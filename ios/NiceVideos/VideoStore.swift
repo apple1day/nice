@@ -132,6 +132,26 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         }
     }
 
+    // Remove only the saved connection. Downloads own their source addresses and
+    // remain available (including retries) after a server is removed from this list.
+    func removeServer(_ input: String) {
+        guard let normalized = try? ServerAddress.normalize(input).absoluteString,
+              servers.contains(normalized) else { return }
+        servers.removeAll { $0 == normalized }
+        defaults.set(servers, forKey: "servers")
+
+        guard server == normalized else { return }
+        refreshTask?.cancel()
+        refreshTask = nil
+        // Invalidate late responses as well as cancelling the request itself.
+        refreshID = UUID()
+        loading = false
+        server = ""
+        defaults.removeObject(forKey: "server")
+        videos = []
+        catalogNotice = nil
+    }
+
     func connectServer(_ input: String) {
         do {
             let normalized = try ServerAddress.normalize(input).absoluteString

@@ -197,9 +197,12 @@ private struct PlaybackProgressView: View {
                            onDraftChanged: { draftSeconds = $0 },
                            onEditingChanged: onEditingChanged,
                            onCommit: { model.seek(to: $0) })
+                .frame(maxWidth: .infinity)
                 .frame(height: 44)
+                .accessibilityIdentifier("playbackProgressSlider")
             HStack {
                 Text(PlaybackPosition.label(displayedSeconds))
+                    .accessibilityIdentifier("playbackElapsedTime")
                 Spacer()
                 Text(PlaybackPosition.label(model.duration))
             }.font(.caption.monospacedDigit())
@@ -485,7 +488,8 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                 .onTapGesture { revealControls() }
         }
         .buttonStyle(transportButtonStyle)
-        .accessibilityIdentifier("playbackTransportControls")
+        // Keep identifiers on leaf controls. An identifier on this container
+        // replaces its descendants' identifiers in SwiftUI's accessibility tree.
     }
     private var transportFavoriteButton: some View {
         let favorite = playlist.currentEntry?.isFavorite == true
@@ -571,3 +575,14 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         playlist.close()
     }
 }
+
+#if DEBUG
+// The UI-test fixture uses the production player hierarchy and a deterministic
+// engine, so real touch tests cover overlays, fullscreen and playlist changes.
+@MainActor struct PlaybackUITestPlayerView: View {
+    @ObservedObject var playlist: PlaylistPlaybackModel
+    var body: some View {
+        PlaylistPlayerView(playlist: playlist, model: playlist.player)
+    }
+}
+#endif

@@ -39,7 +39,7 @@ import UIKit
 
     private func cancel(deferred: Bool) {
         let wasEditing = session.cancel()
-        // Invalidate first. UISlider may synchronously emit more tracking events
+        // Invalidate first. The control may synchronously emit more tracking events
         // while it cancels; none of them may commit the old draft.
         slider?.cancelTracking(with: nil)
         if wasEditing { publish(editingChanged: true, deferred: deferred) }
@@ -77,7 +77,7 @@ import UIKit
         guard slider === view, seconds.isFinite else { return }
         cancel()
         // An accessibility adjustment is a complete operation, with no touch-up
-        // to wait for. Retain UISlider's native Adjustable accessibility behavior.
+        // to wait for. Retain the control's Adjustable accessibility behavior.
         publish(editingChanged: true)
         observer?.commit(seconds)
     }
@@ -100,18 +100,52 @@ import UIKit
     }
 }
 
-// UIKit exposes cancellation independently of successful endTracking, unlike a
-// single SwiftUI onEditingChanged Bool. No ancestor gesture competes with it.
-final class PlaybackTrackingSlider: UISlider {
+// Own the whole 44pt touch surface and its coordinate mapping. A UISlider's
+// internal thumb/gesture tracking must not decide whether our scrub session
+// starts or finishes. UIControl supplies cancellation without a parent gesture.
+final class PlaybackTrackingSlider: UIControl {
     fileprivate weak var scrubController: PlaybackScrubController?
     private var trackingToken: UUID?
     private var deferCancellationNotifications = false
+    private let trackLayer = CALayer()
+    private let progressLayer = CALayer()
+    private let thumbLayer = CALayer()
+    private var storedValue: Float = 0
+    private let thumbDiameter: CGFloat = 20
+
+    var minimumValue: Float = 0 {
+        didSet { setValue(storedValue, animated: false) }
+    }
+    var maximumValue: Float = 1 {
+        didSet { setValue(storedValue, animated: false) }
+    }
+    var value: Float {
+        get { storedValue }
+        set { setValue(newValue, animated: false) }
+    }
+
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: 44)
+    }
+
+    private var trackRect: CGRect {
+        CGRect(x: thumbDiameter / 2, y: bounds.midY - 2,
+               width: max(0, bounds.width - thumbDiameter), height: 4)
+    }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        isContinuous = true
-        minimumTrackTintColor = .white
-        maximumTrackTintColor = UIColor.white.withAlphaComponent(0.35)
+        isMultipleTouchEnabled = false
+        trackLayer.backgroundColor = UIColor.white.withAlphaComponent(0.35).cgColor
+        progressLayer.backgroundColor = UIColor.white.cgColor
+        thumbLayer.backgroundColor = UIColor.white.cgColor
+        thumbLayer.shadowColor = UIColor.black.cgColor
+        thumbLayer.shadowOpacity = 0.25
+        thumbLayer.shadowRadius = 2
+        thumbLayer.shadowOffset = CGSize(width: 0, height: 1)
+        layer.addSublayer(trackLayer)
+        layer.addSublayer(progressLayer)
+        layer.addSublayer(thumbLayer)
         isAccessibilityElement = true
         accessibilityTraits.insert(.adjustable)
         accessibilityLabel = "播放进度"
@@ -122,8 +156,39 @@ final class PlaybackTrackingSlider: UISlider {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let track = trackRect
+        let range = Double(maximumValue) - Double(minimumValue)
+        let fraction = range.isFinite && range > 0
+            ? min(1, max(0, (Double(value) - Double(minimumValue)) / range)) : 0
+        let thumbX = track.minX + track.width * CGFloat(fraction)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        trackLayer.frame = track
+        trackLayer.cornerRadius = track.height / 2
+        progressLayer.frame = CGRect(x: track.minX, y: track.minY,
+                                    width: max(0, thumbX - track.minX), height: track.height)
+        progressLayer.cornerRadius = track.height / 2
+        thumbLayer.frame = CGRect(x: thumbX - thumbDiameter / 2,
+                                 y: bounds.midY - thumbDiameter / 2,
+                                 width: thumbDiameter, height: thumbDiameter)
+        thumbLayer.cornerRadius = thumbDiameter / 2
+        CATransaction.commit()
+    }
+
+    func setValue(_ value: Float, animated: Bool) {
+        guard value.isFinite, minimumValue.isFinite, maximumValue.isFinite,
+              maximumValue >= minimumValue else { return }
+        storedValue = min(maximumValue, max(minimumValue, value))
+        // Playback and finger updates must be immediate, without implicit layer
+        // animations or a valueChanged event for a programmatic update.
+        setNeedsLayout()
+    }
+
     override var isEnabled: Bool {
         didSet {
+            alpha = isEnabled ? 1 : 0.4
             if isEnabled {
                 accessibilityTraits.remove(.notEnabled)
             } else {
@@ -134,27 +199,20 @@ final class PlaybackTrackingSlider: UISlider {
     }
 
     override func beginTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
-        guard isEnabled, super.beginTracking(touch, with: event) else { return false }
-        guard beginScrubbing() else { super.cancelTracking(with: event); return false }
-        return true
+        beginScrubbing(at: touch.location(in: self))
     }
 
     override func continueTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
-        guard trackingToken != nil else { return false }
-        let tracking = super.continueTracking(touch, with: event)
-        if !tracking { cancelTracking(with: event) }
-        return tracking
+        continueScrubbing(at: touch.location(in: self))
     }
 
     override func endTracking(_ touch: UITouch?, with event: UIEvent?) {
-        let token = trackingToken
-        super.endTracking(touch, with: event)
-        // super may cause cancellation, so recheck the token before committing.
-        guard let token, trackingToken == token, touch != nil else {
+        guard let touch else {
             cancelTracking(with: event)
             return
         }
-        finishScrubbing()
+        finishScrubbing(at: touch.location(in: self))
+        super.endTracking(touch, with: event)
     }
 
     override func cancelTracking(with event: UIEvent?) {
@@ -198,21 +256,49 @@ final class PlaybackTrackingSlider: UISlider {
         scrubController?.adjustAccessibility(in: self, seconds: Double(value))
     }
 
-    // The touch callbacks route through these operations. They also let UIKit
-    // integration tests exercise actual control events without fabricating a
-    // UITouch or using private APIs.
+    // UIKit touch callbacks and coordinate unit tests share these operations.
+    // XCUITest separately verifies real press/drag/release through the player.
     @discardableResult
-    func beginScrubbing() -> Bool {
-        guard isEnabled else { return false }
+    func beginScrubbing(at point: CGPoint? = nil) -> Bool {
+        guard isEnabled, trackingToken == nil, trackRect.width > 0, bounds.height > 0,
+              minimumValue.isFinite, maximumValue.isFinite, maximumValue > minimumValue else { return false }
+        if let point {
+            guard bounds.contains(point), let target = value(at: point) else { return false }
+            setValue(target, animated: false)
+        }
         trackingToken = scrubController?.begin(in: self, seconds: Double(value))
         return trackingToken != nil
     }
 
-    func finishScrubbing() {
+    @discardableResult
+    func continueScrubbing(at point: CGPoint) -> Bool {
+        guard trackingToken != nil else { return false }
+        guard isEnabled, let target = value(at: point) else {
+            cancelTracking(with: nil)
+            return false
+        }
+        setValue(target, animated: false)
+        sendActions(for: .valueChanged)
+        return true
+    }
+
+    func finishScrubbing(at point: CGPoint? = nil) {
         guard let token = trackingToken else { return }
+        if let point, !continueScrubbing(at: point) {
+            cancelTracking(with: nil)
+            return
+        }
         trackingToken = nil
         scrubController?.finish(in: self, token: token, seconds: Double(value))
         refreshAccessibilityValue()
+    }
+
+    private func value(at point: CGPoint) -> Float? {
+        guard point.x.isFinite, point.y.isFinite, trackRect.width > 0,
+              minimumValue.isFinite, maximumValue.isFinite, maximumValue > minimumValue else { return nil }
+        let fraction = min(1, max(0, (point.x - trackRect.minX) / trackRect.width))
+        return Float(Double(minimumValue)
+            + Double(fraction) * (Double(maximumValue) - Double(minimumValue)))
     }
 
     @objc private func valueDidChange() {
@@ -268,14 +354,21 @@ final class PlaybackTrackingSlider: UISlider {
         controller.bind(slider, observer: context.coordinator)
         slider.performModelUpdate {
             let upper = duration.isFinite ? max(1, duration) : 1
-            slider.maximumValue = Float(min(upper, Double(Float.greatestFiniteMagnitude)))
-            slider.isEnabled = isEnabled
+            let maximum = Float(min(upper, Double(Float.greatestFiniteMagnitude)))
+            if slider.maximumValue != maximum { slider.maximumValue = maximum }
+            if slider.isEnabled != isEnabled { slider.isEnabled = isEnabled }
             if !controller.isEditing(in: slider) {
                 let value = seconds.isFinite ? min(max(0, seconds), upper) : 0
                 slider.setValue(Float(min(value, Double(slider.maximumValue))), animated: false)
             }
             slider.refreshAccessibilityValue()
         }
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: PlaybackTrackingSlider,
+                      context: Context) -> CGSize? {
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? 300
+        return CGSize(width: max(44, width), height: 44)
     }
 
     static func dismantleUIView(_ slider: PlaybackTrackingSlider, coordinator: Coordinator) {
