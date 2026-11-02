@@ -10,6 +10,7 @@ final class PlaybackModel: ObservableObject {
     @Published private(set) var duration: Double = 0
     @Published private(set) var seekable = false
     @Published private(set) var message: String?
+    var onPlaybackEnded: (() -> Void)?
     private let request: PlaybackRequest
     private let engine: LocalPlaybackEngine
     private let defaults: UserDefaults
@@ -17,6 +18,9 @@ final class PlaybackModel: ObservableObject {
     private var started = false
     private var pauseRequested = false
     private var closed = false
+    private var reportedPlaybackEnd = false
+    private var pendingPlaybackEnd: UUID?
+    private var rearmPlaybackEndOnPlaying = false
     private var restoredPosition = false
     private var lastSave = Date.distantPast
     private var observers: [NSObjectProtocol] = []
@@ -77,15 +81,19 @@ final class PlaybackModel: ObservableObject {
         do {
             try activateAudio()
             pauseRequested = false
+            if reportedPlaybackEnd { rearmPlaybackEndOnPlaying = true }
             if phase == .ended {
+                pendingPlaybackEnd = nil
                 seconds = 0
                 restoredPosition = true
+                phase = .opening
             }
             engine.play()
         } catch { message = error.localizedDescription }
     }
     func pause() {
         guard !closed else { return }
+        pendingPlaybackEnd = nil
         pauseRequested = true
         guard started else { return }
         savePosition()
@@ -95,6 +103,8 @@ final class PlaybackModel: ObservableObject {
     }
     func seek(to value: Double) {
         guard !closed, seekable, let value = PlaybackPosition.clamp(value, duration: duration) else { return }
+        pendingPlaybackEnd = nil
+        if reportedPlaybackEnd { rearmPlaybackEndOnPlaying = true }
         restoredPosition = true
         seconds = value
         engine.seek(to: value)
@@ -102,12 +112,20 @@ final class PlaybackModel: ObservableObject {
     }
     private func receive(_ snapshot: PlaybackSnapshot) {
         guard !closed else { return }
+        // Native stop notifications may follow EOF. Preserve the terminal state
+        // and cleared bookmark until an explicit replay or seek actually starts.
+        if phase == .ended, snapshot.phase == .idle { return }
+        if rearmPlaybackEndOnPlaying, snapshot.phase == .ended { return }
         let nextPhase: PlaybackPhase
         if snapshot.phase == .playing && pauseRequested {
             engine.pause()
             nextPhase = .paused
         } else {
             nextPhase = snapshot.phase
+        }
+        if nextPhase == .playing, rearmPlaybackEndOnPlaying {
+            rearmPlaybackEndOnPlaying = false
+            reportedPlaybackEnd = false
         }
         // Avoid publishing unchanged phase/duration/flags on every time callback.
         if phase != nextPhase { phase = nextPhase }
@@ -127,6 +145,7 @@ final class PlaybackModel: ObservableObject {
         if phase == .ended {
             defaults.removeObject(forKey: key)
             restoredPosition = true
+            reportPlaybackEnd()
             return
         }
         if !restoredPosition, seekable, phase == .playing || phase == .paused {
@@ -140,6 +159,21 @@ final class PlaybackModel: ObservableObject {
         }
         if Date().timeIntervalSince(lastSave) >= 5 { savePosition() }
     }
+    private func reportPlaybackEnd() {
+        guard !reportedPlaybackEnd else { return }
+        reportedPlaybackEnd = true
+        guard started, !pauseRequested else { return }
+        let token = UUID()
+        pendingPlaybackEnd = token
+        // Finish processing the terminal snapshot before a playlist closes this
+        // player. A pause, close, seek or replay cancels this queued completion.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.closed, !self.pauseRequested,
+                  self.phase == .ended, self.pendingPlaybackEnd == token else { return }
+            self.pendingPlaybackEnd = nil
+            self.onPlaybackEnded?()
+        }
+    }
     private func savePosition() {
         guard restoredPosition, phase != .ended, phase != .failed,
               seconds.isFinite, seconds >= 0 else { return }
@@ -150,6 +184,8 @@ final class PlaybackModel: ObservableObject {
         guard !closed else { return }
         savePosition()
         closed = true
+        pendingPlaybackEnd = nil
+        onPlaybackEnded = nil
         engine.onUpdate = nil
         engine.stop()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -541,7 +577,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         NavigationStack {
             List {
                 Section {
-                    Text("按本地列表顺序播放。使用上一个、下一个按钮或点选条目切换；上下滑不再切换视频。只有切换时才检查目标文件，缺失或无效的相邻视频会跳过。")
+                    Text("按打开视频时的筛选列表顺序播放，播完自动播放下一条，最后一条播完后停止。也可使用上一个、下一个按钮或点选条目切换。收藏和已看状态的变化不会改变本次播放顺序；缺失或无效的相邻视频会跳过。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 ForEach(playlist.entries) { record in

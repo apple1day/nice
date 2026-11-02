@@ -86,6 +86,101 @@ private final class FakeEngine: LocalPlaybackEngine {
         XCTAssertEqual(engine.playCount, 2)
         model.close()
     }
+    private func finishQueuedCallbacks() async {
+        let drained = expectation(description: "queued playback completion processed")
+        DispatchQueue.main.async { drained.fulfill() }
+        await fulfillment(of: [drained], timeout: 2)
+    }
+    func testEndCallbackRunsOnceAfterTerminalStateAndBookmarkAreUpdated() async throws {
+        let (model, engine, defaults) = try fixture(saved: 25)
+        var completions = 0
+        model.onPlaybackEnded = {
+            completions += 1
+            XCTAssertEqual(model.phase, .ended)
+            XCTAssertEqual(model.seconds, 100)
+            XCTAssertNil(defaults.object(forKey: "position.test"))
+        }
+        model.attach(to: UIView())
+        engine.emit(.playing)
+        engine.emit(.ended, seconds: 100)
+        engine.emit(.ended, seconds: 100)
+        XCTAssertEqual(completions, 0, "Completion must run after the engine callback returns")
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 1)
+        engine.emit(.ended, seconds: 100)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 1)
+        model.close()
+    }
+    func testReplayCancelsQueuedCompletionAndCanFinishAgain() async throws {
+        let (model, engine, _) = try fixture()
+        var completions = 0
+        model.onPlaybackEnded = { completions += 1 }
+        model.attach(to: UIView())
+        engine.emit(.playing)
+        engine.emit(.ended, seconds: 100)
+        model.toggle()
+        engine.emit(.ended, seconds: 100)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 0)
+        XCTAssertEqual(model.phase, .opening)
+        XCTAssertEqual(engine.playCount, 2)
+
+        engine.emit(.playing)
+        engine.emit(.ended, seconds: 100)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 1)
+        model.close()
+    }
+    func testSeekCancelsQueuedCompletion() async throws {
+        let (model, engine, _) = try fixture()
+        var completions = 0
+        model.onPlaybackEnded = { completions += 1 }
+        model.attach(to: UIView())
+        engine.emit(.ended, seconds: 100)
+        model.seek(to: 20)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 0)
+        XCTAssertEqual(engine.seeks, [20])
+        engine.emit(.playing, seconds: 20)
+        engine.emit(.ended, seconds: 100)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 1, "Seeking back into a finished clip starts a new playback cycle")
+        model.close()
+    }
+    func testNativeStoppedSnapshotAfterEndDoesNotCancelCompletionOrRestoreBookmark() async throws {
+        let (model, engine, defaults) = try fixture()
+        var completions = 0
+        model.onPlaybackEnded = { completions += 1 }
+        model.attach(to: UIView())
+        engine.emit(.playing, seconds: 90)
+        engine.emit(.ended, seconds: 100)
+        engine.emit(.idle, seconds: 0, duration: 0, seekable: false)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 1)
+        XCTAssertEqual(model.phase, .ended)
+        XCTAssertEqual(model.seconds, 100)
+        XCTAssertNil(defaults.object(forKey: "position.test"))
+        model.close()
+    }
+    func testPausedReplayAfterCancelledEndCanCompleteAgain() async throws {
+        let (model, engine, _) = try fixture()
+        var completions = 0
+        model.onPlaybackEnded = { completions += 1 }
+        model.attach(to: UIView())
+        engine.emit(.playing)
+        engine.emit(.ended, seconds: 100)
+        model.pause()
+        engine.emit(.paused, seconds: 100)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 0)
+        model.toggle()
+        engine.emit(.playing, seconds: 0)
+        engine.emit(.ended, seconds: 100)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 1)
+        model.close()
+    }
     func testPauseBeforeMountPreventsAutomaticPlayback() throws {
         let (model, engine, _) = try fixture()
         model.pause()

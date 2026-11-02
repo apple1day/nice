@@ -316,10 +316,14 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         }
         playLocal(record)
     }
-    func playLocal(_ record: DownloadRecord) {
+    func playLocal(_ record: DownloadRecord, playlistIDs: [String]? = nil) {
         guard playbackSession == nil && playback == nil else { return }
         do {
-            let request = try localPlaybackRequest(for: record.id)
+            // Freeze the caller's search/filter order before the player opens.
+            // Legacy callers still get the complete local library in list order.
+            let ids = playlistIDs ?? LocalLibraryOrder.newestFirst(completedCache,
+                completedAt: { $0.downloadedAt }).map(\.id)
+            let request = try localPlaybackRequest(for: record.id, playlistIDs: ids)
             playbackSession = request
             deletionNotice = nil
             playback = request
@@ -330,12 +334,12 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     }
     // Compatibility accessor: metadata only; opening a target still validates it.
     var localPlaylistRecords: [DownloadRecord] { completedCache }
-    func localPlaybackRequest(for id: String) throws -> PlaybackRequest {
+    func localPlaybackRequest(for id: String, playlistIDs: [String]? = nil) throws -> PlaybackRequest {
         guard let record = recordsByID[id],
               record.state == .complete, let file = disk?.verifiedFile(for: record) else {
             throw ClientError("本地文件缺失或下载未完成，请重新下载。")
         }
-        return try PlaybackRequest(key: record.id, title: record.video.name, url: file)
+        return try PlaybackRequest(key: record.id, title: record.video.name, url: file, playlistIDs: playlistIDs)
     }
     func transitionPlayback(from old: PlaybackRequest, to next: PlaybackRequest,
                             stopCurrent: () -> Void) throws {

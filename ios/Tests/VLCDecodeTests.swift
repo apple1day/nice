@@ -13,6 +13,36 @@ import UIKit
     func testDecodeLocalMP4WithVideoFrames() async throws { try await decode(ext: "mp4") }
     func testDecodeLocalMKVWithVideoFrames() async throws { try await decode(ext: "mkv") }
 
+    func testNaturalMP4EndReachesPlaybackCompletion() async throws {
+        let file = try XCTUnwrap(Bundle(for: VLCDecodeTests.self).url(
+            forResource: "offline", withExtension: "mp4", subdirectory: "Fixtures"))
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let request = try PlaybackRequest(key: "natural-end", title: "offline", url: file)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.layoutIfNeeded()
+        let model = PlaybackModel(request: request, engine: VLCPlaybackEngine(),
+                                  defaults: defaults, manageAudioSession: false)
+        defer {
+            model.close()
+            window.isHidden = true
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let ended = expectation(description: "real VLC EOF reaches the playlist completion hook")
+        ended.assertForOverFulfill = true
+        model.onPlaybackEnded = {
+            XCTAssertEqual(model.phase, .ended)
+            XCTAssertNil(defaults.object(forKey: "position.natural-end"))
+            ended.fulfill()
+        }
+        model.attach(to: controller.view)
+        await fulfillment(of: [ended], timeout: 20)
+        XCTAssertEqual(model.phase, .ended, model.message ?? "VLC did not report natural completion")
+    }
+
     func testRepeatedOpenStopAndReleaseKeepsMainQueueResponsive() async throws {
         let file = try XCTUnwrap(Bundle(for: VLCDecodeTests.self).url(
             forResource: "offline", withExtension: "mp4", subdirectory: "Fixtures"))

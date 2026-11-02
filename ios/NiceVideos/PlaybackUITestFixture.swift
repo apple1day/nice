@@ -75,9 +75,12 @@ import UIKit
                 throw ClientError(store.errorMessage ?? "Could not open UI test media")
             }
             let probe = self.probe
+            // EOF simulation is opt-in so the existing scrubbing tests keep
+            // their long-running 120-second playback behavior.
+            let allowsNaturalEnd = ProcessInfo.processInfo.arguments.contains("--ui-test-autoplay")
             let playlist = PlaylistPlaybackModel(
                 request: request, store: store,
-                engineFactory: { PlaybackUITestEngine(probe: probe) },
+                engineFactory: { PlaybackUITestEngine(probe: probe, allowsNaturalEnd: allowsNaturalEnd) },
                 defaults: defaults, manageAudioSession: false
             )
             self.store = store
@@ -102,33 +105,50 @@ private final class PlaybackUITestProbe: ObservableObject {
     @Published var seekCount = 0
     @Published var lastSeek: Double = -1
     @Published var tickCount = 0
+    @Published var attachCount = 0
+    @Published var loadCount = 0
+    @Published var stopCount = 0
 }
 
 private final class PlaybackUITestEngine: LocalPlaybackEngine {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private let probe: PlaybackUITestProbe
+    private let allowsNaturalEnd: Bool
     private var timer: Timer?
     private var phase: PlaybackPhase = .idle
-    private var seconds: Double = 12
+    private var seconds: Double
     private var loaded = false
     private var stopped = false
+    private var duration: Double { allowsNaturalEnd ? 30 : 120 }
 
-    init(probe: PlaybackUITestProbe) { self.probe = probe }
-    func attach(to view: UIView) {}
+    init(probe: PlaybackUITestProbe, allowsNaturalEnd: Bool) {
+        self.probe = probe
+        self.allowsNaturalEnd = allowsNaturalEnd
+        seconds = allowsNaturalEnd ? 0 : 12
+    }
+    func attach(to view: UIView) {
+        guard !stopped else { return }
+        probe.attachCount += 1
+    }
 
     func load(fileURL: URL) throws {
         try OfflineMediaPolicy.validateLocalFile(fileURL)
         loaded = true
+        probe.loadCount += 1
     }
 
     func play() {
         guard loaded, !stopped else { return }
+        if phase == .ended { seconds = 0 }
         phase = .playing
         publish()
         guard timer == nil else { return }
         let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
             guard let self, !self.stopped else { return }
-            if self.phase == .playing { self.seconds = min(119, self.seconds + 0.2) }
+            if self.phase == .playing {
+                self.seconds = min(self.allowsNaturalEnd ? self.duration : 119, self.seconds + 0.2)
+                if self.allowsNaturalEnd && self.seconds >= self.duration { self.phase = .ended }
+            }
             self.probe.tickCount += 1
             self.publish()
         }
@@ -152,13 +172,14 @@ private final class PlaybackUITestEngine: LocalPlaybackEngine {
     }
 
     private func publish() {
-        onUpdate?(PlaybackSnapshot(phase: phase, seconds: seconds, duration: 120,
+        onUpdate?(PlaybackSnapshot(phase: phase, seconds: seconds, duration: duration,
                                    seekable: true, hasVideo: true))
     }
 
     func stop() {
         guard !stopped else { return }
         stopped = true
+        probe.stopCount += 1
         timer?.invalidate()
         timer = nil
         onUpdate = nil
@@ -187,6 +208,9 @@ private struct PlaybackUITestDiagnostics: View {
             Text(String(probe.seekCount)).accessibilityIdentifier("uiTestSeekCount")
             Text(String(probe.lastSeek)).accessibilityIdentifier("uiTestLastSeek")
             Text(String(probe.tickCount)).accessibilityIdentifier("uiTestTickCount")
+            Text(String(probe.attachCount)).accessibilityIdentifier("uiTestAttachCount")
+            Text(String(probe.loadCount)).accessibilityIdentifier("uiTestLoadCount")
+            Text(String(probe.stopCount)).accessibilityIdentifier("uiTestStopCount")
             Text(String(describing: player.phase)).accessibilityIdentifier("uiTestPlaybackPhase")
             Text(String(player.seconds)).accessibilityIdentifier("uiTestPlaybackSeconds")
             Text(currentItem).accessibilityIdentifier("uiTestCurrentItem")
