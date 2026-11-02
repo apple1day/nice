@@ -135,6 +135,52 @@ final class PlaylistPlaybackTests: XCTestCase {
         XCTAssertEqual(f.pool.engines.count, 2)
     }
 
+    @MainActor func testManualNextDuringHeldEOFDoesNotAdvanceAgainAfterCancellation() async throws {
+        let f = try fixture()
+        let firstPlayer = f.model.player
+        firstPlayer.attach(to: UIView())
+        f.pool.engines[0].tick(90)
+        firstPlayer.setScrubbing(true)
+        f.pool.engines[0].finish()
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.id, f.anchor.id)
+
+        firstPlayer.setScrubbing(false)
+        XCTAssertTrue(f.model.move(.next))
+        // A cancelled/removed old slider must not restart its completed engine.
+        firstPlayer.seek(to: 20)
+        firstPlayer.setScrubbing(false)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.key, f.records[1].id)
+        XCTAssertEqual(f.pool.engines.count, 2)
+        XCTAssertEqual(f.pool.engines[0].playCount, 1)
+        XCTAssertTrue(f.pool.engines[0].seeks.isEmpty)
+    }
+
+    @MainActor func testEOFDuringScrubReplaysCurrentBeforeLaterAutomaticNext() async throws {
+        let f = try fixture()
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].tick(90)
+        f.model.player.setScrubbing(true)
+        f.pool.engines[0].onUpdate?(PlaybackSnapshot(phase: .ended, seconds: 100,
+                                                  duration: 0, seekable: false))
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.id, f.anchor.id)
+        f.model.player.setScrubbing(false)
+        f.model.player.seek(to: 20)
+        f.pool.engines[0].tick(0)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.id, f.anchor.id)
+        XCTAssertEqual(f.pool.engines.count, 1)
+        XCTAssertEqual(f.pool.engines[0].playCount, 2)
+        XCTAssertEqual(f.pool.engines[0].seeks, [20])
+
+        f.pool.engines[0].finish()
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.key, f.records[1].id)
+        XCTAssertEqual(f.pool.engines.count, 2)
+    }
+
     @MainActor func testPauseBeforeOrAfterEndPreventsAutomaticNext() async throws {
         for pauseFirst in [true, false] {
             let f = try fixture(count: 2)

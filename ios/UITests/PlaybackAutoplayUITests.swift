@@ -59,7 +59,50 @@ import XCTest
         XCTAssertEqual(element("uiTestStopCount").label, "1")
     }
 
-    private func seekNearEnd() throws {
+    func testDragHeldAcrossEOFCommitsOnSameVideoBeforeAutoplayCanContinue() throws {
+        let frame = try visibleProgressFrame()
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        let start = origin.withOffset(CGVector(dx: frame.minX + frame.width * 0.45, dy: frame.midY))
+        let nearEnd = origin.withOffset(CGVector(dx: frame.minX + frame.width * 0.70, dy: frame.midY))
+        let earlier = origin.withOffset(CGVector(dx: frame.minX + frame.width * 0.25, dy: frame.midY))
+
+        // Commit near 21/30 seconds, then put the finger down again immediately.
+        // Reuse the observed frame: AX lookups between the gestures could let
+        // the first video finish before the second drag even starts.
+        start.press(forDuration: 0.25, thenDragTo: nearEnd)
+        nearEnd.press(forDuration: 0.25, thenDragTo: earlier,
+                      withVelocity: .slow, thenHoldForDuration: 12)
+
+        waitUntil("Releasing the held drag should seek and resume the same video") {
+            self.element("uiTestCurrentItem").label == "uitest-1.mp4"
+                && self.element("uiTestPlaybackPhase").label == "playing"
+                && self.element("uiTestSeekCount").label == "2"
+        }
+        XCTAssertEqual(element("uiTestEndCount").label, "1",
+                       "The decoder must actually report EOF while the finger is held down")
+        let target = try XCTUnwrap(Double(element("uiTestLastSeek").label))
+        XCTAssertEqual(target, 7.5, accuracy: 1.5,
+                       "The touch-up must apply its earlier target to the original video")
+        let seconds = try XCTUnwrap(Double(element("uiTestPlaybackSeconds").label))
+        XCTAssertGreaterThanOrEqual(seconds, target - 0.1)
+        XCTAssertLessThan(seconds, target + 8,
+                          "Playback should continue near the committed target")
+        XCTAssertEqual(element("uiTestAttachCount").label, "1")
+        XCTAssertEqual(element("uiTestLoadCount").label, "1")
+        XCTAssertEqual(element("uiTestStopCount").label, "0")
+
+        try seekNearEnd()
+        waitUntil("After the drag has finished, a later natural EOF should advance normally") {
+            self.element("uiTestCurrentItem").label == "uitest-2.mp4"
+                && self.element("uiTestPlaybackPhase").label == "playing"
+        }
+        XCTAssertEqual(element("uiTestEndCount").label, "2")
+        XCTAssertEqual(element("uiTestAttachCount").label, "2")
+        XCTAssertEqual(element("uiTestLoadCount").label, "2")
+        XCTAssertEqual(element("uiTestStopCount").label, "1")
+    }
+
+    private func visibleProgressFrame() throws -> CGRect {
         let surface = element("playbackSurfaceToggle")
         XCTAssertTrue(surface.exists)
         // The same safe transport-padding point used by the scrubbing tests
@@ -69,7 +112,11 @@ import XCTest
         waitUntil("The real progress slider should be ready") { progress.isHittable }
         let snapshot = try progress.snapshot()
         XCTAssertTrue(snapshot.isEnabled)
-        let frame = snapshot.frame
+        return snapshot.frame
+    }
+
+    private func seekNearEnd() throws {
+        let frame = try visibleProgressFrame()
         let origin = app.coordinate(withNormalizedOffset: .zero)
         let start = origin.withOffset(CGVector(dx: frame.minX + frame.width * 0.65, dy: frame.midY))
         let end = origin.withOffset(CGVector(dx: frame.minX + frame.width * 0.92, dy: frame.midY))

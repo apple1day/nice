@@ -108,6 +108,7 @@ private final class PlaybackUITestProbe: ObservableObject {
     @Published var attachCount = 0
     @Published var loadCount = 0
     @Published var stopCount = 0
+    @Published var endCount = 0
 }
 
 private final class PlaybackUITestEngine: LocalPlaybackEngine {
@@ -147,7 +148,10 @@ private final class PlaybackUITestEngine: LocalPlaybackEngine {
             guard let self, !self.stopped else { return }
             if self.phase == .playing {
                 self.seconds = min(self.allowsNaturalEnd ? self.duration : 119, self.seconds + 0.2)
-                if self.allowsNaturalEnd && self.seconds >= self.duration { self.phase = .ended }
+                if self.allowsNaturalEnd && self.seconds >= self.duration {
+                    self.phase = .ended
+                    self.probe.endCount += 1
+                }
             }
             self.probe.tickCount += 1
             self.publish()
@@ -164,7 +168,8 @@ private final class PlaybackUITestEngine: LocalPlaybackEngine {
     }
 
     func seek(to seconds: Double) {
-        guard loaded, !stopped else { return }
+        // A terminal decoder must be restarted before it becomes seekable again.
+        guard loaded, !stopped, !allowsNaturalEnd || phase != .ended else { return }
         self.seconds = seconds
         probe.seekCount += 1
         probe.lastSeek = seconds
@@ -172,8 +177,11 @@ private final class PlaybackUITestEngine: LocalPlaybackEngine {
     }
 
     private func publish() {
-        onUpdate?(PlaybackSnapshot(phase: phase, seconds: seconds, duration: duration,
-                                   seekable: true, hasVideo: true))
+        // VLC can lose duration/seekability at EOF. Exercise that terminal shape
+        // so an active native drag cannot pass only because the fake stays ready.
+        let terminal = allowsNaturalEnd && phase == .ended
+        onUpdate?(PlaybackSnapshot(phase: phase, seconds: seconds, duration: terminal ? 0 : duration,
+                                   seekable: !terminal, hasVideo: !terminal))
     }
 
     func stop() {
@@ -211,6 +219,7 @@ private struct PlaybackUITestDiagnostics: View {
             Text(String(probe.attachCount)).accessibilityIdentifier("uiTestAttachCount")
             Text(String(probe.loadCount)).accessibilityIdentifier("uiTestLoadCount")
             Text(String(probe.stopCount)).accessibilityIdentifier("uiTestStopCount")
+            Text(String(probe.endCount)).accessibilityIdentifier("uiTestEndCount")
             Text(String(describing: player.phase)).accessibilityIdentifier("uiTestPlaybackPhase")
             Text(String(player.seconds)).accessibilityIdentifier("uiTestPlaybackSeconds")
             Text(currentItem).accessibilityIdentifier("uiTestCurrentItem")

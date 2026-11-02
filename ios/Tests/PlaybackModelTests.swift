@@ -20,6 +20,14 @@ private final class FakeEngine: LocalPlaybackEngine {
     }
 }
 
+@MainActor private final class PlaybackModelScrubObserver: PlaybackScrubObserver {
+    let model: PlaybackModel
+    init(model: PlaybackModel) { self.model = model }
+    func draftChanged(_ seconds: Double?) {}
+    func editingChanged(_ editing: Bool) { model.setScrubbing(editing) }
+    func commit(_ seconds: Double) { model.seek(to: seconds) }
+}
+
 @MainActor final class PlaybackModelTests: XCTestCase {
     private func fixture(saved: Double = 0) throws -> (PlaybackModel, FakeEngine, UserDefaults) {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
@@ -141,11 +149,139 @@ private final class FakeEngine: LocalPlaybackEngine {
         model.seek(to: 20)
         await finishQueuedCallbacks()
         XCTAssertEqual(completions, 0)
+        XCTAssertTrue(engine.seeks.isEmpty, "Stopped input must restart before seeking")
+        XCTAssertEqual(engine.playCount, 2)
+        engine.emit(.playing, seconds: 0)
         XCTAssertEqual(engine.seeks, [20])
-        engine.emit(.playing, seconds: 20)
         engine.emit(.ended, seconds: 100)
         await finishQueuedCallbacks()
         XCTAssertEqual(completions, 1, "Seeking back into a finished clip starts a new playback cycle")
+        model.close()
+    }
+    private func scrubFixture(model: PlaybackModel)
+        -> (PlaybackScrubController, PlaybackTrackingSlider, PlaybackModelScrubObserver) {
+        let controller = PlaybackScrubController()
+        let slider = PlaybackTrackingSlider(frame: CGRect(x: 0, y: 0, width: 300, height: 44))
+        slider.maximumValue = 100
+        slider.value = 20
+        let observer = PlaybackModelScrubObserver(model: model)
+        controller.bind(slider, observer: observer)
+        return (controller, slider, observer)
+    }
+    func testHeldScrubDefersEOFAndTouchUpSeekRestartsCurrentClip() async throws {
+        let (model, engine, defaults) = try fixture()
+        var completions = 0
+        model.onPlaybackEnded = { completions += 1 }
+        model.attach(to: UIView())
+        engine.emit(.playing, seconds: 90)
+        let (controller, slider, observer) = scrubFixture(model: model)
+        XCTAssertTrue(slider.beginScrubbing())
+        engine.emit(.ended, seconds: 100, duration: 0, seekable: false)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 0)
+        XCTAssertTrue(controller.isEditing(in: slider))
+        XCTAssertTrue(model.seekable, "EOF must not disable and cancel the held native slider")
+        XCTAssertEqual(model.duration, 100)
+
+        // Exercise the production controller's editing=false BEFORE commit order.
+        slider.finishScrubbing()
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 0)
+        XCTAssertEqual(engine.playCount, 2)
+        XCTAssertTrue(engine.seeks.isEmpty)
+        XCTAssertEqual(model.phase, .opening)
+        engine.emit(.paused, seconds: 0, duration: 0, seekable: false)
+        XCTAssertTrue(engine.seeks.isEmpty, "Preserved UI seekability is not native input readiness")
+        engine.emit(.playing, seconds: 0)
+        XCTAssertEqual(engine.seeks, [20])
+        XCTAssertEqual(model.seconds, 20)
+        XCTAssertEqual(defaults.double(forKey: "position.test"), 20)
+
+        engine.emit(.ended, seconds: 100, duration: 0, seekable: false)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 1)
+        withExtendedLifetime(observer) {}
+        model.close()
+    }
+    func testCancellingHeldScrubWithoutSeekDeliversDeferredEOFOnce() async throws {
+        let (model, engine, _) = try fixture()
+        var completions = 0
+        model.onPlaybackEnded = { completions += 1 }
+        model.attach(to: UIView())
+        engine.emit(.playing, seconds: 90)
+        let (controller, slider, observer) = scrubFixture(model: model)
+        XCTAssertTrue(slider.beginScrubbing())
+        engine.emit(.ended, seconds: 100, duration: 0, seekable: false)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 0)
+        controller.cancel()
+        controller.cancel()
+        slider.finishScrubbing()
+        engine.emit(.ended, seconds: 100, duration: 0, seekable: false)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 1)
+        XCTAssertTrue(engine.seeks.isEmpty)
+        XCTAssertEqual(engine.playCount, 1)
+        withExtendedLifetime(observer) {}
+        model.close()
+    }
+    func testScrubStartingAfterEOFCancelsDeliveryUntilItEnds() async throws {
+        let (model, engine, _) = try fixture()
+        var completions = 0
+        model.onPlaybackEnded = { completions += 1 }
+        model.attach(to: UIView())
+        engine.emit(.playing, seconds: 90)
+        engine.emit(.ended, seconds: 100)
+        model.setScrubbing(true)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 0)
+        model.setScrubbing(false)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(completions, 1)
+        model.close()
+    }
+    func testPauseOrCloseCancelsEOFReleasedByScrubCancellation() async throws {
+        for shouldClose in [false, true] {
+            let (model, engine, _) = try fixture()
+            var completions = 0
+            model.onPlaybackEnded = { completions += 1 }
+            model.attach(to: UIView())
+            engine.emit(.playing, seconds: 90)
+            let (controller, slider, observer) = scrubFixture(model: model)
+            XCTAssertTrue(slider.beginScrubbing())
+            engine.emit(.ended, seconds: 100, duration: 0, seekable: false)
+            controller.cancel()
+            if shouldClose { model.close() } else { model.pause() }
+            slider.finishScrubbing()
+            await finishQueuedCallbacks()
+            XCTAssertEqual(completions, 0)
+            XCTAssertEqual(engine.playCount, 1)
+            XCTAssertTrue(engine.seeks.isEmpty)
+            withExtendedLifetime(observer) {}
+            model.close()
+        }
+    }
+    func testSeekAfterEOFAndLatePauseWaitsForExplicitPlayThenAppliesTarget() async throws {
+        let (model, engine, _) = try fixture()
+        model.attach(to: UIView())
+        engine.emit(.playing, seconds: 90)
+        model.setScrubbing(true)
+        engine.emit(.ended, seconds: 100, duration: 0, seekable: false)
+        model.pause()
+        engine.emit(.paused, seconds: 0, duration: 0, seekable: false)
+        model.setScrubbing(false)
+        model.seek(to: 30)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(engine.playCount, 1)
+        XCTAssertTrue(engine.seeks.isEmpty)
+        XCTAssertEqual(model.phase, .paused)
+        XCTAssertEqual(model.seconds, 30)
+        model.toggle()
+        XCTAssertEqual(engine.playCount, 2)
+        engine.emit(.playing, seconds: 0)
+        XCTAssertEqual(engine.seeks, [30])
+        XCTAssertEqual(model.seconds, 30)
+        XCTAssertEqual(model.phase, .playing)
         model.close()
     }
     func testNativeStoppedSnapshotAfterEndDoesNotCancelCompletionOrRestoreBookmark() async throws {
