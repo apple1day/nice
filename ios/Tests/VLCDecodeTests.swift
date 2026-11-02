@@ -69,8 +69,12 @@ import UIKit
         var restarting = false
         var reachedSeekTarget = false
         var completionCount = 0
+        var restartSnapshots: [String] = []
         let receive = try XCTUnwrap(engine.onUpdate)
         engine.onUpdate = { snapshot in
+            if restarting, restartSnapshots.count < 100 {
+                restartSnapshots.append("\(snapshot.phase) t=\(snapshot.seconds) duration=\(snapshot.duration) seekable=\(snapshot.seekable)")
+            }
             receive(snapshot)
             if snapshot.phase == .ended, !reachedFirstEnd {
                 reachedFirstEnd = true
@@ -98,9 +102,11 @@ import UIKit
         model.setScrubbing(false)
         model.seek(to: 1)
         await fulfillment(of: [sought, completed], timeout: 20)
-        XCTAssertTrue(reachedSeekTarget)
-        XCTAssertEqual(completionCount, 1)
-        XCTAssertEqual(model.phase, .ended, model.message ?? "VLC did not finish the replayed local input")
+        let diagnostic = restartSnapshots.joined(separator: "\n")
+        XCTAssertTrue(reachedSeekTarget, diagnostic)
+        XCTAssertEqual(completionCount, 1, diagnostic)
+        XCTAssertEqual(model.phase, .ended,
+                       (model.message ?? "VLC did not finish the replayed local input") + "\n" + diagnostic)
     }
 
     func testRepeatedOpenStopAndReleaseKeepsMainQueueResponsive() async throws {

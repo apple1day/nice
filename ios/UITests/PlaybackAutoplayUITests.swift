@@ -88,7 +88,9 @@ import XCTest
         XCTAssertLessThan(seconds, target + 8,
                           "Playback should continue near the committed target")
         XCTAssertEqual(element("uiTestAttachCount").label, "1")
-        XCTAssertEqual(element("uiTestLoadCount").label, "1")
+        // Only EOF recovery reloads the current media descriptor. It keeps the
+        // same native surface and engine, without a teardown or another attach.
+        XCTAssertEqual(element("uiTestLoadCount").label, "2")
         XCTAssertEqual(element("uiTestStopCount").label, "0")
 
         try seekNearEnd()
@@ -98,7 +100,7 @@ import XCTest
         }
         XCTAssertEqual(element("uiTestEndCount").label, "2")
         XCTAssertEqual(element("uiTestAttachCount").label, "2")
-        XCTAssertEqual(element("uiTestLoadCount").label, "2")
+        XCTAssertEqual(element("uiTestLoadCount").label, "3")
         XCTAssertEqual(element("uiTestStopCount").label, "1")
     }
 

@@ -90,9 +90,15 @@ final class PlaybackModel: ObservableObject {
                 if pendingRestartSeek == nil { seconds = 0 }
                 restoredPosition = true
                 phase = .opening
+                // VLCKit 3.7.3 play() alone retains an EOF input. Replacing only
+                // its media reopens this local file without replacing the view.
+                try engine.load(fileURL: request.url)
             }
             engine.play()
-        } catch { message = error.localizedDescription }
+        } catch {
+            message = error.localizedDescription
+            if playbackInputEnded { phase = .failed }
+        }
     }
     func pause() {
         guard !closed else { return }
@@ -115,38 +121,39 @@ final class PlaybackModel: ObservableObject {
         if reportedPlaybackEnd { rearmPlaybackEndOnPlaying = true }
         restoredPosition = true
         seconds = value
-        if playbackInputEnded || pendingRestartSeek != nil {
-            // VLC can no longer seek once EOF has stopped its input. Reopen
-            // the same media, then apply the target when it is seekable again.
-            // A paused user keeps that intent and starts only on explicit play.
-            let alreadyWaiting = pendingRestartSeek != nil
-            pendingRestartSeek = value
-            if !alreadyWaiting {
-                if pauseRequested {
-                    phase = .paused
-                } else {
-                    do {
-                        try activateAudio()
-                        phase = .opening
-                        engine.play()
-                    } catch {
-                        message = error.localizedDescription
-                        phase = .failed
-                    }
-                }
-            }
+        if !playbackInputEnded, pendingRestartSeek == nil {
+            // Ordinary seeks stay on the existing input, without any file I/O.
+            engine.seek(to: value)
             savePosition()
             return
         }
-        engine.seek(to: value)
+        // EOF recovery validates/reloads only this current file. Keep the same
+        // engine and surface, and apply the target once its new input is ready.
+        let alreadyWaiting = pendingRestartSeek != nil
+        pendingRestartSeek = value
+        if !alreadyWaiting {
+            if pauseRequested {
+                phase = .paused
+            } else {
+                do {
+                    try activateAudio()
+                    phase = .opening
+                    try engine.load(fileURL: request.url)
+                    engine.play()
+                } catch {
+                    message = error.localizedDescription
+                    phase = .failed
+                }
+            }
+        }
         savePosition()
     }
     private func receive(_ snapshot: PlaybackSnapshot) {
-        guard !closed else { return }
+        guard !closed, phase != .failed else { return }
         // Native stop notifications may follow EOF. Preserve the terminal state
         // and cleared bookmark until an explicit replay or seek actually starts.
         if playbackInputEnded || pendingRestartSeek != nil, snapshot.phase == .idle { return }
-        if rearmPlaybackEndOnPlaying, snapshot.phase == .ended { return }
+        if rearmPlaybackEndOnPlaying || pendingRestartSeek != nil, snapshot.phase == .ended { return }
         let nextPhase: PlaybackPhase
         if snapshot.phase == .playing && pauseRequested {
             engine.pause()
@@ -155,8 +162,13 @@ final class PlaybackModel: ObservableObject {
             nextPhase = snapshot.phase
         }
         if nextPhase == .ended { playbackInputEnded = true }
-        if snapshot.phase == .playing, rearmPlaybackEndOnPlaying { playbackInputEnded = false }
-        if nextPhase == .playing, rearmPlaybackEndOnPlaying {
+        // A restarted decoder can report playing before it has a duration or
+        // accepts seeks. Keep the old EOF suppressed until its queued target
+        // has actually been applied to a ready input.
+        if snapshot.phase == .playing, rearmPlaybackEndOnPlaying, pendingRestartSeek == nil {
+            playbackInputEnded = false
+        }
+        if nextPhase == .playing, rearmPlaybackEndOnPlaying, pendingRestartSeek == nil {
             rearmPlaybackEndOnPlaying = false
             reportedPlaybackEnd = false
         }
@@ -168,7 +180,8 @@ final class PlaybackModel: ObservableObject {
             : (playbackInputEnded || pendingRestartSeek != nil ? duration : 0)
         // EOF must not disable the progress control and cancel a held drag.
         // Keep its last valid range; seek() handles restarting a stopped input.
-        let nextSeekable = (snapshot.seekable || (playbackInputEnded && seekable)) && nextDuration > 0
+        let preservingSeekRange = playbackInputEnded || pendingRestartSeek != nil
+        let nextSeekable = (snapshot.seekable || (preservingSeekRange && seekable)) && nextDuration > 0
         let displayedSeconds = pendingRestartSeek ?? nextSeconds
         if seconds != displayedSeconds { seconds = displayedSeconds }
         if duration != nextDuration { duration = nextDuration }
@@ -190,6 +203,10 @@ final class PlaybackModel: ObservableObject {
            phase == .playing || phase == .paused {
             pendingRestartSeek = nil
             playbackInputEnded = false
+            if phase == .playing {
+                rearmPlaybackEndOnPlaying = false
+                reportedPlaybackEnd = false
+            }
             if let target = PlaybackPosition.clamp(target, duration: duration) {
                 seconds = target
                 engine.seek(to: target)
@@ -270,8 +287,9 @@ private struct VLCVideoSurface: UIViewRepresentable {
     static func dismantleUIView(_ view: UIView, coordinator: PlaybackModel) { coordinator.close() }
 }
 
-// The drag draft belongs to this small view, not the whole player. No store,
-// playlist traversal or file validation is reachable from the drag callbacks.
+// Draft changes stay in this small view, without store/playlist traversal or
+// file I/O. A committed seek stays on the existing input; only recovery after
+// EOF revalidates and reopens the current file before applying its target.
 private struct PlaybackProgressView: View {
     @ObservedObject var model: PlaybackModel
     let isEnabled: Bool
