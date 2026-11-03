@@ -32,6 +32,7 @@ struct UpdatedRootView: View {
 struct ServerCatalogView: View {
     @EnvironmentObject private var store: VideoStore
     @State private var search = ""
+    @State private var filter: VideoListFilter = .all
     @State private var confirmAll = false
     @State private var pendingServerDeletion: Video?
     @State private var pendingServerDeletionServer = ""
@@ -40,7 +41,17 @@ struct ServerCatalogView: View {
     @State private var downloadedDeletionResult: DownloadedServerDeletionResult?
 
     private var filtered: [Video] {
-        store.videos.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
+        store.videos.filter {
+            filter.matches(store.record(for: $0)) &&
+                (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search))
+        }
+    }
+
+    private var playlistIDs: [String] {
+        filtered.compactMap { video in
+            guard let record = store.record(for: video), record.state == .complete else { return nil }
+            return record.id
+        }
     }
 
     private var downloadedPlan: DownloadedServerDeletionPlan {
@@ -49,11 +60,25 @@ struct ServerCatalogView: View {
 
     private var deletingFromServer: Bool { deletingDownloaded || !deletingServerNames.isEmpty }
 
+    private var emptyMessage: String {
+        if store.videos.isEmpty { return "当前服务器暂无视频，请刷新列表。" }
+        if !search.isEmpty { return "没有匹配文件名的视频，请调整搜索内容或筛选条件。" }
+        switch filter {
+        case .all: return "当前服务器暂无视频，请刷新列表。"
+        case .favorites: return "当前服务器没有本机已收藏的视频。下载并播放后可点击“收藏”。"
+        case .unwatched: return "当前服务器的视频都已在本机观看，可切换到“全部”查看。"
+        }
+    }
+
     var body: some View {
         List {
+            VideoListFilterPicker(selection: $filter)
             downloadedDeletionSection
             Section {
                 Text("服务器用于获取列表、下载和远程删除。删除服务器视频不会删除手机中已经下载好的本地副本。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Text("本地播放会按当前筛选和搜索结果顺序连播，跳过尚未下载完成的视频。收藏和未看状态以本机记录为准。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 if store.server.isEmpty {
@@ -120,6 +145,10 @@ struct ServerCatalogView: View {
                 }
                 .padding(.vertical, 6)
                 .buttonStyle(.borderless)
+            }
+            if !store.server.isEmpty && !store.loading && filtered.isEmpty {
+                Text(emptyMessage)
+                    .foregroundStyle(.secondary)
             }
         }
         .navigationTitle("服务器视频")
@@ -195,7 +224,7 @@ struct ServerCatalogView: View {
             Button { } label: { Label("不支持下载", systemImage: "nosign") }
                 .disabled(true)
         } else if let record = record, record.state == .complete {
-            Button { store.playLocal(record) } label: {
+            Button { store.playLocal(record, playlistIDs: playlistIDs) } label: {
                 Label("本地播放", systemImage: "play.fill")
             }
         } else if let record = record, record.state == .downloading {

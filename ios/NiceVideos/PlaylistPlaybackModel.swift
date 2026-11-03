@@ -37,13 +37,15 @@ final class PlaylistPlaybackModel: ObservableObject {
         // Match the visible library order, newest completion first, without stat.
         // Snapshot it once: watching/favoriting and new downloads cannot reshuffle
         // the active playlist under the user's previous/next buttons.
-        let ordered = LocalLibraryOrder.newestFirst(store.completed, completedAt: { $0.downloadedAt })
-        playlist = LocalPlaybackPlaylist(ids: ordered.map(\.id), currentID: request.key)
+        let ids = request.playlistIDs ?? LocalLibraryOrder.newestFirst(
+            store.completed, completedAt: { $0.downloadedAt }).map(\.id)
+        playlist = LocalPlaybackPlaylist(ids: ids, currentID: request.key)
         let engine = WatchedPlaybackEngine(base: engineFactory()) { [weak store] in
             store?.markWatched(request.key)
         }
         player = PlaybackModel(request: request, engine: engine, defaults: defaults,
                                manageAudioSession: manageAudioSession)
+        observePlaybackEnd(player, requestID: request.id)
         recordSubscription = store.$records.removeDuplicates().sink { [weak self] records in
             // @Published emits before store.records is assigned. Use the emitted
             // value, not store.records, so stars/deletions cannot lag one update.
@@ -97,8 +99,22 @@ final class PlaylistPlaybackModel: ObservableObject {
             guard let next = try? resolveRequest(id) else { continue }
             return transition(to: next)
         }
-        notice = "这个方向的视频文件已缺失或无效，当前视频继续播放。"
+        notice = player.phase == .ended
+            ? "后续视频文件已缺失或无效，播放已结束。"
+            : "这个方向的视频文件已缺失或无效，当前视频继续播放。"
         return false
+    }
+
+    private func observePlaybackEnd(_ player: PlaybackModel, requestID: UUID) {
+        player.onPlaybackEnded = { [weak self] in
+            guard let self, !self.closed, !self.switching,
+                  self.current.id == requestID else { return }
+            guard self.canMove(.next) else {
+                self.notice = "当前播放列表已播放完毕。"
+                return
+            }
+            self.move(.next)
+        }
     }
 
     @discardableResult func select(_ id: String) -> Bool {
@@ -144,6 +160,7 @@ final class PlaylistPlaybackModel: ObservableObject {
             }
             let nextPlayer = PlaybackModel(request: next, engine: engine, defaults: defaults,
                                            manageAudioSession: manageAudioSession)
+            observePlaybackEnd(nextPlayer, requestID: next.id)
             playlist.select(next.key)
             current = next
             player = nextPlayer

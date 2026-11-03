@@ -18,6 +18,9 @@ private final class PlaylistTestEngine: LocalPlaybackEngine {
     func tick(_ seconds: Double) {
         onUpdate?(PlaybackSnapshot(phase: .playing, seconds: seconds, duration: 100, seekable: true, hasVideo: true))
     }
+    func finish() {
+        onUpdate?(PlaybackSnapshot(phase: .ended, seconds: 100, duration: 100, seekable: true))
+    }
 }
 private final class PlaylistEnginePool {
     var engines: [PlaylistTestEngine] = []
@@ -42,7 +45,8 @@ private struct PlaylistFixture {
 }
 
 final class PlaylistPlaybackTests: XCTestCase {
-    @MainActor private func fixture(count: Int = 5, start: Int = 0, sameNames: Bool = false) throws -> PlaylistFixture {
+    @MainActor private func fixture(count: Int = 5, start: Int = 0, sameNames: Bool = false,
+                                    playlistIndices: [Int]? = nil) throws -> PlaylistFixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let suite = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -62,7 +66,7 @@ final class PlaylistPlaybackTests: XCTestCase {
         }
         try disk.saveRecords(records)
         let store = VideoStore(storage: disk, defaults: defaults, restoreDownloads: false)
-        store.playLocal(records[start])
+        store.playLocal(records[start], playlistIDs: playlistIndices?.map { records[$0].id })
         let anchor = try XCTUnwrap(store.playback)
         let pool = PlaylistEnginePool()
         let requests = RequestProbe()
@@ -78,6 +82,197 @@ final class PlaylistPlaybackTests: XCTestCase {
         }
         return PlaylistFixture(disk: disk, records: records, defaults: defaults, store: store,
                                anchor: anchor, model: model, pool: pool, requests: requests)
+    }
+
+    @MainActor private func finishQueuedCallbacks() async {
+        let drained = expectation(description: "queued playback completion processed")
+        DispatchQueue.main.async { drained.fulfill() }
+        await fulfillment(of: [drained], timeout: 2)
+    }
+
+    @MainActor func testNaturalEndAdvancesAndClearsBookmarkBeforeClosingOldPlayer() async throws {
+        let f = try fixture()
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].tick(80)
+        f.pool.engines[0].finish()
+        await finishQueuedCallbacks()
+
+        XCTAssertEqual(f.model.current.key, f.records[1].id)
+        XCTAssertEqual(f.model.positionLabel, "2 / 5")
+        XCTAssertNil(f.defaults.object(forKey: "position." + f.records[0].id))
+        XCTAssertEqual(f.pool.previousWasStoppedBeforeCreation, [true])
+        XCTAssertEqual(f.requests.ids, [f.records[1].id])
+        f.model.player.attach(to: UIView())
+        XCTAssertEqual(f.pool.engines[1].playCount, 1)
+        f.store.removeFromDevice(f.records[1])
+        XCTAssertNotNil(f.disk.verifiedFile(for: f.records[1]), "Auto-advance must transfer the deletion lease")
+    }
+
+    @MainActor func testDuplicateAndLateEndEventsCannotSkipAnotherVideo() async throws {
+        let f = try fixture()
+        f.model.player.attach(to: UIView())
+        let oldUpdate = f.pool.engines[0].onUpdate
+        f.pool.engines[0].finish()
+        f.pool.engines[0].finish()
+        await finishQueuedCallbacks()
+        f.model.player.attach(to: UIView())
+        oldUpdate?(PlaybackSnapshot(phase: .ended, seconds: 100, duration: 100))
+        await finishQueuedCallbacks()
+
+        XCTAssertEqual(f.model.current.key, f.records[1].id)
+        XCTAssertEqual(f.pool.engines.count, 2)
+        XCTAssertEqual(f.pool.engines[0].stopCount, 1)
+    }
+
+    @MainActor func testManualNextCancelsAnAlreadyQueuedAutomaticNext() async throws {
+        let f = try fixture()
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].finish()
+        XCTAssertTrue(f.model.move(.next))
+        await finishQueuedCallbacks()
+
+        XCTAssertEqual(f.model.current.key, f.records[1].id)
+        XCTAssertEqual(f.pool.engines.count, 2)
+    }
+
+    @MainActor func testManualNextDuringHeldEOFDoesNotAdvanceAgainAfterCancellation() async throws {
+        let f = try fixture()
+        let firstPlayer = f.model.player
+        firstPlayer.attach(to: UIView())
+        f.pool.engines[0].tick(90)
+        firstPlayer.setScrubbing(true)
+        f.pool.engines[0].finish()
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.id, f.anchor.id)
+
+        firstPlayer.setScrubbing(false)
+        XCTAssertTrue(f.model.move(.next))
+        // A cancelled/removed old slider must not restart its completed engine.
+        firstPlayer.seek(to: 20)
+        firstPlayer.setScrubbing(false)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.key, f.records[1].id)
+        XCTAssertEqual(f.pool.engines.count, 2)
+        XCTAssertEqual(f.pool.engines[0].playCount, 1)
+        XCTAssertTrue(f.pool.engines[0].seeks.isEmpty)
+    }
+
+    @MainActor func testEOFDuringScrubReplaysCurrentBeforeLaterAutomaticNext() async throws {
+        let f = try fixture()
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].tick(90)
+        f.model.player.setScrubbing(true)
+        f.pool.engines[0].onUpdate?(PlaybackSnapshot(phase: .ended, seconds: 100,
+                                                  duration: 0, seekable: false))
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.id, f.anchor.id)
+        f.model.player.setScrubbing(false)
+        f.model.player.seek(to: 20)
+        f.pool.engines[0].tick(0)
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.id, f.anchor.id)
+        XCTAssertEqual(f.pool.engines.count, 1)
+        XCTAssertEqual(f.pool.engines[0].playCount, 2)
+        XCTAssertEqual(f.pool.engines[0].seeks, [20])
+
+        f.pool.engines[0].finish()
+        await finishQueuedCallbacks()
+        XCTAssertEqual(f.model.current.key, f.records[1].id)
+        XCTAssertEqual(f.pool.engines.count, 2)
+    }
+
+    @MainActor func testPauseBeforeOrAfterEndPreventsAutomaticNext() async throws {
+        for pauseFirst in [true, false] {
+            let f = try fixture(count: 2)
+            f.model.player.attach(to: UIView())
+            if pauseFirst { f.model.player.pause() }
+            f.pool.engines[0].finish()
+            if !pauseFirst { f.model.player.pause() }
+            await finishQueuedCallbacks()
+
+            XCTAssertEqual(f.model.current.id, f.anchor.id)
+            XCTAssertEqual(f.pool.engines.count, 1)
+            XCTAssertTrue(f.requests.ids.isEmpty)
+        }
+    }
+
+    @MainActor func testCloseCancelsPendingAutomaticNext() async throws {
+        let f = try fixture()
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].finish()
+        f.model.close()
+        await finishQueuedCallbacks()
+
+        XCTAssertNil(f.store.playback)
+        XCTAssertEqual(f.pool.engines.count, 1)
+        XCTAssertTrue(f.requests.ids.isEmpty)
+    }
+
+    @MainActor func testAutomaticNextSkipsMissingAndInvalidNeighbors() async throws {
+        let f = try fixture(count: 5)
+        try f.disk.remove(f.records[1])
+        try Data("{bad".utf8).write(to: f.disk.destination(for: f.records[2]))
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].finish()
+        await finishQueuedCallbacks()
+
+        XCTAssertEqual(f.model.current.key, f.records[3].id)
+        XCTAssertEqual(f.requests.ids, Array(f.records[1...3]).map(\.id))
+        XCTAssertEqual(f.pool.engines.count, 2)
+    }
+
+    @MainActor func testAutomaticNextWithNoPlayableRemainderStopsWithoutRestarting() async throws {
+        let f = try fixture(count: 2)
+        try f.disk.remove(f.records[1])
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].finish()
+        await finishQueuedCallbacks()
+
+        XCTAssertEqual(f.model.current.id, f.anchor.id)
+        XCTAssertEqual(f.model.player.phase, .ended)
+        XCTAssertEqual(f.pool.engines.count, 1)
+        XCTAssertEqual(f.pool.engines[0].playCount, 1)
+        XCTAssertEqual(f.model.notice, "后续视频文件已缺失或无效，播放已结束。")
+    }
+
+    @MainActor func testFilteredSnapshotControlsAutomaticOrderAndDoesNotWrapAtEnd() async throws {
+        let f = try fixture(start: 3, playlistIndices: [3, 0, 4])
+        let expected = [3, 0, 4].map { f.records[$0].id }
+        XCTAssertEqual(f.model.entries.map(\.id), expected)
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].tick(1)
+        XCTAssertTrue(f.store.completed.first { $0.id == f.records[3].id }?.hasWatched == true)
+        XCTAssertTrue(f.store.toggleFavorite(f.records[1].id))
+        XCTAssertTrue(f.store.toggleFavorite(f.records[3].id))
+
+        for index in 0..<3 {
+            f.pool.engines[index].finish()
+            await finishQueuedCallbacks()
+            if index < 2 {
+                XCTAssertEqual(f.model.current.key, expected[index + 1])
+                f.model.player.attach(to: UIView())
+            }
+        }
+
+        XCTAssertEqual(f.model.entries.map(\.id), expected, "Watch/favorite changes must preserve the snapshot")
+        XCTAssertEqual(f.model.current.key, f.records[4].id)
+        XCTAssertEqual(f.model.player.phase, .ended)
+        XCTAssertEqual(f.pool.engines.count, 3)
+        XCTAssertEqual(f.requests.ids, [f.records[0].id, f.records[4].id])
+        XCTAssertEqual(f.model.notice, "当前播放列表已播放完毕。")
+    }
+
+    @MainActor func testFailureAndPauseAreNotTreatedAsNaturalEnd() async throws {
+        let f = try fixture()
+        f.model.player.attach(to: UIView())
+        f.pool.engines[0].onUpdate?(PlaybackSnapshot(phase: .paused))
+        await finishQueuedCallbacks()
+        f.pool.engines[0].onUpdate?(PlaybackSnapshot(phase: .failed, error: "decode error"))
+        await finishQueuedCallbacks()
+
+        XCTAssertEqual(f.model.current.id, f.anchor.id)
+        XCTAssertEqual(f.pool.engines.count, 1)
+        XCTAssertTrue(f.requests.ids.isEmpty)
     }
 
     @MainActor func testAllLocalVideosAvailableWithoutServerOrCatalog() throws {

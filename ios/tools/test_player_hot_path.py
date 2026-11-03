@@ -47,10 +47,17 @@ class PlayerHotPathTests(unittest.TestCase):
         for symbol in ("store.", "playlist.", "FileManager", "validateLocalFile"):
             self.assertNotIn(symbol, slider)
 
-    def test_seek_keeps_same_engine_without_file_checks(self) -> None:
+    def test_normal_seek_has_no_file_io_and_eof_reload_targets_only_current_file(self) -> None:
         seek = self.player.split("func seek(to value:", 1)[1].split("private func receive", 1)[0]
-        self.assertIn("engine.seek(to: value)", seek)
-        for symbol in ("store.", "playlist.", "load(", "stop(", "FileManager", "validate"):
+        # EOF cannot reuse the finished VLC input. Only that recovery path may
+        # reload; normal seeks must still perform no validation or library scan.
+        normal = seek.split("if !playbackInputEnded, pendingRestartSeek == nil {", 1)[1].split("\n        }", 1)[0]
+        self.assertIn("engine.seek(to: value)", normal)
+        self.assertIn("return", normal)
+        self.assertNotIn("load(", normal)
+        self.assertEqual(seek.count("load("), 1)
+        self.assertIn("try engine.load(fileURL: request.url)", seek)
+        for symbol in ("store.", "playlist.", "stop(", "FileManager", "validate"):
             self.assertNotIn(symbol, seek)
 
     def test_portrait_and_landscape_keep_navigation_buttons(self) -> None:

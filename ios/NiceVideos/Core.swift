@@ -101,11 +101,15 @@ struct PlaybackRequest: Identifiable {
     let key: String
     let title: String
     let url: URL
-    init(key: String, title: String, url: URL) throws {
+    // The visible list captured at the tap, before playback can change watched
+    // flags. nil keeps compatibility with standalone callers of this request.
+    let playlistIDs: [String]?
+    init(key: String, title: String, url: URL, playlistIDs: [String]? = nil) throws {
         try OfflineMediaPolicy.validateLocalFile(url)
         self.key = key
         self.title = title
         self.url = url
+        self.playlistIDs = playlistIDs
     }
 }
 

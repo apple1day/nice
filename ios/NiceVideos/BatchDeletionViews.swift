@@ -25,6 +25,9 @@ private struct OfflineLibraryContent: View {
     var body: some View {
         List {
             Section {
+                VideoListFilterPicker(selection: Binding(
+                    get: { library.filter }, set: { library.setFilter($0) }
+                ))
                 HStack {
                     Text(library.summary)
                     Spacer(minLength: 8)
@@ -33,7 +36,10 @@ private struct OfflineLibraryContent: View {
                     }
                 }.font(.footnote)
                 if selection.isSelecting {
-                    Text("全选仅针对当前搜索结果。").font(.caption).foregroundStyle(.secondary)
+                    Text("全选仅针对当前筛选和搜索结果。").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("点击视频后，按当前列表顺序自动播放后续视频。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if let notice = library.notice {
                     Text(notice).font(.caption).foregroundStyle(.secondary)
@@ -43,7 +49,7 @@ private struct OfflineLibraryContent: View {
             ForEach(library.visibleRows) { row in
                 Button {
                     if selection.isSelecting { selection.toggle(row.record.taskToken) }
-                    else { store.playLocal(row.record) }
+                    else { store.playLocal(row.record, playlistIDs: library.visibleRows.map(\.id)) }
                 } label: {
                     LocalVideoRowLabel(row: row, selecting: selection.isSelecting,
                                        selected: selection.contains(row.record.taskToken)).equatable()
@@ -67,8 +73,8 @@ private struct OfflineLibraryContent: View {
                 }
             }
             if library.visibleRows.isEmpty {
-                ContentUnavailableView(search.isEmpty ? "暂无本地视频" : "没有匹配的视频", systemImage: "internaldrive",
-                    description: Text("在「服务器」下载视频后即可离线播放。"))
+                ContentUnavailableView(emptyTitle, systemImage: "internaldrive",
+                    description: Text(emptyDescription))
             }
         }
         .navigationTitle("本地视频")
@@ -106,6 +112,22 @@ private struct OfflineLibraryContent: View {
             Button(snapshot.buttonTitle, role: .destructive) { performDeletion(snapshot) }
             Button("取消", role: .cancel) { deletion = nil }
         } message: { snapshot in Text(snapshot.message) }
+    }
+    private var emptyTitle: String {
+        if !search.isEmpty { return "没有匹配的视频" }
+        switch library.filter {
+        case .all: return "暂无本地视频"
+        case .favorites: return "暂无收藏的视频"
+        case .unwatched: return "暂无未看的视频"
+        }
+    }
+    private var emptyDescription: String {
+        if !search.isEmpty { return "试试其他文件名，或切换筛选条件。" }
+        switch library.filter {
+        case .all: return "在「服务器」下载视频后即可离线播放。"
+        case .favorites: return "播放时点击“收藏”，即可在这里找到视频。"
+        case .unwatched: return "已经开始观看的视频不会显示在这里，可切换到“全部”查看。"
+        }
     }
     private func performDeletion(_ snapshot: BatchDeletionRequest) {
         deletion = nil

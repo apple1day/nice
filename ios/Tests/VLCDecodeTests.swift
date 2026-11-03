@@ -13,6 +13,102 @@ import UIKit
     func testDecodeLocalMP4WithVideoFrames() async throws { try await decode(ext: "mp4") }
     func testDecodeLocalMKVWithVideoFrames() async throws { try await decode(ext: "mkv") }
 
+    func testNaturalMP4EndReachesPlaybackCompletion() async throws {
+        let file = try XCTUnwrap(Bundle(for: VLCDecodeTests.self).url(
+            forResource: "offline", withExtension: "mp4", subdirectory: "Fixtures"))
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let request = try PlaybackRequest(key: "natural-end", title: "offline", url: file)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.layoutIfNeeded()
+        let model = PlaybackModel(request: request, engine: VLCPlaybackEngine(),
+                                  defaults: defaults, manageAudioSession: false)
+        defer {
+            model.close()
+            window.isHidden = true
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let ended = expectation(description: "real VLC EOF reaches the playlist completion hook")
+        ended.assertForOverFulfill = true
+        model.onPlaybackEnded = {
+            XCTAssertEqual(model.phase, .ended)
+            XCTAssertNil(defaults.object(forKey: "position.natural-end"))
+            ended.fulfill()
+        }
+        model.attach(to: controller.view)
+        await fulfillment(of: [ended], timeout: 20)
+        XCTAssertEqual(model.phase, .ended, model.message ?? "VLC did not report natural completion")
+    }
+
+    func testHeldScrubAcrossRealEOFCanReplaySameInputAtTargetAndFinishAgain() async throws {
+        let file = try XCTUnwrap(Bundle(for: VLCDecodeTests.self).url(
+            forResource: "offline", withExtension: "mp4", subdirectory: "Fixtures"))
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let request = try PlaybackRequest(key: "scrub-end", title: "offline", url: file)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.layoutIfNeeded()
+        let engine = VLCPlaybackEngine()
+        let model = PlaybackModel(request: request, engine: engine,
+                                  defaults: defaults, manageAudioSession: false)
+        defer {
+            model.close()
+            window.isHidden = true
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let firstEnd = expectation(description: "VLC reaches EOF while the progress control is held")
+        let sought = expectation(description: "reopened VLC input reports playback at the seek target")
+        let completed = expectation(description: "replayed VLC input finishes with one completion")
+        var reachedFirstEnd = false
+        var restarting = false
+        var reachedSeekTarget = false
+        var completionCount = 0
+        var restartSnapshots: [String] = []
+        let receive = try XCTUnwrap(engine.onUpdate)
+        engine.onUpdate = { snapshot in
+            if restarting, restartSnapshots.count < 100 {
+                restartSnapshots.append("\(snapshot.phase) t=\(snapshot.seconds) duration=\(snapshot.duration) seekable=\(snapshot.seekable)")
+            }
+            receive(snapshot)
+            if snapshot.phase == .ended, !reachedFirstEnd {
+                reachedFirstEnd = true
+                firstEnd.fulfill()
+            }
+            if restarting, !reachedSeekTarget, snapshot.phase == .playing,
+               snapshot.seekable, snapshot.seconds >= 0.8, snapshot.seconds <= 1.8 {
+                reachedSeekTarget = true
+                sought.fulfill()
+            }
+        }
+        model.onPlaybackEnded = {
+            completionCount += 1
+            completed.fulfill()
+        }
+        model.setScrubbing(true)
+        model.attach(to: controller.view)
+        await fulfillment(of: [firstEnd], timeout: 20)
+        XCTAssertEqual(completionCount, 0)
+        XCTAssertEqual(model.phase, .ended)
+        XCTAssertTrue(model.seekable)
+
+        // Match native slider touch-up: editing=false immediately precedes seek.
+        restarting = true
+        model.setScrubbing(false)
+        model.seek(to: 1)
+        await fulfillment(of: [sought, completed], timeout: 20)
+        let diagnostic = restartSnapshots.joined(separator: "\n")
+        XCTAssertTrue(reachedSeekTarget, diagnostic)
+        XCTAssertEqual(completionCount, 1, diagnostic)
+        XCTAssertEqual(model.phase, .ended,
+                       (model.message ?? "VLC did not finish the replayed local input") + "\n" + diagnostic)
+    }
+
     func testRepeatedOpenStopAndReleaseKeepsMainQueueResponsive() async throws {
         let file = try XCTUnwrap(Bundle(for: VLCDecodeTests.self).url(
             forResource: "offline", withExtension: "mp4", subdirectory: "Fixtures"))

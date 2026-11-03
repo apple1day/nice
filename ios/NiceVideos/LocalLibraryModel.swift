@@ -12,6 +12,7 @@ struct LocalLibraryRow: Identifiable, Equatable {
 final class LocalLibraryModel: ObservableObject {
     @Published private(set) var visibleRows: [LocalLibraryRow] = []
     @Published private(set) var visibleTokens: [String] = []
+    @Published private(set) var filter: VideoListFilter = .all
     @Published private(set) var pendingRecords: [DownloadRecord] = []
     @Published private(set) var summary = "0 个视频 · 0 KB"
     @Published private(set) var restoring = false
@@ -35,6 +36,11 @@ final class LocalLibraryModel: ObservableObject {
     func setSearch(_ value: String) {
         guard search != value else { return }
         search = value
+        filterRows()
+    }
+    func setFilter(_ value: VideoListFilter) {
+        guard filter != value else { return }
+        filter = value
         filterRows()
     }
     private func rebuild(_ records: [DownloadRecord]) {
@@ -67,8 +73,9 @@ final class LocalLibraryModel: ObservableObject {
         filterRows()
     }
     private func filterRows() {
-        let next = search.isEmpty ? allRows : allRows.filter {
-            $0.record.video.name.localizedCaseInsensitiveContains(search)
+        let next = allRows.filter {
+            filter.matches($0.record) &&
+                (search.isEmpty || $0.record.video.name.localizedCaseInsensitiveContains(search))
         }
         if visibleRows != next { visibleRows = next }
         let tokens = next.map { $0.record.taskToken }

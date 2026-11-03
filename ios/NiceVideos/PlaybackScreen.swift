@@ -10,6 +10,7 @@ final class PlaybackModel: ObservableObject {
     @Published private(set) var duration: Double = 0
     @Published private(set) var seekable = false
     @Published private(set) var message: String?
+    var onPlaybackEnded: (() -> Void)?
     private let request: PlaybackRequest
     private let engine: LocalPlaybackEngine
     private let defaults: UserDefaults
@@ -17,6 +18,12 @@ final class PlaybackModel: ObservableObject {
     private var started = false
     private var pauseRequested = false
     private var closed = false
+    private var reportedPlaybackEnd = false
+    private var pendingPlaybackEnd: UUID?
+    private var rearmPlaybackEndOnPlaying = false
+    private var playbackInputEnded = false
+    private var isScrubbing = false
+    private var pendingRestartSeek: Double?
     private var restoredPosition = false
     private var lastSave = Date.distantPast
     private var observers: [NSObjectProtocol] = []
@@ -77,15 +84,25 @@ final class PlaybackModel: ObservableObject {
         do {
             try activateAudio()
             pauseRequested = false
-            if phase == .ended {
-                seconds = 0
+            if reportedPlaybackEnd { rearmPlaybackEndOnPlaying = true }
+            if playbackInputEnded {
+                pendingPlaybackEnd = nil
+                if pendingRestartSeek == nil { seconds = 0 }
                 restoredPosition = true
+                phase = .opening
+                // VLCKit 3.7.3 play() alone retains an EOF input. Replacing only
+                // its media reopens this local file without replacing the view.
+                try engine.load(fileURL: request.url)
             }
             engine.play()
-        } catch { message = error.localizedDescription }
+        } catch {
+            message = error.localizedDescription
+            if playbackInputEnded { phase = .failed }
+        }
     }
     func pause() {
         guard !closed else { return }
+        pendingPlaybackEnd = nil
         pauseRequested = true
         guard started else { return }
         savePosition()
@@ -93,15 +110,50 @@ final class PlaybackModel: ObservableObject {
         if phase == .playing || phase == .opening { phase = .paused }
         if manageAudioSession { UIApplication.shared.isIdleTimerDisabled = previousIdleTimer }
     }
+    func setScrubbing(_ editing: Bool) {
+        guard !closed, isScrubbing != editing else { return }
+        isScrubbing = editing
+        if !editing { schedulePendingPlaybackEnd() }
+    }
     func seek(to value: Double) {
         guard !closed, seekable, let value = PlaybackPosition.clamp(value, duration: duration) else { return }
+        pendingPlaybackEnd = nil
+        if reportedPlaybackEnd { rearmPlaybackEndOnPlaying = true }
         restoredPosition = true
         seconds = value
-        engine.seek(to: value)
+        if !playbackInputEnded, pendingRestartSeek == nil {
+            // Ordinary seeks stay on the existing input, without any file I/O.
+            engine.seek(to: value)
+            savePosition()
+            return
+        }
+        // EOF recovery validates/reloads only this current file. Keep the same
+        // engine and surface, and apply the target once its new input is ready.
+        let alreadyWaiting = pendingRestartSeek != nil
+        pendingRestartSeek = value
+        if !alreadyWaiting {
+            if pauseRequested {
+                phase = .paused
+            } else {
+                do {
+                    try activateAudio()
+                    phase = .opening
+                    try engine.load(fileURL: request.url)
+                    engine.play()
+                } catch {
+                    message = error.localizedDescription
+                    phase = .failed
+                }
+            }
+        }
         savePosition()
     }
     private func receive(_ snapshot: PlaybackSnapshot) {
-        guard !closed else { return }
+        guard !closed, phase != .failed else { return }
+        // Native stop notifications may follow EOF. Preserve the terminal state
+        // and cleared bookmark until an explicit replay or seek actually starts.
+        if playbackInputEnded || pendingRestartSeek != nil, snapshot.phase == .idle { return }
+        if rearmPlaybackEndOnPlaying || pendingRestartSeek != nil, snapshot.phase == .ended { return }
         let nextPhase: PlaybackPhase
         if snapshot.phase == .playing && pauseRequested {
             engine.pause()
@@ -109,12 +161,29 @@ final class PlaybackModel: ObservableObject {
         } else {
             nextPhase = snapshot.phase
         }
+        if nextPhase == .ended { playbackInputEnded = true }
+        // A restarted decoder can report playing before it has a duration or
+        // accepts seeks. Keep the old EOF suppressed until its queued target
+        // has actually been applied to a ready input.
+        if snapshot.phase == .playing, rearmPlaybackEndOnPlaying, pendingRestartSeek == nil {
+            playbackInputEnded = false
+        }
+        if nextPhase == .playing, rearmPlaybackEndOnPlaying, pendingRestartSeek == nil {
+            rearmPlaybackEndOnPlaying = false
+            reportedPlaybackEnd = false
+        }
         // Avoid publishing unchanged phase/duration/flags on every time callback.
         if phase != nextPhase { phase = nextPhase }
         let nextSeconds = snapshot.seconds.isFinite ? max(0, snapshot.seconds) : 0
-        let nextDuration = snapshot.duration.isFinite ? max(0, snapshot.duration) : 0
-        let nextSeekable = snapshot.seekable && nextDuration > 0
-        if seconds != nextSeconds { seconds = nextSeconds }
+        let rawDuration = snapshot.duration.isFinite ? max(0, snapshot.duration) : 0
+        let nextDuration = rawDuration > 0 ? rawDuration
+            : (playbackInputEnded || pendingRestartSeek != nil ? duration : 0)
+        // EOF must not disable the progress control and cancel a held drag.
+        // Keep its last valid range; seek() handles restarting a stopped input.
+        let preservingSeekRange = playbackInputEnded || pendingRestartSeek != nil
+        let nextSeekable = (snapshot.seekable || (preservingSeekRange && seekable)) && nextDuration > 0
+        let displayedSeconds = pendingRestartSeek ?? nextSeconds
+        if seconds != displayedSeconds { seconds = displayedSeconds }
         if duration != nextDuration { duration = nextDuration }
         if seekable != nextSeekable { seekable = nextSeekable }
         if message != snapshot.error { message = snapshot.error }
@@ -127,6 +196,22 @@ final class PlaybackModel: ObservableObject {
         if phase == .ended {
             defaults.removeObject(forKey: key)
             restoredPosition = true
+            reportPlaybackEnd()
+            return
+        }
+        if let target = pendingRestartSeek, snapshot.seekable, rawDuration > 0,
+           phase == .playing || phase == .paused {
+            pendingRestartSeek = nil
+            playbackInputEnded = false
+            if phase == .playing {
+                rearmPlaybackEndOnPlaying = false
+                reportedPlaybackEnd = false
+            }
+            if let target = PlaybackPosition.clamp(target, duration: duration) {
+                seconds = target
+                engine.seek(to: target)
+                savePosition()
+            }
             return
         }
         if !restoredPosition, seekable, phase == .playing || phase == .paused {
@@ -140,6 +225,25 @@ final class PlaybackModel: ObservableObject {
         }
         if Date().timeIntervalSince(lastSave) >= 5 { savePosition() }
     }
+    private func reportPlaybackEnd() {
+        guard !reportedPlaybackEnd else { return }
+        reportedPlaybackEnd = true
+        guard started, !pauseRequested else { return }
+        pendingPlaybackEnd = UUID()
+        schedulePendingPlaybackEnd()
+    }
+    private func schedulePendingPlaybackEnd() {
+        guard !closed, !isScrubbing, !pauseRequested, let token = pendingPlaybackEnd else { return }
+        // Finish processing the terminal snapshot before a playlist closes this
+        // player. Touch-up reports editing=false before committing its seek;
+        // deferring lets that seek cancel completion in the same event turn.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.closed, !self.pauseRequested, !self.isScrubbing,
+                  self.phase == .ended, self.pendingPlaybackEnd == token else { return }
+            self.pendingPlaybackEnd = nil
+            self.onPlaybackEnded?()
+        }
+    }
     private func savePosition() {
         guard restoredPosition, phase != .ended, phase != .failed,
               seconds.isFinite, seconds >= 0 else { return }
@@ -150,6 +254,9 @@ final class PlaybackModel: ObservableObject {
         guard !closed else { return }
         savePosition()
         closed = true
+        pendingPlaybackEnd = nil
+        pendingRestartSeek = nil
+        onPlaybackEnded = nil
         engine.onUpdate = nil
         engine.stop()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -180,8 +287,9 @@ private struct VLCVideoSurface: UIViewRepresentable {
     static func dismantleUIView(_ view: UIView, coordinator: PlaybackModel) { coordinator.close() }
 }
 
-// The drag draft belongs to this small view, not the whole player. No store,
-// playlist traversal or file validation is reachable from the drag callbacks.
+// Draft changes stay in this small view, without store/playlist traversal or
+// file I/O. A committed seek stays on the existing input; only recovery after
+// EOF revalidates and reopens the current file before applying its target.
 private struct PlaybackProgressView: View {
     @ObservedObject var model: PlaybackModel
     let isEnabled: Bool
@@ -195,7 +303,10 @@ private struct PlaybackProgressView: View {
             PlaybackSlider(seconds: model.seconds, duration: model.duration,
                            isEnabled: isEnabled && model.seekable, controller: scrubber,
                            onDraftChanged: { draftSeconds = $0 },
-                           onEditingChanged: onEditingChanged,
+                           onEditingChanged: { editing in
+                               model.setScrubbing(editing)
+                               onEditingChanged(editing)
+                           },
                            onCommit: { model.seek(to: $0) })
                 .frame(maxWidth: .infinity)
                 .frame(height: 44)
@@ -541,7 +652,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         NavigationStack {
             List {
                 Section {
-                    Text("按本地列表顺序播放。使用上一个、下一个按钮或点选条目切换；上下滑不再切换视频。只有切换时才检查目标文件，缺失或无效的相邻视频会跳过。")
+                    Text("按打开视频时的筛选列表顺序播放，播完自动播放下一条，最后一条播完后停止。也可使用上一个、下一个按钮或点选条目切换。收藏和已看状态的变化不会改变本次播放顺序；缺失或无效的相邻视频会跳过。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 ForEach(playlist.entries) { record in

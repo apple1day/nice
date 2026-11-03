@@ -1,6 +1,19 @@
 import SwiftUI
 import UIKit
 
+struct VideoListFilterPicker: View {
+    @Binding var selection: VideoListFilter
+    var body: some View {
+        Picker("筛选视频", selection: $selection) {
+            ForEach(VideoListFilter.allCases) { filter in
+                Text(filter.title).tag(filter)
+            }
+        }
+        .pickerStyle(.segmented)
+        .accessibilityIdentifier("videoListFilterPicker")
+    }
+}
+
 struct RootView: View {
     @EnvironmentObject private var store: VideoStore
     @Environment(\.scenePhase) private var scenePhase
@@ -33,12 +46,23 @@ struct RootView: View {
 struct CatalogView: View {
     @EnvironmentObject private var store: VideoStore
     @State private var search = ""
+    @State private var filter: VideoListFilter = .all
     @State private var confirmAll = false
     private var filtered: [Video] {
-        store.videos.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
+        store.videos.filter {
+            filter.matches(store.record(for: $0)) &&
+                (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search))
+        }
+    }
+    private var playlistIDs: [String] {
+        filtered.compactMap { video in
+            guard let record = store.record(for: video), record.state == .complete else { return nil }
+            return record.id
+        }
     }
     var body: some View {
         List {
+            VideoListFilterPicker(selection: $filter)
             PendingDeletionSection()
             Section {
                 Text("服务器仅用于获取列表和下载。播放前必须下载完成。")
@@ -64,7 +88,7 @@ struct CatalogView: View {
                         Text("暂不下载此格式；播放清单不是独立视频。")
                             .font(.caption).foregroundStyle(.secondary)
                     } else if let record = record, record.state == .complete {
-                        Button { store.playLocal(record) } label: { Label("本地播放", systemImage: "play.fill") }
+                        Button { store.playLocal(record, playlistIDs: playlistIDs) } label: { Label("本地播放", systemImage: "play.fill") }
                     } else if let record = record, record.state == .downloading {
                         ProgressView(value: store.progress[record.id] ?? 0)
                         Text("下载中 \(Int((store.progress[record.id] ?? 0) * 100))%")
