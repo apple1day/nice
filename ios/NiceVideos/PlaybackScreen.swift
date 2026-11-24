@@ -33,7 +33,7 @@ final class PlaybackModel: ObservableObject {
     init(request: PlaybackRequest, engine: LocalPlaybackEngine? = nil,
          defaults: UserDefaults = .standard, manageAudioSession: Bool = true) {
         self.request = request
-        self.engine = engine ?? SBSPlaybackEngine()
+        self.engine = engine ?? SBSPlaybackEngine(pickedFile: request.pickedFile)
         self.defaults = defaults
         self.manageAudioSession = manageAudioSession
         self.engine.onUpdate = { [weak self] snapshot in self?.receive(snapshot) }
@@ -382,6 +382,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
     private var isFullscreen: Bool { controls.isFullscreen || displayMode != .standard }
     private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist || showsVideoFormats }
+    private var isLibraryVideo: Bool { request.pickedFile == nil }
     private var showsPause: Bool { model.phase == .playing || model.phase == .opening }
     private var canInteract: Bool { scenePhase == .active && store.errorMessage == nil && !showsPlaylist }
     private var transportButtonStyle: PlaybackTransportButtonStyle {
@@ -408,8 +409,12 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                         .accessibilityLabel("视频画面，轻点显示或隐藏控制栏")
                         .accessibilityAddTraits(.isButton)
                         .accessibilityAction { toggleControls() }
-                        .accessibilityAction(named: Text("上一个视频")) { navigate(.previous) }
-                        .accessibilityAction(named: Text("下一个视频")) { navigate(.next) }
+                        .accessibilityActions {
+                            if isLibraryVideo {
+                                Button("上一个视频") { navigate(.previous) }
+                                Button("下一个视频") { navigate(.next) }
+                            }
+                        }
                         .accessibilityIdentifier("playbackSurfaceToggle")
                 }
                 .overlay(alignment: .top) {
@@ -541,26 +546,28 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                     .accessibilityIdentifier("playbackActionNotice")
             }
             HStack(spacing: 8) {
-                if !isLandscape { navigationButton(.previous, compact: false) }
+                if isLibraryVideo && !isLandscape { navigationButton(.previous, compact: false) }
                 Spacer(minLength: 4)
-                Button { performTransportAction { showsPlaylist = true } } label: {
-                    Label(playlist.positionLabel, systemImage: "list.bullet")
-                        .font(.caption.monospacedDigit())
-                        .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
-                        .contentShape(Rectangle())
+                if isLibraryVideo {
+                    Button { performTransportAction { showsPlaylist = true } } label: {
+                        Label(playlist.positionLabel, systemImage: "list.bullet")
+                            .font(.caption.monospacedDigit())
+                            .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .disabled(!canInteract)
+                    .accessibilityLabel("本地播放列表 \(playlist.positionLabel)")
+                    .accessibilityIdentifier("openLocalPlaylistButton")
                 }
-                .disabled(!canInteract)
-                .accessibilityLabel("本地播放列表 \(playlist.positionLabel)")
-                .accessibilityIdentifier("openLocalPlaylistButton")
                 videoFormatButton
                 Spacer(minLength: 4)
-                if !isLandscape { navigationButton(.next, compact: false) }
+                if isLibraryVideo && !isLandscape { navigationButton(.next, compact: false) }
             }
             PlaybackProgressView(model: model, isEnabled: canInteract, scrubber: scrubber) { editing in
                 controls.setScrubbing(editing, at: now)
             }.id(request.id)
             HStack(spacing: 0) {
-                if isLandscape {
+                if isLibraryVideo && isLandscape {
                     navigationButton(.previous, compact: true).frame(minWidth: 0, maxWidth: .infinity)
                 }
                 Button { performTransportAction { model.seek(to: model.seconds - 15) } } label: {
@@ -576,14 +583,16 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                     .accessibilityLabel(showsPause ? "暂停" : "播放")
                     .accessibilityIdentifier("togglePlaybackButton")
                     .frame(minWidth: 0, maxWidth: .infinity)
-                transportFavoriteButton.frame(minWidth: 0, maxWidth: .infinity)
-                transportDeleteButton.frame(minWidth: 0, maxWidth: .infinity)
+                if isLibraryVideo {
+                    transportFavoriteButton.frame(minWidth: 0, maxWidth: .infinity)
+                    transportDeleteButton.frame(minWidth: 0, maxWidth: .infinity)
+                }
                 Button { performTransportAction { model.seek(to: model.seconds + 15) } } label: {
                     Image(systemName: "goforward.15")
                         .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52).contentShape(Rectangle())
                 }.disabled(!model.seekable || !canInteract).accessibilityLabel("前进15秒")
                     .frame(minWidth: 0, maxWidth: .infinity)
-                if isLandscape {
+                if isLibraryVideo && isLandscape {
                     navigationButton(.next, compact: true).frame(minWidth: 0, maxWidth: .infinity)
                 }
                 Button { performTransportAction(toggleFullscreen) } label: {

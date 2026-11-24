@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import "VLCPickedFileInput.h"
 #import <MobileVLCKit/VLCMedia.h>
 #import <MobileVLCKit/VLCMediaPlayer.h>
 
@@ -7,14 +8,27 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^NICEVLCFrameHandler)(CVPixelBufferRef frame);
 
+@protocol NICEVLCTrackSource <NSObject>
+@property (nonatomic, readonly, copy) NSArray *tracksInformation;
+@end
+@interface VLCMedia (NICEVLCTrackSource) <NICEVLCTrackSource>
+@end
+
 @interface NICEVLCFrameDelivery : NSObject
 // Assigned before starting the local media. The decoder thread reads its
 // track metadata once when negotiating a new video output format.
-@property (atomic, strong, nullable) VLCMedia *sourceMedia;
+@property (atomic, strong, nullable) id<NICEVLCTrackSource> sourceMedia;
 @property (atomic, readonly) BOOL hasDeliveredFrame;
 // Called on the main queue when retiring playback, before VLC stops asynchronously.
 - (void)invalidate;
 - (instancetype)init NS_UNAVAILABLE;
+@end
+
+@interface NICEVLCNativeReference : NSObject
+@property (nonatomic, readonly) int64_t lengthMilliseconds;
+- (BOOL)loadFileWithByteCount:(uint64_t)byteCount
+                      options:(NSArray<NSString *> *)options
+                         read:(NICEVLCFileRead)reader NS_SWIFT_NAME(loadFile(byteCount:options:read:));
 @end
 
 // Creates the player through VLCKit's public native-instance initializer.
@@ -22,7 +36,7 @@ typedef void (^NICEVLCFrameHandler)(CVPixelBufferRef frame);
 // released on a background queue. No private selector or pointer lookup is used.
 @interface NICEVLCPlayerConstruction : NSObject
 @property (nonatomic, strong, readonly) VLCMediaPlayer *player;
-@property (nonatomic, strong, readonly) NSObject *nativeReference;
+@property (nonatomic, strong, readonly) NICEVLCNativeReference *nativeReference;
 @property (nonatomic, strong, readonly, nullable) NICEVLCFrameDelivery *frameDelivery;
 - (nullable instancetype)initWithOptions:(NSArray<NSString *> *)options;
 - (nullable instancetype)initWithOptions:(NSArray<NSString *> *)options

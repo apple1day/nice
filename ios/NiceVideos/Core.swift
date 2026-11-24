@@ -101,6 +101,7 @@ struct PlaybackRequest: Identifiable {
     let key: String
     let title: String
     let url: URL
+    let pickedFile: PickedVideoFile?
     // The visible list captured at the tap, before playback can change watched
     // flags. nil keeps compatibility with standalone callers of this request.
     let playlistIDs: [String]?
@@ -110,6 +111,18 @@ struct PlaybackRequest: Identifiable {
         self.title = title
         self.url = url
         self.playlistIDs = playlistIDs
+        pickedFile = nil
+    }
+
+    // The Files picker already opened and validated this exact file. A provider
+    // URL can move later; decoding uses the retained file instead of reopening it.
+    init(pickedFile: PickedVideoFile) {
+        self.pickedFile = pickedFile
+        url = pickedFile.url
+        title = pickedFile.url.lastPathComponent
+        let identity = pickedFile.url.standardizedFileURL.absoluteString + "\n" + String(pickedFile.byteCount)
+        key = "files." + SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
+        playlistIDs = [key]
     }
 }
 

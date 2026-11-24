@@ -56,9 +56,12 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private static var lifetimeAssociationKey: UInt8 = 0
     private let playerResource: BackgroundPlaybackResource<VLCMediaPlayer>
-    private weak var nativeLifetime: BackgroundPlaybackResource<NSObject>?
+    private weak var nativeLifetime: BackgroundPlaybackResource<NICEVLCNativeReference>?
     private var player: VLCMediaPlayer? { playerResource.resource }
     private let frameDelivery: NICEVLCFrameDelivery?
+    private let pickedFile: PickedVideoFile?
+    private var pickedLoadID: UUID?
+    private var fileReadFailed = false
     private var stopped = false
     private var loaded = false
     private var pausedPreviewDeadline: TimeInterval?
@@ -74,7 +77,8 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
 
     override convenience init() { self.init(frameHandler: nil) }
 
-    init(frameHandler: ((CVPixelBuffer) -> Void)?) {
+    init(frameHandler: ((CVPixelBuffer) -> Void)?, pickedFile: PickedVideoFile? = nil) {
+        self.pickedFile = pickedFile
         let construction = NICEVLCPlayerConstruction(options: ["--no-video-title-show", "--no-metadata-network-access"],
                                                      frameHandler: frameHandler)
         frameDelivery = construction?.frameDelivery
@@ -102,16 +106,50 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     func load(fileURL: URL, startAt seconds: Double, paused: Bool) throws {
         guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
         guard let player else { throw ClientError("播放器初始化失败，请关闭后重新打开视频。") }
-        // Check again immediately before giving VLC a file, even for non-store callers.
-        try OfflineMediaPolicy.validateLocalFile(fileURL)
-        let media = VLCMedia(path: fileURL.path)
-        if seconds.isFinite && seconds > 0 { media.addOption(":start-time=\(seconds)") }
-        if paused { media.addOption(":start-paused") }
-        frameDelivery?.sourceMedia = media
+        var options: [String] = []
+        if seconds.isFinite && seconds > 0 { options.append(":start-time=\(seconds)") }
+        if paused { options.append(":start-paused") }
+        if let pickedFile {
+            guard fileURL == pickedFile.url, let native = nativeLifetime?.resource else {
+                throw ClientError("无法打开所选文件，请重新选择视频。")
+            }
+            let loadID = UUID()
+            pickedLoadID = loadID
+            fileReadFailed = false
+            let opened = native.loadFile(byteCount: pickedFile.byteCount, options: options) { [weak self] buffer, count, offset in
+                let bytes = pickedFile.read(into: buffer, count: count, at: offset)
+                if bytes < 0 {
+                    // VLC's imem access module converts a read error to EOF.
+                    // Surface disappearance or replacement as a playback error.
+                    DispatchQueue.main.async { [weak self] in self?.fileReadDidFail(loadID) }
+                }
+                return bytes
+            }
+            guard opened else { throw ClientError("无法打开所选文件，请重新选择视频。") }
+        } else {
+            try OfflineMediaPolicy.validateLocalFile(fileURL)
+            let media = VLCMedia(path: fileURL.path)
+            for option in options { media.addOption(option) }
+            frameDelivery?.sourceMedia = media
+            player.media = media
+        }
         pausedPreviewDeadline = nil
-        player.media = media
         loaded = true
     }
+    private func fileReadDidFail(_ loadID: UUID) {
+        guard !stopped, pickedLoadID == loadID, !fileReadFailed else { return }
+        fileReadFailed = true
+        player?.stop()
+        publishNow()
+    }
+
+    private func durationSeconds(_ player: VLCMediaPlayer) -> Double {
+        if pickedFile != nil {
+            return max(0, Double(nativeLifetime?.resource?.lengthMilliseconds ?? 0) / 1000)
+        }
+        return max(0, Double(player.media?.length.intValue ?? 0) / 1000)
+    }
+
     func play() { play(waitForPausedFrame: false) }
     func play(waitForPausedFrame: Bool) {
         guard loaded && !stopped else { return }
@@ -123,7 +161,7 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     func pause() { if loaded && !stopped { player?.pause() } }
     func seek(to seconds: Double) {
         guard !stopped, let player else { return }
-        let duration = Double(player.media?.length.intValue ?? 0) / 1000
+        let duration = durationSeconds(player)
         guard player.isSeekable,
               let seconds = PlaybackPosition.clamp(seconds, duration: duration) else { return }
 
@@ -208,6 +246,9 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
 
     private func makeSnapshot() -> PlaybackSnapshot? {
         guard !stopped, let player else { return nil }
+        if fileReadFailed {
+            return PlaybackSnapshot(phase: .failed, error: "无法继续读取所选视频。请检查文件和存储设备，再重新打开。")
+        }
         let phase: PlaybackPhase
         switch player.state {
         case .playing: phase = .playing
@@ -227,7 +268,7 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
         return PlaybackSnapshot(
             phase: phase,
             seconds: displayedSeconds,
-            duration: max(0, Double(player.media?.length.intValue ?? 0) / 1000),
+            duration: durationSeconds(player),
             seekable: player.isSeekable,
             hasVideo: frameDelivery?.hasDeliveredFrame ?? player.hasVideoOut,
             error: phase == .failed ? "VLC 无法解码这个本地文件。请检查文件是否损坏、编码是否受支持，必要时重新下载。" : nil

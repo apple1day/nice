@@ -43,7 +43,10 @@ enum OfflineMediaPolicy {
     static func rejectTextPayload(at url: URL) throws {
         let file = try FileHandle(forReadingFrom: url)
         defer { try? file.close() }
-        let header = try file.read(upToCount: 512) ?? Data()
+        try validateHeader(file.read(upToCount: 512) ?? Data())
+    }
+
+    static func validateHeader(_ header: Data) throws {
         let text = String(decoding: header, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{feff}")))
             .lowercased()

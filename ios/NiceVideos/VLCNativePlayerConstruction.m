@@ -9,10 +9,53 @@
 #import <MobileVLCKit/vlc/libvlc_media.h>
 #import <MobileVLCKit/vlc/libvlc_media_player.h>
 
+@implementation VLCMedia (NICEVLCTrackSource)
+@end
+
+// vmem negotiates on the decoder thread, possibly before VLCKit has published
+// its ObjC wrapper. Retain this descriptor to read the visible video geometry.
+@interface NICEVLCPickedTracks : NSObject <NICEVLCTrackSource>
+- (instancetype)initWithMedia:(libvlc_media_t *)media;
+@end
+
+@implementation NICEVLCPickedTracks {
+    libvlc_media_t *_media;
+}
+- (instancetype)initWithMedia:(libvlc_media_t *)media {
+    self = [super init];
+    if (self) {
+        libvlc_media_retain(media);
+        _media = media;
+    }
+    return self;
+}
+- (NSArray *)tracksInformation {
+    NSMutableArray *result = [NSMutableArray array];
+    libvlc_media_track_t **tracks;
+    unsigned count = libvlc_media_tracks_get(_media, &tracks);
+    for (unsigned i = 0; i < count; i++) {
+        libvlc_media_track_t *track = tracks[i];
+        if (track->i_type != libvlc_track_video || !track->video) { continue; }
+        const libvlc_video_track_t *video = track->video;
+        [result addObject:@{
+            VLCMediaTracksInformationType: VLCMediaTracksInformationTypeVideo,
+            VLCMediaTracksInformationVideoWidth: @(video->i_width),
+            VLCMediaTracksInformationVideoHeight: @(video->i_height),
+            VLCMediaTracksInformationVideoOrientation: @(video->i_orientation),
+            VLCMediaTracksInformationSourceAspectRatio: @(video->i_sar_num),
+            VLCMediaTracksInformationSourceAspectRatioDenominator: @(video->i_sar_den)
+        }];
+    }
+    if (count) { libvlc_media_tracks_release(tracks, count); }
+    return result;
+}
+- (void)dealloc { libvlc_media_release(_media); }
+@end
+
 // libvlc's final release joins its decoder worker. Keep a separate C reference
 // so the ObjC wrapper's dealloc only decrements the count, even if a late VLCKit
 // idle-timer block is the wrapper's last owner on the main queue.
-@interface NICEVLCNativeReference : NSObject
+@interface NICEVLCNativeReference ()
 - (instancetype)initWithPlayer:(libvlc_media_player_t *)player library:(VLCLibrary *)library
                  frameDelivery:(NICEVLCFrameDelivery *)delivery;
 @end
@@ -35,6 +78,18 @@
         _delivery = delivery;
     }
     return self;
+}
+
+- (int64_t)lengthMilliseconds { return libvlc_media_player_get_length(_player); }
+
+- (BOOL)loadFileWithByteCount:(uint64_t)byteCount options:(NSArray<NSString *> *)options read:(NICEVLCFileRead)reader {
+    libvlc_media_t *media = NICECreatePickedMedia((libvlc_instance_t *)_library.instance, byteCount, reader);
+    if (!media) { return NO; }
+    for (NSString *option in options) { libvlc_media_add_option(media, option.UTF8String); }
+    if (_delivery) { _delivery.sourceMedia = [[NICEVLCPickedTracks alloc] initWithMedia:media]; }
+    libvlc_media_player_set_media_async(_player, media);
+    libvlc_media_release(media);
+    return YES;
 }
 
 - (void)dealloc {

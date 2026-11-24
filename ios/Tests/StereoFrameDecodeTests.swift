@@ -4,8 +4,37 @@ import XCTest
 
 @MainActor final class StereoFrameDecodeTests: XCTestCase {
     func testSBSFramePreservesBothEyesInMetalCompatibleBGRA() async throws {
+        try await checkStereoOutput(picked: false)
+    }
+
+    func testPickedSBSFramePreservesVisibleGeometryAndBothEyes() async throws {
+        try await checkStereoOutput(picked: true)
+    }
+
+    func testRemovedPickedFileReportsReadFailure() async throws {
+        let original = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "sbs", withExtension: "mp4", subdirectory: "Fixtures"))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
+        try FileManager.default.copyItem(at: original, to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let file = try await PickedVideoFile.open(url)
+        let engine = SBSPlaybackEngine(pickedFile: file)
+        defer { engine.stop() }
+        try engine.load(fileURL: file.url)
+        try FileManager.default.removeItem(at: url)
+        let failed = expectation(description: "The Files read failure is shown to the user")
+        engine.onUpdate = { state in
+            if state.phase == .failed, state.error?.contains("读取") == true { failed.fulfill() }
+        }
+        engine.play()
+        await fulfillment(of: [failed], timeout: 15)
+    }
+
+    private func checkStereoOutput(picked: Bool) async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "sbs", withExtension: "mp4", subdirectory: "Fixtures"))
+        let file: PickedVideoFile?
+        if picked { file = try await PickedVideoFile.open(url) } else { file = nil }
         let decoded = expectation(description: "VLC delivers both eyes in one BGRA frame")
         var firstFrame: CVPixelBuffer?
         let engine = VLCPlaybackEngine(frameHandler: { frame in
@@ -13,9 +42,9 @@ import XCTest
             guard firstFrame == nil else { return }
             firstFrame = frame
             decoded.fulfill()
-        })
+        }, pickedFile: file)
         defer { engine.stop() }
-        try engine.load(fileURL: url)
+        try engine.load(fileURL: file?.url ?? url)
         engine.play()
         await fulfillment(of: [decoded], timeout: 15)
         let frame = try XCTUnwrap(firstFrame)

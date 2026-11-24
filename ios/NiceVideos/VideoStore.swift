@@ -324,14 +324,25 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             let ids = playlistIDs ?? LocalLibraryOrder.newestFirst(completedCache,
                 completedAt: { $0.downloadedAt }).map(\.id)
             let request = try localPlaybackRequest(for: record.id, playlistIDs: ids)
-            playbackSession = request
-            deletionNotice = nil
-            playback = request
+            presentPlayback(request)
         } catch {
             errorMessage = error.localizedDescription
             reconcileFiles(ids: [record.id])
         }
     }
+    func playPickedFile(_ file: PickedVideoFile) throws {
+        guard playbackSession == nil && playback == nil else {
+            throw ClientError("已有视频正在播放，请先关闭播放器。")
+        }
+        presentPlayback(PlaybackRequest(pickedFile: file))
+    }
+
+    private func presentPlayback(_ request: PlaybackRequest) {
+        playbackSession = request
+        deletionNotice = nil
+        playback = request
+    }
+
     // Compatibility accessor: metadata only; opening a target still validates it.
     var localPlaylistRecords: [DownloadRecord] { completedCache }
     func localPlaybackRequest(for id: String, playlistIDs: [String]? = nil) throws -> PlaybackRequest {

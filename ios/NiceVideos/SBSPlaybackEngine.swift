@@ -43,6 +43,7 @@ final class SBSPlaybackView: UIView {
 final class SBSPlaybackEngine: LocalPlaybackEngine {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private var session: VLCPlaybackEngine?
+    private let pickedFile: PickedVideoFile?
     private var file: URL?
     private var seconds = 0.0
     private var phase: PlaybackPhase = .idle
@@ -52,6 +53,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
     private var awaitingOutput = false
     private var pendingSeek: Double?
     private var stopped = false
+
+    init(pickedFile: PickedVideoFile? = nil) { self.pickedFile = pickedFile }
 
     func attach(to view: UIView) {
         guard !stopped else { return }
@@ -80,7 +83,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
             guard let self, !self.stopped else { return }
             // A stopped event may trail EOF. Only an explicit reload can
             // restart that input, including when changing output at the end.
-            if self.phase == .ended || self.phase == .failed { return }
+            let pickedFileFailure = self.pickedFile != nil && snapshot.phase == .failed
+            if self.phase == .failed || (self.phase == .ended && !pickedFileFailure) { return }
             var visible = snapshot
             if self.openingPaused && snapshot.phase == .paused {
                 self.openingPaused = false
@@ -117,7 +121,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
 
     private func nativeSession() -> VLCPlaybackEngine {
         if let session { return session }
-        let newSession = VLCPlaybackEngine()
+        let newSession = VLCPlaybackEngine(frameHandler: nil, pickedFile: pickedFile)
         observe(newSession)
         return newSession
     }
@@ -127,7 +131,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
             observe(VLCPlaybackEngine(frameHandler: { [weak renderer] frame in
                 // The frame-delivery bridge coalesces output onto the main queue.
                 MainActor.assumeIsolated { renderer?.display(frame) }
-            }))
+            }, pickedFile: pickedFile))
         } else {
             nativeSession().attach(to: host.drawableView)
         }

@@ -14,6 +14,9 @@ private struct OfflineLibraryContent: View {
     @State private var selection = BatchSelection()
     @State private var deletion: BatchDeletionRequest?
     @State private var result: BatchDeletionResult?
+    @State private var showsFilePicker = false
+    @State private var pickedURL: URL?
+    @State private var preparingURL: URL?
 
     init(store: VideoStore) {
         self.store = store
@@ -24,6 +27,26 @@ private struct OfflineLibraryContent: View {
     }
     var body: some View {
         List {
+            if !selection.isSelecting {
+                Section {
+                    if let url = preparingURL {
+                        HStack {
+                            ProgressView()
+                            Text("正在准备 \(url.lastPathComponent)").lineLimit(1)
+                            Spacer(minLength: 8)
+                            Button("取消") { preparingURL = nil }
+                                .buttonStyle(.borderless)
+                        }
+                    } else {
+                        Button { showsFilePicker = true } label: {
+                            Label("打开文件", systemImage: "folder")
+                        }
+                        .accessibilityIdentifier("openVideoFileButton")
+                    }
+                } footer: {
+                    Text(preparingURL == nil ? "从「文件」中选择视频，直接播放。" : "云端文件可能需要先下载到设备。")
+                }
+            }
             Section {
                 VideoListFilterPicker(selection: Binding(
                     get: { library.filter }, set: { library.setFilter($0) }
@@ -49,7 +72,10 @@ private struct OfflineLibraryContent: View {
             ForEach(library.visibleRows) { row in
                 Button {
                     if selection.isSelecting { selection.toggle(row.record.taskToken) }
-                    else { store.playLocal(row.record, playlistIDs: library.visibleRows.map(\.id)) }
+                    else {
+                        preparingURL = nil
+                        store.playLocal(row.record, playlistIDs: library.visibleRows.map(\.id))
+                    }
                 } label: {
                     LocalVideoRowLabel(row: row, selecting: selection.isSelecting,
                                        selected: selection.contains(row.record.taskToken)).equatable()
@@ -62,6 +88,7 @@ private struct OfflineLibraryContent: View {
                 .swipeActions(allowsFullSwipe: false) {
                     if !selection.isSelecting {
                         Button("删除", role: .destructive) {
+                            preparingURL = nil
                             deletion = BatchDeletionRequest(scope: .localVideos, records: [row.record])
                         }.disabled(library.restoring)
                     }
@@ -81,7 +108,7 @@ private struct OfflineLibraryContent: View {
         .searchable(text: $search, prompt: "搜索本地视频")
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                PendingDeleteToolbarButton(records: library.pendingRecords, disabled: library.restoring) { snapshot in
+                PendingDeleteToolbarButton(records: library.pendingRecords, disabled: library.restoring || preparingURL != nil) { snapshot in
                     store.deletePendingVideos(snapshot)
                     selection.retainVisible(library.visibleTokens)
                 }
@@ -92,7 +119,7 @@ private struct OfflineLibraryContent: View {
                     Button("取消") { selection.cancel() }
                 } else {
                     Button("选择") { result = nil; selection.begin() }
-                        .disabled(library.visibleRows.isEmpty || library.restoring)
+                        .disabled(library.visibleRows.isEmpty || library.restoring || preparingURL != nil)
                         .accessibilityIdentifier("selectLocalVideosButton")
                 }
             }
@@ -106,6 +133,33 @@ private struct OfflineLibraryContent: View {
         }
         .onChange(of: search) { _, value in library.setSearch(value) }
         .onChange(of: library.visibleTokens) { _, tokens in selection.retainVisible(tokens) }
+        .sheet(isPresented: $showsFilePicker, onDismiss: {
+            // The player's full-screen presentation starts after Files has closed.
+            preparingURL = pickedURL
+            pickedURL = nil
+        }) {
+            VideoDocumentPicker { url in
+                pickedURL = url
+                showsFilePicker = false
+            }
+        }
+        .task(id: preparingURL) { @MainActor in
+            guard let url = preparingURL else { return }
+            do {
+                let file = try await PickedVideoFile.open(url)
+                try Task.checkCancellation()
+                guard preparingURL == url else { return }
+                try store.playPickedFile(file)
+            } catch {
+                guard !Task.isCancelled, preparingURL == url else { return }
+                store.errorMessage = "无法打开视频：\(error.localizedDescription)"
+            }
+            preparingURL = nil
+        }
+        .onDisappear {
+            pickedURL = nil
+            preparingURL = nil
+        }
         .confirmationDialog(deletion?.title ?? "删除本地视频？", isPresented: Binding(
             get: { deletion != nil }, set: { if !$0 { deletion = nil } }
         ), titleVisibility: .visible, presenting: deletion) { snapshot in
@@ -124,7 +178,7 @@ private struct OfflineLibraryContent: View {
     private var emptyDescription: String {
         if !search.isEmpty { return "试试其他文件名，或切换筛选条件。" }
         switch library.filter {
-        case .all: return "在「服务器」下载视频后即可离线播放。"
+        case .all: return "可以点「打开文件」播放已有视频，或从「服务器」下载到本地列表。"
         case .favorites: return "播放时点击“收藏”，即可在这里找到视频。"
         case .unwatched: return "已经开始观看的视频不会显示在这里，可切换到“全部”查看。"
         }
