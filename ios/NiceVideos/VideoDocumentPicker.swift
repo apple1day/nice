@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 import UIKit
 
 struct VideoDocumentPicker: UIViewControllerRepresentable {
-    let onPick: (URL?) -> Void
+    let onPick: (PickedVideoFile.Selection?) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
 
@@ -19,12 +19,12 @@ struct VideoDocumentPicker: UIViewControllerRepresentable {
     func updateUIViewController(_ picker: UIDocumentPickerViewController, context: Context) {}
 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        private let onPick: (URL?) -> Void
+        private let onPick: (PickedVideoFile.Selection?) -> Void
 
-        init(onPick: @escaping (URL?) -> Void) { self.onPick = onPick }
+        init(onPick: @escaping (PickedVideoFile.Selection?) -> Void) { self.onPick = onPick }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            onPick(urls.first)
+            onPick(urls.first.map { PickedVideoFile.Selection($0) })
         }
 
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {

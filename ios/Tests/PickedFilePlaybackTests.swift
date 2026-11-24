@@ -4,30 +4,19 @@ import XCTest
 
 @MainActor
 final class PickedFilePlaybackTests: XCTestCase {
-    /// Insert a 64-bit ISO BMFF free box after ftyp. Only the tiny fixture's
-    /// bytes are written. All decoder metadata and samples begin past 4 GiB.
+    /// The two fixture resources contain only the populated regions of an MP4.
+    /// Its faststart movie header indexes A/V samples using 64-bit chunk offsets.
     private func makeLargeMovie(at url: URL) throws {
-        let fixture = try XCTUnwrap(Bundle(for: Self.self).url(
-            forResource: "fragmented", withExtension: "mp4", subdirectory: "Fixtures"))
-        let sample = try Data(contentsOf: fixture)
-        guard sample.count >= 8, sample[4..<8] == Data("ftyp".utf8) else {
-            throw ClientError("Missing ftyp in the generated test fixture")
-        }
-        let ftypSize = sample.prefix(4).reduce(0) { ($0 << 8) | Int($1) }
-        guard (8..<sample.count).contains(ftypSize) else {
-            throw ClientError("Invalid ftyp length in the generated test fixture")
-        }
-
-        let padding: UInt64 = 1 << 32
-        var freeBox = Data([0, 0, 0, 1]) + Data("free".utf8)
-        withUnsafeBytes(of: padding.bigEndian) { freeBox.append(contentsOf: $0) }
-        try sample.prefix(ftypSize).write(to: url)
+        let bundle = Bundle(for: Self.self)
+        let index = try XCTUnwrap(bundle.url(forResource: "co64-index", withExtension: "bin",
+                                             subdirectory: "Fixtures"))
+        let samples = try XCTUnwrap(bundle.url(forResource: "co64-samples", withExtension: "bin",
+                                               subdirectory: "Fixtures"))
+        try FileManager.default.copyItem(at: index, to: url)
         let file = try FileHandle(forWritingTo: url)
         defer { try? file.close() }
-        try file.seek(toOffset: UInt64(ftypSize))
-        try file.write(contentsOf: freeBox)
-        try file.seek(toOffset: UInt64(ftypSize) + padding)
-        try file.write(contentsOf: sample.dropFirst(ftypSize))
+        try file.seek(toOffset: UInt64(1) << 32)
+        try file.write(contentsOf: Data(contentsOf: samples))
     }
 
     func testPickedMovieBeyond4GiBPlaysThroughNormalAndVRDecoderWithoutChangingLibrary() async throws {
@@ -71,26 +60,52 @@ final class PickedFilePlaybackTests: XCTestCase {
         defer { model.close(); window.isHidden = true }
 
         let receive = try XCTUnwrap(engine.onUpdate)
-        let ordinaryFrame = expectation(description: "Native drawable plays samples beyond 4 GiB")
-        let vrFrame = expectation(description: "Reopened VR decoder delivers a frame from the same file")
+        let ordinaryFrame = XCTestExpectation(description: "Native drawable plays samples beyond 4 GiB")
+        let sought = XCTestExpectation(description: "Native clock advances past the requested time")
+        let vrFrame = XCTestExpectation(description: "Reopened VR decoder delivers a frame from the same file")
         var sawOrdinaryFrame = false
+        var seekRequested = false
+        var passedSeek = false
         var sawVRFrame = false
+        var latest = PlaybackSnapshot(phase: .idle)
+        var transitions: [String] = []
+        var previousState = ""
         engine.onUpdate = { state in
             receive(state)
-            guard state.phase == .playing, state.hasVideo, state.seekable, state.seconds > 0 else { return }
-            if host.mode == .standard && !sawOrdinaryFrame {
-                sawOrdinaryFrame = true
-                ordinaryFrame.fulfill()
+            latest = state
+            let flags = "\(host.mode) \(state.phase) seekable=\(state.seekable) video=\(state.hasVideo) duration=\(state.duration)"
+            if flags != previousState {
+                transitions.append("\(flags) at \(state.seconds)")
+                previousState = flags
+            }
+            guard state.phase == .playing, state.hasVideo else { return }
+            if host.mode == .standard {
+                if !sawOrdinaryFrame && state.seekable && state.duration >= 10 && state.seconds > 0 {
+                    sawOrdinaryFrame = true
+                    ordinaryFrame.fulfill()
+                }
+                if seekRequested && !passedSeek && state.seconds >= 5.4 {
+                    passedSeek = true
+                    sought.fulfill()
+                }
             } else if host.mode == .half && !sawVRFrame {
                 sawVRFrame = true
                 vrFrame.fulfill()
             }
         }
+        func diagnostic() -> String {
+            "Latest snapshot \(latest), player message \(model.player.message ?? "none"), transitions \(transitions)"
+        }
         model.player.attach(to: host)
         await fulfillment(of: [ordinaryFrame], timeout: 15)
+        guard sawOrdinaryFrame else { XCTFail(diagnostic()); return }
+        seekRequested = true
+        model.player.seek(to: 5)
+        await fulfillment(of: [sought], timeout: 8)
+        guard passedSeek else { XCTFail(diagnostic()); return }
         host.mode = .half
         await fulfillment(of: [vrFrame], timeout: 15)
-        XCTAssertTrue(sawOrdinaryFrame && sawVRFrame)
+        XCTAssertTrue(sawVRFrame, diagnostic())
         XCTAssertFalse(model.canMove(.next))
         XCTAssertFalse(model.markCurrentForDeletion(expectedRequestID: request.id))
         model.close()

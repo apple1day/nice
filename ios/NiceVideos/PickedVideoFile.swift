@@ -8,13 +8,18 @@ final class PickedVideoFile {
     let byteCount: UInt64
     private let handle: FileHandle
     private let original: stat
-    private let access: ScopedAccess
+    private let selection: Selection
 
-    private final class ScopedAccess {
+    /// Created synchronously by the Files delegate. This same grant survives
+    /// dismissal, asynchronous preparation, and the last decoder that uses it.
+    final class Selection: Identifiable {
+        let url: URL
         private let stop: (() -> Void)?
-        init(url: URL, start: (URL) -> Bool, end: @escaping (URL) -> Void) {
+        init(_ url: URL, startAccess: (URL) -> Bool = { $0.startAccessingSecurityScopedResource() },
+             endAccess: @escaping (URL) -> Void = { $0.stopAccessingSecurityScopedResource() }) {
+            self.url = url
             // URLs already readable in the sandbox may not require a scope.
-            stop = start(url) ? { end(url) } : nil
+            stop = startAccess(url) ? { endAccess(url) } : nil
         }
         deinit { stop?() }
     }
@@ -26,7 +31,7 @@ final class PickedVideoFile {
         return queue
     }()
 
-    private init(url: URL, access: ScopedAccess) throws {
+    private init(url: URL, selection: Selection) throws {
         try Self.validateURL(url)
         let fd = url.withUnsafeFileSystemRepresentation { path in
             path.map { Darwin.open($0, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC) } ?? -1
@@ -41,7 +46,7 @@ final class PickedVideoFile {
         try OfflineMediaPolicy.validateHeader(handle.read(upToCount: 512) ?? Data())
         self.handle = handle
         self.url = url
-        self.access = access
+        self.selection = selection
         original = info
         byteCount = UInt64(info.st_size)
     }
@@ -56,23 +61,21 @@ final class PickedVideoFile {
     }
 
     static func open(_ url: URL) async throws -> PickedVideoFile {
-        try await open(url, startAccess: { $0.startAccessingSecurityScopedResource() },
-                       endAccess: { $0.stopAccessingSecurityScopedResource() })
+        try Task.checkCancellation()
+        return try await open(Selection(url))
     }
 
-    static func open(_ url: URL, startAccess: (URL) -> Bool,
-                     endAccess: @escaping (URL) -> Void) async throws -> PickedVideoFile {
+    static func open(_ selection: Selection) async throws -> PickedVideoFile {
         try Task.checkCancellation()
-        try validateURL(url)
-        let access = ScopedAccess(url: url, start: startAccess, end: endAccess)
+        try validateURL(selection.url)
         let coordinator = NSFileCoordinator(filePresenter: nil)
-        let intent = NSFileAccessIntent.readingIntent(with: url, options: .withoutChanges)
+        let intent = NSFileAccessIntent.readingIntent(with: selection.url, options: .withoutChanges)
         let result: Result<PickedVideoFile, Error> = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 coordinator.coordinate(with: [intent], queue: preparationQueue) { error in
                     continuation.resume(returning: Result {
                         if let error { throw error }
-                        return try PickedVideoFile(url: intent.url, access: access)
+                        return try PickedVideoFile(url: intent.url, selection: selection)
                     })
                 }
                 // Covers cancellation that occurred just before registration.

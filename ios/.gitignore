@@ -6,6 +6,7 @@ DerivedData/
 .DS_Store
 Tests/Fixtures/*.mp4
 Tests/Fixtures/*.mkv
+Tests/Fixtures/*.bin
 Licenses/MobileVLCKit-COPYING.txt
 Licenses/Acknowledgements.txt
 .project-backups/

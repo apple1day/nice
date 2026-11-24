@@ -36,19 +36,42 @@ final class PickedVideoFileTests: XCTestCase {
         XCTAssertEqual(read(source, at: UInt64.max).0, -1)
     }
 
+    func testAbandonedSelectionReleasesGrantWithoutOpeningFile() throws {
+        // There is deliberately no file. Selecting only holds the grant while
+        // the sheet dismisses; cancelling during that interval performs no I/O.
+        let url = try makeFolder().appendingPathComponent("never-opened.mp4")
+        var calls: [String] = []
+        var pending: PickedVideoFile.Selection? = .init(url, startAccess: { selected in
+            XCTAssertEqual(selected, url)
+            calls.append("start")
+            return true
+        }, endAccess: { released in
+            XCTAssertEqual(released, url)
+            calls.append("stop")
+        })
+        XCTAssertEqual(calls, ["start"])
+        XCTAssertEqual(pending?.url, url)
+        pending = nil
+        XCTAssertEqual(calls, ["start", "stop"])
+    }
+
     func testSecurityScopeRemainsUntilFinalOwnerReleasesAndOriginalIsUnchanged() async throws {
         let url = try makeFolder().appendingPathComponent("fixture.mp4")
         let data = Data([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70])
         try data.write(to: url)
         let stopped = expectation(description: "Original URL released once after final owner")
         stopped.assertForOverFulfill = true
-        var opened: PickedVideoFile? = try await PickedVideoFile.open(
-            url, startAccess: { $0 == url }, endAccess: { released in
-                XCTAssertEqual(released, url)
-                stopped.fulfill()
-            })
+        var pending: PickedVideoFile.Selection? = .init(url, startAccess: { $0 == url },
+                                                       endAccess: { released in
+            XCTAssertEqual(released, url)
+            stopped.fulfill()
+        })
+        weak var originalGrant = pending
+        var opened: PickedVideoFile? = try await PickedVideoFile.open(XCTUnwrap(pending))
+        pending = nil
         var decoder = opened
         opened = nil
+        XCTAssertNotNil(originalGrant, "The decoder must keep the picker's original grant")
         XCTAssertEqual(read(try XCTUnwrap(decoder), at: 4).1, [0x66])
         decoder = nil
         await fulfillment(of: [stopped], timeout: 5)
@@ -76,10 +99,11 @@ final class PickedVideoFileTests: XCTestCase {
         let stopped = expectation(description: "Scope released after header validation error")
         stopped.assertForOverFulfill = true
         do {
-            _ = try await PickedVideoFile.open(url, startAccess: { _ in true }, endAccess: { released in
+            let selection = PickedVideoFile.Selection(url, startAccess: { _ in true }, endAccess: { released in
                 XCTAssertEqual(released, url)
                 stopped.fulfill()
             })
+            _ = try await PickedVideoFile.open(selection)
             XCTFail("A renamed playlist was accepted")
         } catch OfflineMediaPolicy.Failure.playlist {}
         await fulfillment(of: [stopped], timeout: 5)
@@ -88,8 +112,8 @@ final class PickedVideoFileTests: XCTestCase {
     func testAlreadyReadableFileDoesNotStopAnUnacquiredScope() async throws {
         let url = try makeFolder().appendingPathComponent("local.avi")
         try Data([1, 2, 3]).write(to: url)
-        var file: PickedVideoFile? = try await PickedVideoFile.open(url, startAccess: { _ in false },
-                                                                   endAccess: { _ in XCTFail("unbalanced stop") })
+        var file: PickedVideoFile? = try await PickedVideoFile.open(.init(url, startAccess: { _ in false },
+                                                                        endAccess: { _ in XCTFail("unbalanced stop") }))
         XCTAssertEqual(file?.byteCount, 3)
         file = nil
     }
@@ -110,8 +134,8 @@ final class PickedVideoFileTests: XCTestCase {
         let started = expectation(description: "Security scope acquired")
         let ended = expectation(description: "Security scope balanced on cancellation")
         let task = Task {
-            try await PickedVideoFile.open(url, startAccess: { _ in started.fulfill(); return true },
-                                           endAccess: { _ in ended.fulfill() })
+            try await PickedVideoFile.open(.init(url, startAccess: { _ in started.fulfill(); return true },
+                                                endAccess: { _ in ended.fulfill() }))
         }
         await fulfillment(of: [started], timeout: 5)
         task.cancel()
@@ -123,16 +147,19 @@ final class PickedVideoFileTests: XCTestCase {
         await fulfillment(of: [ended], timeout: 5)
     }
 
-    func testCancellationBeforeOpeningNeverStartsScope() async throws {
+    func testCancelledPreparationReleasesSelectionWithoutOpeningFile() async throws {
         let url = try makeFolder().appendingPathComponent("some.mkv")
+        let stopped = expectation(description: "Pre-acquired scope released")
         let task = Task {
+            let selection = PickedVideoFile.Selection(url, startAccess: { _ in true },
+                                                     endAccess: { _ in stopped.fulfill() })
             withUnsafeCurrentTask { $0?.cancel() }
-            return try await PickedVideoFile.open(url, startAccess: { _ in XCTFail("opened after cancel"); return true },
-                                                 endAccess: { _ in XCTFail("unexpected stop") })
+            return try await PickedVideoFile.open(selection)
         }
         do {
             _ = try await task.value
             XCTFail("Cancelled file request succeeded")
         } catch is CancellationError {}
+        await fulfillment(of: [stopped], timeout: 5)
     }
 }

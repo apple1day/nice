@@ -139,6 +139,7 @@ DEVICE_ID="模拟器UUID" bash ios/test.sh
   以及生产播放器中正反拖动、暂停、全屏、横屏和切换视频后的真实触摸。
 - `PlaybackAutoplayUITests`：在真实播放器视图中用确定性的结束事件验证自动切换后继续播放，
   并验证播放列表最后一条结束后不会循环。
+- `PickedVideoFileTests`、`PickedFilePlaybackTests` 和 `LocalFilePickerUITests` 覆盖文件授权与取消、从空片库打开系统文件选择器，以及从 4 GiB 之后读取音视频样本并切换 VR。
 - `VLCDecodeTests`：直接使用固定版本的真实 VLC 内核，在模拟器窗口中解码本地 MP4/MKV，
   验证 `hasVideoOut` 且播放时间前进；再次验证引擎拒绝 HTTP 地址。
 
