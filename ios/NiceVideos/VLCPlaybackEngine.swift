@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import CoreVideo
 import MobileVLCKit
 import ObjectiveC
 
@@ -57,6 +58,7 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     private let playerResource: BackgroundPlaybackResource<VLCMediaPlayer>
     private weak var nativeLifetime: BackgroundPlaybackResource<NSObject>?
     private var player: VLCMediaPlayer? { playerResource.resource }
+    private let frameDelivery: NICEVLCFrameDelivery?
     private var stopped = false
     private var loaded = false
 
@@ -68,8 +70,12 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     private var timePublishScheduled = false
     private var seekGate = SeekFeedbackGate()
 
-    override init() {
-        let construction = NICEVLCPlayerConstruction(options: ["--no-video-title-show", "--no-metadata-network-access"])
+    override convenience init() { self.init(frameHandler: nil) }
+
+    init(frameHandler: ((CVPixelBuffer) -> Void)?) {
+        let construction = NICEVLCPlayerConstruction(options: ["--no-video-title-show", "--no-metadata-network-access"],
+                                                     frameHandler: frameHandler)
+        frameDelivery = construction?.frameDelivery
         playerResource = BackgroundPlaybackResource(construction?.player)
         super.init()
         if let construction {
@@ -84,16 +90,22 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
         player?.delegate = self
     }
     func attach(to view: UIView) {
-        guard !stopped, let player else { return }
+        guard !stopped, frameDelivery == nil, let player else { return }
         nativeLifetime?.keepAlive(view)
         player.drawable = view
     }
     func load(fileURL: URL) throws {
+        try load(fileURL: fileURL, startAt: 0, paused: false)
+    }
+    func load(fileURL: URL, startAt seconds: Double, paused: Bool) throws {
         guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
         guard let player else { throw ClientError("播放器初始化失败，请关闭后重新打开视频。") }
         // Check again immediately before giving VLC a file, even for non-store callers.
         try OfflineMediaPolicy.validateLocalFile(fileURL)
-        player.media = VLCMedia(path: fileURL.path)
+        let media = VLCMedia(path: fileURL.path)
+        if seconds.isFinite && seconds > 0 { media.addOption(":start-time=\(seconds)") }
+        if paused { media.addOption(":start-paused") }
+        player.media = media
         loaded = true
     }
     func play() { if loaded && !stopped { player?.play() } }
@@ -121,6 +133,7 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     func stop() {
         guard !stopped else { return }
         stopped = true
+        frameDelivery?.invalidate()
         player?.delegate = nil
         onUpdate = nil
         callbackLock.lock()

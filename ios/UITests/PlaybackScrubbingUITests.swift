@@ -45,6 +45,36 @@ import XCTest
         XCTAssertEqual(element("uiTestPlaybackPhase").label, "paused")
     }
 
+    func testSBSFormatSwitchKeepsPausedPositionAndExitsFullscreen() throws {
+        try ensureControlsVisible()
+        element("togglePlaybackButton").tap()
+        waitUntil("Pause before changing the video format") {
+            self.element("uiTestPlaybackPhase").label == "paused"
+        }
+        let pausedAt = try number("uiTestPlaybackSeconds")
+        let formats = element("videoFormatButton")
+        let fullscreen = element("toggleFullscreenButton")
+        XCTAssertEqual(formats.value as? String, "普通播放")
+        for (choice, value, fullscreenValue) in [
+            ("半宽 SBS（Half SBS）", "半宽 SBS", "全屏"),
+            ("全宽 SBS（Full SBS）", "全宽 SBS", "全屏"),
+            ("退出 VR，普通播放", "普通播放", "普通")
+        ] {
+            formats.tap()
+            let option = app.buttons[choice]
+            XCTAssertTrue(option.waitForExistence(timeout: 5))
+            option.tap()
+            waitUntil("Selected format should update both controls") {
+                formats.value as? String == value && fullscreen.value as? String == fullscreenValue
+            }
+            XCTAssertEqual(element("uiTestPlaybackPhase").label, "paused")
+            XCTAssertEqual(try number("uiTestPlaybackSeconds"), pausedAt, accuracy: 0.01)
+        }
+        XCTAssertEqual(try integer("uiTestAttachCount"), 1)
+        XCTAssertEqual(try integer("uiTestLoadCount"), 1)
+        XCTAssertEqual(try integer("uiTestStopCount"), 0)
+    }
+
     func testFullscreenLandscapeAndNextVideoKeepDraggingAvailable() throws {
         try ensureControlsVisible()
         element("toggleFullscreenButton").tap()

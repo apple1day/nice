@@ -1,7 +1,16 @@
 #import <Foundation/Foundation.h>
+#import <CoreVideo/CoreVideo.h>
 #import <MobileVLCKit/VLCMediaPlayer.h>
 
 NS_ASSUME_NONNULL_BEGIN
+
+typedef void (^NICEVLCFrameHandler)(CVPixelBufferRef frame);
+
+@interface NICEVLCFrameDelivery : NSObject
+// Called on the main queue when retiring playback, before VLC stops asynchronously.
+- (void)invalidate;
+- (instancetype)init NS_UNAVAILABLE;
+@end
 
 // Creates the player through VLCKit's public native-instance initializer.
 // The independent nativeReference must outlive the ObjC player and must be
@@ -9,7 +18,10 @@ NS_ASSUME_NONNULL_BEGIN
 @interface NICEVLCPlayerConstruction : NSObject
 @property (nonatomic, strong, readonly) VLCMediaPlayer *player;
 @property (nonatomic, strong, readonly) NSObject *nativeReference;
-- (nullable instancetype)initWithOptions:(NSArray<NSString *> *)options NS_DESIGNATED_INITIALIZER;
+@property (nonatomic, strong, readonly, nullable) NICEVLCFrameDelivery *frameDelivery;
+- (nullable instancetype)initWithOptions:(NSArray<NSString *> *)options;
+- (nullable instancetype)initWithOptions:(NSArray<NSString *> *)options
+                           frameHandler:(nullable NICEVLCFrameHandler)handler NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 @end
 

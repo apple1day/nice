@@ -25,7 +25,7 @@ final class PlaylistPlaybackModel: ObservableObject {
     private var closed = false
 
     init(request: PlaybackRequest, store: VideoStore,
-         engineFactory: @escaping () -> LocalPlaybackEngine = { VLCPlaybackEngine() },
+         engineFactory: @escaping () -> LocalPlaybackEngine = { SBSPlaybackEngine() },
          defaults: UserDefaults = .standard, manageAudioSession: Bool = true,
          requestResolver: ((String) throws -> PlaybackRequest)? = nil) {
         self.store = store

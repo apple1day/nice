@@ -33,7 +33,7 @@ final class PlaybackModel: ObservableObject {
     init(request: PlaybackRequest, engine: LocalPlaybackEngine? = nil,
          defaults: UserDefaults = .standard, manageAudioSession: Bool = true) {
         self.request = request
-        self.engine = engine ?? VLCPlaybackEngine()
+        self.engine = engine ?? SBSPlaybackEngine()
         self.defaults = defaults
         self.manageAudioSession = manageAudioSession
         self.engine.onUpdate = { [weak self] snapshot in self?.receive(snapshot) }
@@ -274,17 +274,18 @@ final class PlaybackModel: ObservableObject {
 
 private struct VLCVideoSurface: UIViewRepresentable {
     let model: PlaybackModel
+    let mode: SBSDisplayMode
     func makeCoordinator() -> PlaybackModel { model }
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
-        view.backgroundColor = .black
+    func makeUIView(context: Context) -> SBSPlaybackView {
+        let view = SBSPlaybackView(frame: .zero)
+        view.mode = mode
         DispatchQueue.main.async { [weak model, weak view] in
-            if let view = view { model?.attach(to: view) }
+            if let view { model?.attach(to: view) }
         }
         return view
     }
-    func updateUIView(_ view: UIView, context: Context) {}
-    static func dismantleUIView(_ view: UIView, coordinator: PlaybackModel) { coordinator.close() }
+    func updateUIView(_ view: SBSPlaybackView, context: Context) { view.mode = mode }
+    static func dismantleUIView(_ view: SBSPlaybackView, coordinator: PlaybackModel) { coordinator.close() }
 }
 
 // Draft changes stay in this small view, without store/playlist traversal or
@@ -375,9 +376,12 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     // to cancel the current native tracking session synchronously before actions.
     @State private var scrubber = PlaybackScrubController()
     @State private var showsPlaylist = false
+    @State private var showsVideoFormats = false
+    @State private var displayMode: SBSDisplayMode = .standard
     private var request: PlaybackRequest { playlist.current }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
-    private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist }
+    private var isFullscreen: Bool { controls.isFullscreen || displayMode != .standard }
+    private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist || showsVideoFormats }
     private var showsPause: Bool { model.phase == .playing || model.phase == .opening }
     private var canInteract: Bool { scenePhase == .active && store.errorMessage == nil && !showsPlaylist }
     private var transportButtonStyle: PlaybackTransportButtonStyle {
@@ -391,10 +395,10 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             GeometryReader { proxy in
                 ZStack {
                     Color.black.ignoresSafeArea()
-                    VLCVideoSurface(model: model)
+                    VLCVideoSurface(model: model, mode: displayMode)
                         .id(request.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .ignoresSafeArea(.container, edges: controls.isFullscreen ? .all : [])
+                        .ignoresSafeArea(.container, edges: isFullscreen ? .all : [])
                         .allowsHitTesting(false)
                         .accessibilityIdentifier("offlineVideoSurface")
                     // Tap-only surface: no vertical paging, previews or delayed switches.
@@ -409,7 +413,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                         .accessibilityIdentifier("playbackSurfaceToggle")
                 }
                 .overlay(alignment: .top) {
-                    if controls.isFullscreen {
+                    if isFullscreen {
                         fullscreenHeader
                             .opacity(controls.isVisible ? 1 : 0)
                             .allowsHitTesting(controls.isVisible)
@@ -427,7 +431,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             .background(.black)
             .navigationTitle(request.title)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar(controls.isFullscreen ? .hidden : .visible, for: .navigationBar)
+            .toolbar(isFullscreen ? .hidden : .visible, for: .navigationBar)
             .toolbarBackground(.black, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
@@ -441,8 +445,8 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             }
         }
         .preferredColorScheme(.dark)
-        .statusBarHidden(controls.isFullscreen)
-        .persistentSystemOverlays(controls.isFullscreen && !controls.isVisible ? .hidden : .automatic)
+        .statusBarHidden(isFullscreen)
+        .persistentSystemOverlays(isFullscreen && !controls.isVisible ? .hidden : .automatic)
         .sheet(isPresented: $showsPlaylist) { playlistSheet }
         .alert("操作提示", isPresented: Binding(
             get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } }
@@ -527,6 +531,9 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     }
     private func transportControls(isLandscape: Bool) -> some View {
         VStack(spacing: 4) {
+            if displayMode != .standard && !isLandscape {
+                Text("请将手机横放后放入 VR 眼镜").font(.caption)
+            }
             if model.phase == .opening { ProgressView("打开本地文件…").tint(.white).font(.caption) }
             if let message = model.message { Text(message).font(.caption).foregroundStyle(.red).lineLimit(2) }
             if let notice = playlist.notice ?? store.deletionNotice {
@@ -545,6 +552,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                 .disabled(!canInteract)
                 .accessibilityLabel("本地播放列表 \(playlist.positionLabel)")
                 .accessibilityIdentifier("openLocalPlaylistButton")
+                videoFormatButton
                 Spacer(minLength: 4)
                 if !isLandscape { navigationButton(.next, compact: false) }
             }
@@ -578,13 +586,13 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                 if isLandscape {
                     navigationButton(.next, compact: true).frame(minWidth: 0, maxWidth: .infinity)
                 }
-                Button { performTransportAction { controls.toggleFullscreen(at: now) } } label: {
-                    Image(systemName: controls.isFullscreen
+                Button { performTransportAction(toggleFullscreen) } label: {
+                    Image(systemName: isFullscreen
                           ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                         .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52).contentShape(Rectangle())
                 }.disabled(!canInteract)
-                    .accessibilityLabel(controls.isFullscreen ? "退出全屏" : "全屏播放")
-                    .accessibilityValue(controls.isFullscreen ? "全屏" : "普通")
+                    .accessibilityLabel(isFullscreen ? "退出全屏" : "全屏播放")
+                    .accessibilityValue(isFullscreen ? "全屏" : "普通")
                     .accessibilityIdentifier("toggleFullscreenButton")
                     .frame(minWidth: 0, maxWidth: .infinity)
             }.font(.title2)
@@ -601,6 +609,31 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         .buttonStyle(transportButtonStyle)
         // Keep identifiers on leaf controls. An identifier on this container
         // replaces its descendants' identifiers in SwiftUI's accessibility tree.
+    }
+    private func toggleFullscreen() {
+        if controls.isFullscreen || displayMode == .standard { controls.toggleFullscreen(at: now) }
+        displayMode = .standard
+    }
+
+    private var videoFormatButton: some View {
+        Button { performTransportAction { showsVideoFormats = true } } label: {
+            Text(displayMode == .standard ? "VR" : "VR ✓")
+                .font(.subheadline.bold())
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .disabled(!canInteract)
+        .accessibilityLabel("VR 播放格式")
+        .accessibilityValue(displayMode == .standard ? "普通播放" : (displayMode == .half ? "半宽 SBS" : "全宽 SBS"))
+        .accessibilityIdentifier("videoFormatButton")
+        .confirmationDialog("左右分屏播放格式", isPresented: $showsVideoFormats, titleVisibility: .visible) {
+            Button("半宽 SBS（Half SBS）") { displayMode = .half }
+            Button("全宽 SBS（Full SBS）") { displayMode = .full }
+            if displayMode != .standard { Button("退出 VR，普通播放") { displayMode = .standard } }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("按片源选择格式。每只眼的画面被横向压缩时选半宽，保持原比例时选全宽。")
+        }
     }
     private var transportFavoriteButton: some View {
         let favorite = playlist.currentEntry?.isFavorite == true
