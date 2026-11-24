@@ -34,7 +34,7 @@ final class SBSPlaybackEngineTests: XCTestCase {
         engine.pause()
         let before = latest.seconds
         for mode in [SBSDisplayMode.half, .standard] {
-            let paused = expectation(description: "Reopened MKV stays paused with a valid video output")
+            let paused = expectation(description: "Reopened MKV stays paused with a valid video output in \(mode)")
             var pausedOnce = false
             engine.onUpdate = { state in
                 latest = state
@@ -45,7 +45,12 @@ final class SBSPlaybackEngineTests: XCTestCase {
             }
             host.mode = mode
             await fulfillment(of: [paused], timeout: 15)
+            XCTAssertTrue(pausedOnce, "mode=\(mode) latest=\(latest)")
             XCTAssertEqual(latest.seconds, before, accuracy: 0.45)
+            let pausedAt = latest.seconds
+            try await Task.sleep(nanoseconds: 300_000_000)
+            XCTAssertEqual(latest.phase, .paused)
+            XCTAssertEqual(latest.seconds, pausedAt, accuracy: 0.15)
             if mode == .half {
                 let renderer = try XCTUnwrap(host.renderer)
                 host.mode = .full

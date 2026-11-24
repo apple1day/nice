@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import <MobileVLCKit/VLCMedia.h>
 #import <MobileVLCKit/VLCMediaPlayer.h>
 
 NS_ASSUME_NONNULL_BEGIN
@@ -7,6 +8,10 @@ NS_ASSUME_NONNULL_BEGIN
 typedef void (^NICEVLCFrameHandler)(CVPixelBufferRef frame);
 
 @interface NICEVLCFrameDelivery : NSObject
+// Assigned before starting the local media. The decoder thread reads its
+// track metadata once when negotiating a new video output format.
+@property (atomic, strong, nullable) VLCMedia *sourceMedia;
+@property (atomic, readonly) BOOL hasDeliveredFrame;
 // Called on the main queue when retiring playback, before VLC stops asynchronously.
 - (void)invalidate;
 - (instancetype)init NS_UNAVAILABLE;

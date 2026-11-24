@@ -9,4 +9,4 @@ ffmpeg -hide_banner -loglevel error -y -i offline.mp4 -c:v mpeg4 -q:v 5 -c:a cop
 # Each eye has an unambiguous color so a decoder test can detect eye/channel swaps.
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -i 'color=c=red:size=128x96:rate=12' -f lavfi -i 'color=c=blue:size=128x96:rate=12' \
-  -filter_complex hstack -t 2 -c:v libx264 -pix_fmt yuv420p -movflags +faststart sbs.mp4
+  -filter_complex 'hstack,setsar=3/2' -t 2 -c:v libx264 -pix_fmt yuv420p -movflags +faststart sbs.mp4

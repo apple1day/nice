@@ -4,19 +4,22 @@
 #import <MobileVLCKit/vlc/libvlc_picture.h>
 #import <MobileVLCKit/vlc/libvlc_media.h>
 #import <MobileVLCKit/vlc/libvlc_media_player.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
 
 @interface NICEVLCFrameDelivery ()
 - (instancetype)initWithHandler:(NICEVLCFrameHandler)handler;
-- (void)enqueue:(CVPixelBufferRef)frame;
+- (void)enqueue:(CVPixelBufferRef)frame forMedia:(VLCMedia *)media;
 @end
 
 @implementation NICEVLCFrameDelivery {
     NICEVLCFrameHandler _handler;
     CVPixelBufferRef _pending;
     BOOL _scheduled;
+    VLCMedia *_sourceMedia;
+    BOOL _hasDeliveredFrame;
 }
 
 - (instancetype)initWithHandler:(NICEVLCFrameHandler)handler {
@@ -25,9 +28,26 @@
     return self;
 }
 
-- (void)enqueue:(CVPixelBufferRef)frame {
+- (VLCMedia *)sourceMedia {
+    @synchronized (self) { return _sourceMedia; }
+}
+
+- (void)setSourceMedia:(VLCMedia *)media {
     @synchronized (self) {
-        if (!_handler) { return; }
+        _sourceMedia = media;
+        _hasDeliveredFrame = NO;
+        if (_pending) { CVPixelBufferRelease(_pending); }
+        _pending = NULL;
+    }
+}
+
+- (BOOL)hasDeliveredFrame {
+    @synchronized (self) { return _hasDeliveredFrame; }
+}
+
+- (void)enqueue:(CVPixelBufferRef)frame forMedia:(VLCMedia *)media {
+    @synchronized (self) {
+        if (!_handler || media != _sourceMedia) { return; }
         if (_pending) { CVPixelBufferRelease(_pending); }
         _pending = CVPixelBufferRetain(frame);
         if (_scheduled) { return; }
@@ -41,6 +61,7 @@
             self->_pending = NULL;
             self->_scheduled = NO;
             handler = self->_handler;
+            if (handler && frameToDraw) { self->_hasDeliveredFrame = YES; }
         }
         if (frameToDraw) {
             if (handler) { handler(frameToDraw); }
@@ -62,11 +83,49 @@
 }
 @end
 
+typedef struct {
+    unsigned width, height;
+    double pixelAspect;
+} NICEFrameGeometry;
+
+static NICEFrameGeometry NICEVisibleGeometry(VLCMedia *media, unsigned codedWidth, unsigned codedHeight) {
+    // VLC 3 passes the codec allocation (e.g. 256x98 for a 256x96 movie)
+    // to vmem. Its public track API separately exposes the visible dimensions.
+    const NICEFrameGeometry fallback = { codedWidth, codedHeight, 1 };
+    NICEFrameGeometry visible = fallback;
+    unsigned bestPadding = UINT_MAX;
+    for (NSDictionary *track in media.tracksInformation) {
+        if (![track[VLCMediaTracksInformationType] isEqual:VLCMediaTracksInformationTypeVideo]) { continue; }
+        unsigned w = [track[VLCMediaTracksInformationVideoWidth] unsignedIntValue];
+        unsigned h = [track[VLCMediaTracksInformationVideoHeight] unsignedIntValue];
+        unsigned sarW = [track[VLCMediaTracksInformationSourceAspectRatio] unsignedIntValue];
+        unsigned sarH = [track[VLCMediaTracksInformationSourceAspectRatioDenominator] unsignedIntValue];
+        if ([track[VLCMediaTracksInformationVideoOrientation] unsignedIntValue] >= VLCMediaOrientationLeftTop) {
+            // vmem applies the track rotation before calling the setup callback.
+            unsigned temp = w; w = h; h = temp;
+            temp = sarW; sarW = sarH; sarH = temp;
+        }
+        // Match this vout, ignoring unrelated video tracks and metadata from a
+        // different coded resolution if a stream changes dimensions mid-file.
+        if (!w || !h || w > codedWidth || h > codedHeight ||
+            codedWidth - w > 127 || codedHeight - h > 127) { continue; }
+        unsigned padding = codedWidth - w + codedHeight - h;
+        double par = (sarW && sarH) ? (double)sarW / sarH : 1;
+        if (padding < bestPadding) {
+            bestPadding = padding;
+            visible = (NICEFrameGeometry){ w, h, par };
+        } else if (padding == bestPadding && (visible.width != w || visible.height != h || visible.pixelAspect != par)) {
+            visible = fallback;
+        }
+    }
+    return visible;
+}
+
 // One instance per negotiated vout format. The VLC 3 vmem plugin runs its
 // lock/unlock (Prepare), display and cleanup serially for this specific vout.
 @interface NICEVLCFrameFormat : NSObject
 @property (nonatomic, readonly) size_t pitch;
-- (instancetype)initWithWidth:(unsigned)width height:(unsigned)height delivery:(NICEVLCFrameDelivery *)delivery;
+- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry source:(VLCMedia *)source delivery:(NICEVLCFrameDelivery *)delivery;
 - (void *)lockPlane:(void **)planes;
 - (void)unlockPicture:(void *)picture;
 - (void)displayPicture:(void *)picture;
@@ -74,17 +133,25 @@
 
 @implementation NICEVLCFrameFormat {
     NICEVLCFrameDelivery *_delivery;
+    VLCMedia *_source;
     CVPixelBufferPoolRef _pool;
     CVPixelBufferRef _scratch;
     void *_scratchBase;
     CVPixelBufferRef _picture;
     NSDictionary *_poolLimits;
+    NSDictionary *_displayDimensions;
 }
 
-- (instancetype)initWithWidth:(unsigned)width height:(unsigned)height delivery:(NICEVLCFrameDelivery *)delivery {
+- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry source:(VLCMedia *)source delivery:(NICEVLCFrameDelivery *)delivery {
     self = [super init];
     if (!self) { return nil; }
     _delivery = delivery;
+    _source = source;
+    unsigned width = geometry.width, height = geometry.height;
+    _displayDimensions = @{
+        (__bridge NSString *)kCVImageBufferDisplayWidthKey: @(width * geometry.pixelAspect),
+        (__bridge NSString *)kCVImageBufferDisplayHeightKey: @(height)
+    };
     NSDictionary *attributes = @{
         (__bridge NSString *)kCVPixelBufferWidthKey: @(width),
         (__bridge NSString *)kCVPixelBufferHeightKey: @(height),
@@ -142,7 +209,9 @@
 
 - (void)displayPicture:(void *)picture {
     if (picture && picture == _picture) {
-        [_delivery enqueue:_picture];
+        CVBufferSetAttachment(_picture, kCVImageBufferDisplayDimensionsKey,
+                              (__bridge CFDictionaryRef)_displayDimensions, kCVAttachmentMode_ShouldPropagate);
+        [_delivery enqueue:_picture forMedia:_source];
         CVPixelBufferRelease(_picture);
         _picture = NULL;
     }
@@ -160,12 +229,14 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
                                unsigned *pitches, unsigned *lines) {
     @autoreleasepool {
         if (*width == 0 || *height == 0) { return 0; }
+        NICEVLCFrameDelivery *delivery = (__bridge NICEVLCFrameDelivery *)*opaque;
+        VLCMedia *source = delivery.sourceMedia;
+        NICEFrameGeometry geometry = NICEVisibleGeometry(source, *width, *height);
         // Bound the CPU color conversion and IOSurface allocations for 4K/8K sources.
-        const double scale = MIN(1.0, 2560.0 / MAX(*width, *height));
-        *width = (unsigned)MAX(1.0, round(*width * scale));
-        *height = (unsigned)MAX(1.0, round(*height * scale));
-        NICEVLCFrameFormat *format = [[NICEVLCFrameFormat alloc] initWithWidth:*width height:*height
-                                                                     delivery:(__bridge NICEVLCFrameDelivery *)*opaque];
+        const double scale = MIN(1.0, 2560.0 / MAX(geometry.width, geometry.height));
+        *width = geometry.width = (unsigned)MAX(1.0, round(geometry.width * scale));
+        *height = geometry.height = (unsigned)MAX(1.0, round(geometry.height * scale));
+        NICEVLCFrameFormat *format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry source:source delivery:delivery];
         if (!format) { return 0; }
         memcpy(chroma, "BGRA", 4);
         pitches[0] = (unsigned)format.pitch;

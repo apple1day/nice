@@ -25,17 +25,21 @@ import XCTest
         let height = CVPixelBufferGetHeight(frame)
         XCTAssertEqual(width, 256)
         XCTAssertEqual(height, 96)
+        let display = CVImageBufferGetDisplaySize(frame)
+        XCTAssertEqual(display.width / display.height, 4, accuracy: 0.01) // 256:96, with 3:2 pixels
         guard CVPixelBufferLockBaseAddress(frame, .readOnly) == kCVReturnSuccess else {
             return XCTFail("Could not inspect the decoded eye colors")
         }
         defer { CVPixelBufferUnlockBaseAddress(frame, .readOnly) }
         let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(frame)).assumingMemoryBound(to: UInt8.self)
-        let row = height / 2 * CVPixelBufferGetBytesPerRow(frame)
-        let left = row + (width / 4) * 4
-        let right = row + (3 * width / 4) * 4
-        XCTAssertGreaterThan(bytes[left + 2], 180) // red left eye
-        XCTAssertLessThan(bytes[left], 60)
-        XCTAssertGreaterThan(bytes[right], 180) // blue right eye
-        XCTAssertLessThan(bytes[right + 2], 60)
+        for y in [0, height / 2, height - 1] {
+            let row = y * CVPixelBufferGetBytesPerRow(frame)
+            let left = row + (width / 4) * 4
+            let right = row + (3 * width / 4) * 4
+            XCTAssertGreaterThan(bytes[left + 2], 180) // red left eye
+            XCTAssertLessThan(bytes[left], 60)
+            XCTAssertGreaterThan(bytes[right], 180) // blue right eye
+            XCTAssertLessThan(bytes[right + 2], 60)
+        }
     }
 }

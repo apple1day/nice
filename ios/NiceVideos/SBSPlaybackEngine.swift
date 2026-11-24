@@ -145,7 +145,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
             awaitingOutput = resume
             pendingSeek = nil
             try session.load(fileURL: file, startAt: seconds, paused: openingPaused)
-            if resume { session.play() }
+            if resume { session.play(waitForPausedFrame: openingPaused) }
         } catch {
             // This can happen if the local file disappears while the clip is open.
             phase = .failed

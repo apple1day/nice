@@ -61,6 +61,8 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     private let frameDelivery: NICEVLCFrameDelivery?
     private var stopped = false
     private var loaded = false
+    private var pausedPreviewDeadline: TimeInterval?
+    private var needsPausedFrame = false
 
     // VLC may fire timeChanged very frequently around a seek. Enqueuing every
     // callback onto the main queue can visibly stall SwiftUI and make the slider
@@ -105,10 +107,19 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
         let media = VLCMedia(path: fileURL.path)
         if seconds.isFinite && seconds > 0 { media.addOption(":start-time=\(seconds)") }
         if paused { media.addOption(":start-paused") }
+        frameDelivery?.sourceMedia = media
+        pausedPreviewDeadline = nil
         player.media = media
         loaded = true
     }
-    func play() { if loaded && !stopped { player?.play() } }
+    func play() { play(waitForPausedFrame: false) }
+    func play(waitForPausedFrame: Bool) {
+        guard loaded && !stopped else { return }
+        needsPausedFrame = waitForPausedFrame
+        pausedPreviewDeadline = waitForPausedFrame ? ProcessInfo.processInfo.systemUptime + 10 : nil
+        player?.play()
+        if waitForPausedFrame { scheduleTimePublish(after: 0.1) }
+    }
     func pause() { if loaded && !stopped { player?.pause() } }
     func seek(to seconds: Double) {
         guard !stopped, let player else { return }
@@ -175,6 +186,21 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
 
     private func publishNow() {
         guard !stopped, let snapshot = makeSnapshot() else { return }
+        if let deadline = pausedPreviewDeadline {
+            // Paused inputs do not emit clock ticks. VLCKit 3.x does not
+            // forward vout/seekable readiness as a delegate callback either.
+            if snapshot.phase == .failed || snapshot.phase == .ended || ProcessInfo.processInfo.systemUptime >= deadline {
+                pausedPreviewDeadline = nil
+            } else if needsPausedFrame, player?.hasVideoOut == true, player?.isSeekable == true {
+                needsPausedFrame = false
+                if frameDelivery?.hasDeliveredFrame != true { player?.gotoNextFrame() }
+                scheduleTimePublish(after: 0.1)
+            } else if snapshot.hasVideo && snapshot.seekable && snapshot.duration > 0 {
+                pausedPreviewDeadline = nil
+            } else {
+                scheduleTimePublish(after: 0.1)
+            }
+        }
         // No borrowed native player reference is held while clients receive an
         // update: a client may close or switch the player from this callback.
         onUpdate?(snapshot)
@@ -203,7 +229,7 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
             seconds: displayedSeconds,
             duration: max(0, Double(player.media?.length.intValue ?? 0) / 1000),
             seekable: player.isSeekable,
-            hasVideo: player.hasVideoOut,
+            hasVideo: frameDelivery?.hasDeliveredFrame ?? player.hasVideoOut,
             error: phase == .failed ? "VLC 无法解码这个本地文件。请检查文件是否损坏、编码是否受支持，必要时重新下载。" : nil
         )
     }
