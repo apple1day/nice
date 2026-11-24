@@ -12,7 +12,7 @@ final class PickedFilePlaybackTests: XCTestCase {
                                              subdirectory: "Fixtures"))
         let samples = try XCTUnwrap(bundle.url(forResource: "co64-samples", withExtension: "bin",
                                                subdirectory: "Fixtures"))
-        try FileManager.default.copyItem(at: index, to: url)
+        try Data(contentsOf: index).write(to: url)
         let file = try FileHandle(forWritingTo: url)
         defer { try? file.close() }
         try file.seek(toOffset: UInt64(1) << 32)
