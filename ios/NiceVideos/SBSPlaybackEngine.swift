@@ -49,6 +49,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
     private var hasStarted = false
     private var wantsPlayback = false
     private var openingPaused = false
+    private var awaitingOutput = false
+    private var pendingSeek: Double?
     private var stopped = false
 
     func attach(to view: UIView) {
@@ -76,22 +78,36 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
         session = newSession
         newSession.onUpdate = { [weak self] snapshot in
             guard let self, !self.stopped else { return }
+            // A stopped event may trail EOF. Only an explicit reload can
+            // restart that input, including when changing output at the end.
+            if self.phase == .ended || self.phase == .failed { return }
             var visible = snapshot
-            if self.openingPaused {
-                // Opening a paused file can first report .opening/.playing. Keep
-                // controls paused and never toggle native audio on to get a frame.
-                if snapshot.phase == .paused {
-                    self.openingPaused = false
-                    if self.wantsPlayback { self.session?.play() }
-                } else if !self.wantsPlayback && (snapshot.phase == .opening || snapshot.phase == .playing) {
-                    visible.phase = .paused
-                }
+            if self.openingPaused && snapshot.phase == .paused {
+                self.openingPaused = false
+                if self.wantsPlayback { self.session?.play() }
             }
-            // Until a reopened input reports a timestamp, keep the displayed
-            // position even if the user rapidly switches the output again.
-            if visible.seconds == 0, self.seconds > 0,
-               visible.phase == .opening || visible.phase == .paused || visible.phase == .playing {
-                visible.seconds = self.seconds
+            if self.hasStarted && !self.wantsPlayback &&
+                (snapshot.phase == .opening || snapshot.phase == .playing) {
+                // A pause requested before VLC's input opened may have been
+                // ignored; honor it as soon as the decoder reports playing.
+                if snapshot.phase == .playing && !self.openingPaused { self.session?.pause() }
+                visible.phase = .paused
+            }
+            if self.awaitingOutput {
+                // SwiftUI can deliver a seek while the replacement decoder is
+                // opening. Commit the latest request when it becomes seekable.
+                if let target = self.pendingSeek {
+                    visible.seconds = target
+                    if snapshot.seekable && snapshot.duration > 0 {
+                        self.pendingSeek = nil
+                        self.session?.seek(to: target)
+                        self.awaitingOutput = false
+                    }
+                } else if snapshot.seconds == 0 && self.seconds > 0 {
+                    visible.seconds = self.seconds
+                } else if snapshot.seekable && snapshot.duration > 0 {
+                    self.awaitingOutput = false
+                }
             }
             self.seconds = visible.seconds
             self.phase = visible.phase
@@ -126,12 +142,14 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
         do {
             let resume = hasStarted && phase != .ended && phase != .failed
             openingPaused = resume && !wantsPlayback
+            awaitingOutput = resume
+            pendingSeek = nil
             try session.load(fileURL: file, startAt: seconds, paused: openingPaused)
             if resume { session.play() }
         } catch {
             // This can happen if the local file disappears while the clip is open.
             phase = .failed
-            let failure = PlaybackSnapshot(phase: .failed, error: error.localizedDescription)
+            let failure = PlaybackSnapshot(phase: .failed, error: "切换播放格式失败，请关闭并重新打开视频。\n" + error.localizedDescription)
             DispatchQueue.main.async { [weak self, weak session] in
                 guard let self, self.session === session, !self.stopped else { return }
                 self.onUpdate?(failure)
@@ -146,6 +164,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
         seconds = 0
         phase = .idle
         openingPaused = false
+        awaitingOutput = false
+        pendingSeek = nil
         hasStarted = false
     }
 
@@ -164,7 +184,11 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
     func seek(to position: Double) {
         guard position.isFinite else { return }
         seconds = max(0, position)
-        session?.seek(to: position)
+        if awaitingOutput {
+            pendingSeek = seconds
+        } else {
+            session?.seek(to: seconds)
+        }
     }
 
     func stop() {
