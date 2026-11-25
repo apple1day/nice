@@ -51,7 +51,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                 view.addSubview(video)
             }
             surface = video
-            video.videoLayer.player = frameHandler == nil ? player : nil
+            video.videoLayer.player = player
             displayObservation = video.videoLayer.observe(\.isReadyForDisplay, options: [.new]) { [weak self] _, _ in
                 DispatchQueue.main.async { self?.publish() }
             }
@@ -62,15 +62,10 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         guard !stopped else { return }
         frameHandler = handler
         resetFrameWatch()
-        MainActor.assumeIsolated {
-            surface?.videoLayer.player = handler == nil ? player : nil
-            installStereoOutput()
-        }
-        // A paused item may have been decoded before its new output was
-        // attached. Request the current position again to preroll that output.
-        if !wantsPlayback, !seeking, let item = player.currentItem, item.status == .readyToPlay {
-            seek(to: item.currentTime().seconds)
-        }
+        // The host hides its native view in VR. Keeping the layer associated
+        // lets AVFoundation prepare the item before a sized output is available.
+        MainActor.assumeIsolated { installStereoOutput() }
+        if handler == nil, let item = player.currentItem { prerollIfPaused(item) }
     }
 
     @MainActor private func installStereoOutput() {
@@ -78,7 +73,14 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         stereo = nil
         guard let item = player.currentItem, let frameHandler else { return }
         var first = true
-        stereo = AppleStereoFrameOutput(item: item) { [weak self, weak item] buffer in
+        stereo = AppleStereoFrameOutput(item: item, onAttach: { [weak self, weak item] in
+            // Item size, and hence the stereo output, can become available
+            // several event turns after the user paused. Preroll it after attach.
+            DispatchQueue.main.async {
+                guard let self, let item, self.frameHandler != nil else { return }
+                self.prerollIfPaused(item)
+            }
+        }) { [weak self, weak item] buffer in
             guard let self, let item, self.player.currentItem === item else { return }
             frameHandler(buffer)
             if first {
@@ -86,6 +88,12 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                 DispatchQueue.main.async { [weak self] in self?.publish() }
             }
         }
+    }
+
+    private func prerollIfPaused(_ item: AVPlayerItem) {
+        guard player.currentItem === item, item.status == .readyToPlay,
+              !wantsPlayback, !seeking, pendingSeek == nil, !ended, !stopped else { return }
+        seek(to: item.currentTime().seconds)
     }
 
     func load(fileURL: URL) throws { try load(fileURL: fileURL, startAt: 0, paused: false) }

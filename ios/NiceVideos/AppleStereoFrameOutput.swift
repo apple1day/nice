@@ -6,46 +6,55 @@ import UIKit
 final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     private weak var item: AVPlayerItem?
     private var handler: ((CVPixelBuffer) -> Void)?
+    private var onAttach: (() -> Void)?
     private var output: AVPlayerItemVideoOutput?
     private var displayLink: CADisplayLink?
     private var lastDelivery = CACurrentMediaTime()
     private(set) var frameSequence: UInt64 = 0
     var hasVideoFrame: Bool { frameSequence > 0 }
 
-    init(item: AVPlayerItem, handler: @escaping (CVPixelBuffer) -> Void) {
+    init(item: AVPlayerItem, onAttach: @escaping () -> Void = {}, handler: @escaping (CVPixelBuffer) -> Void) {
         self.item = item
         self.handler = handler
+        self.onAttach = onAttach
         super.init()
+        attachOutputIfReady()
         let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
 
+    private func attachOutputIfReady() {
+        guard output == nil, let item else { return }
+        // At first the presentation size may still be zero. Giving the
+        // converter the final dimensions avoids allocating 8K BGRA surfaces.
+        let size = item.presentationSize
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0 else { return }
+        let scale = min(1, 2560 / max(size.width, size.height))
+        let attributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: max(2, Int((size.width * scale).rounded())),
+            kCVPixelBufferHeightKey as String: max(1, Int((size.height * scale).rounded())),
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+        ]
+        let next = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
+        next.suppressesPlayerRendering = true
+        next.setDelegate(self, queue: .main)
+        item.add(next)
+        output = next
+        onAttach?()
+        onAttach = nil
+    }
+
     @objc private func tick(_ link: CADisplayLink) {
-        guard let item, let handler else { return }
-        if output == nil {
-            // At first the presentation size may still be zero. Giving the
-            // converter the final dimensions avoids allocating 8K BGRA surfaces.
-            let size = item.presentationSize
-            guard size.width.isFinite, size.height.isFinite,
-                  size.width > 0, size.height > 0 else { return }
-            let scale = min(1, 2560 / max(size.width, size.height))
-            let attributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: max(2, Int((size.width * scale).rounded())),
-                kCVPixelBufferHeightKey as String: max(1, Int((size.height * scale).rounded())),
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-            ]
-            let next = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
-            next.suppressesPlayerRendering = true
-            next.setDelegate(self, queue: .main)
-            item.add(next)
-            output = next
-        }
+        guard let handler else { return }
+        attachOutputIfReady()
         guard let output else { return }
         let hostTime = link.targetTimestamp
-        let time = output.itemTime(forHostTime: hostTime)
+        let scheduled = output.itemTime(forHostTime: hostTime)
+        let time = scheduled.isNumeric ? scheduled : (item?.currentTime() ?? .invalid)
         if time.isNumeric, (!hasVideoFrame || output.hasNewPixelBuffer(forItemTime: time)),
            let frame = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) {
             lastDelivery = hostTime
@@ -69,6 +78,7 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
         displayLink?.invalidate()
         displayLink = nil
         handler = nil
+        onAttach = nil
         if let output {
             output.setDelegate(nil, queue: nil)
             item?.remove(output)

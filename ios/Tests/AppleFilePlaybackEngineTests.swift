@@ -25,7 +25,7 @@ final class AppleFilePlaybackEngineTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(failure?.error).isEmpty)
     }
 
-    func testSeekingWhenOpenedPausedPreservesIntentAndMovesLayerToReplacementHost() async throws {
+    func testPausedSeekAndStereoPrerollPreserveTheItemAndPositionAcrossHostChanges() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "offline", withExtension: "mp4", subdirectory: "Fixtures"))
         let source = try await PickedVideoFile.open(url)
         let engine = AppleFilePlaybackEngine(pickedFile: source)
@@ -62,6 +62,25 @@ final class AppleFilePlaybackEngineTests: XCTestCase {
         engine.play(waitForPausedFrame: true)
         await fulfillment(of: [preview], timeout: 12)
         XCTAssertEqual(layer.player?.rate, 0)
+        let initialItem = try XCTUnwrap(layer.player?.currentItem)
+        let pausedStereo = expectation(description: "A newly attached stereo output actually delivers the paused image")
+        var stereoFrame: CVPixelBuffer?
+        secondHost.isHidden = true
+        engine.setVideoFrameHandler { buffer in
+            if stereoFrame == nil {
+                stereoFrame = buffer
+                pausedStereo.fulfill()
+            }
+        }
+        await fulfillment(of: [pausedStereo], timeout: 12)
+        let buffer = try XCTUnwrap(stereoFrame)
+        XCTAssertEqual(CVPixelBufferGetPixelFormatType(buffer), kCVPixelFormatType_32BGRA)
+        XCTAssertGreaterThan(CVPixelBufferGetWidth(buffer), 1)
+        XCTAssertTrue(layer.player?.currentItem === initialItem)
+        XCTAssertEqual(layer.player?.rate, 0)
+        XCTAssertEqual(initialItem.currentTime().seconds, 1, accuracy: 0.1)
+        secondHost.isHidden = false
+        engine.setVideoFrameHandler(nil)
         engine.play()
         await fulfillment(of: [advanced], timeout: 8)
         engine.stop()
