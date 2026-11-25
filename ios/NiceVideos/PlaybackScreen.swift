@@ -9,6 +9,8 @@ final class PlaybackModel: ObservableObject {
     @Published private(set) var seconds: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var seekable = false
+    @Published private(set) var videoOutput: MovieOutput?
+    @Published private(set) var videoDetails: String?
     @Published private(set) var message: String?
     var onPlaybackEnded: (() -> Void)?
     private let request: PlaybackRequest
@@ -148,8 +150,18 @@ final class PlaybackModel: ObservableObject {
         }
         savePosition()
     }
+    @MainActor func prepareOutputChange(to output: MovieOutput) {
+        if phase == .failed {
+            message = nil
+            phase = .opening
+        }
+        if output == .system { (engine as? SBSPlaybackEngine)?.retrySystemOutput() }
+    }
+
     private func receive(_ snapshot: PlaybackSnapshot) {
         guard !closed, phase != .failed else { return }
+        if let output = snapshot.videoOutput, videoOutput != output { videoOutput = output }
+        if let details = snapshot.videoDetails, videoDetails != details { videoDetails = details }
         // Native stop notifications may follow EOF. Preserve the terminal state
         // and cleared bookmark until an explicit replay or seek actually starts.
         if playbackInputEnded || pendingRestartSeek != nil, snapshot.phase == .idle { return }
@@ -272,18 +284,18 @@ final class PlaybackModel: ObservableObject {
     }
 }
 
-private struct VLCVideoSurface: UIViewRepresentable {
+private struct MovieVideoSurface: UIViewRepresentable {
     let model: PlaybackModel
     let mode: SBSDisplayMode
-    let standardFrameOutput: Bool
+    let standardOutput: MovieOutput
     func makeCoordinator() -> PlaybackModel { model }
     func makeUIView(context: Context) -> SBSPlaybackView {
         let view = SBSPlaybackView(frame: .zero)
-        view.configure(mode: mode, standardFrameOutput: standardFrameOutput)
+        view.configure(mode: mode, standardOutput: standardOutput)
         view.startPlaybackWhenReady { [weak model] view in model?.attach(to: view) }
         return view
     }
-    func updateUIView(_ view: SBSPlaybackView, context: Context) { view.configure(mode: mode, standardFrameOutput: standardFrameOutput) }
+    func updateUIView(_ view: SBSPlaybackView, context: Context) { view.configure(mode: mode, standardOutput: standardOutput) }
     static func dismantleUIView(_ view: SBSPlaybackView, coordinator: PlaybackModel) {
         view.cancelPendingStart()
         coordinator.close()
@@ -380,8 +392,10 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     @State private var showsPlaylist = false
     @State private var showsVideoFormats = false
     @State private var displayMode: SBSDisplayMode = .standard
-    @State private var standardFrameOverride: Bool?
-    private var standardFrameOutput: Bool { standardFrameOverride ?? (request.pickedFile != nil) }
+    @State private var outputOverride: MovieOutput?
+    private var defaultOutput: MovieOutput { MovieOutput.defaultOutput(for: request.pickedFile) }
+    private var standardOutput: MovieOutput { outputOverride ?? defaultOutput }
+    private var activeOutput: MovieOutput { model.videoOutput ?? standardOutput }
     private var request: PlaybackRequest { playlist.current }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
     private var isFullscreen: Bool { controls.isFullscreen || displayMode != .standard }
@@ -400,7 +414,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             GeometryReader { proxy in
                 ZStack {
                     Color.black.ignoresSafeArea()
-                    VLCVideoSurface(model: model, mode: displayMode, standardFrameOutput: standardFrameOutput)
+                    MovieVideoSurface(model: model, mode: displayMode, standardOutput: standardOutput)
                         .id(request.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .ignoresSafeArea(.container, edges: isFullscreen ? .all : [])
@@ -631,6 +645,11 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         displayMode = .standard
     }
 
+    private func selectOutput(_ output: MovieOutput) {
+        model.prepareOutputChange(to: output)
+        outputOverride = output
+    }
+
     private var videoFormatButton: some View {
         Button { performTransportAction { showsVideoFormats = true } } label: {
             Text(displayMode == .standard ? "VR" : "VR ✓")
@@ -647,14 +666,23 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             Button("全宽 SBS（Full SBS）") { displayMode = .full }
             if displayMode != .standard {
                 Button("退出 VR，普通播放") { displayMode = .standard }
-            } else {
-                Button(standardFrameOutput ? "普通播放：切换到原生显示" : "普通播放：切换到兼容显示") {
-                    standardFrameOverride = !standardFrameOutput
+                if activeOutput == .system {
+                    Button("VR：切换到 VLC 解码") { selectOutput(.vlcFrames) }
                 }
+            } else {
+                if activeOutput != .vlcNative {
+                    Button("普通播放：切换到原生显示") { selectOutput(.vlcNative) }
+                }
+                if activeOutput != .vlcFrames {
+                    Button("普通播放：切换到兼容显示") { selectOutput(.vlcFrames) }
+                }
+            }
+            if defaultOutput == .system && activeOutput != .system {
+                Button("切换到系统播放器") { selectOutput(.system) }
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("按片源选择格式。每只眼的画面被横向压缩时选半宽，保持原比例时选全宽。")
+            Text(["当前解码：\(activeOutput.title)。", model.videoDetails, "每只眼的画面被横向压缩时选半宽，保持原比例时选全宽。"].compactMap { $0 }.joined(separator: "\n"))
         }
     }
     private var transportFavoriteButton: some View {

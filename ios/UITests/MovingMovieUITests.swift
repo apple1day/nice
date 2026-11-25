@@ -6,11 +6,7 @@ final class MovingMovieUITests: XCTestCase {
     func testPickedMovieActuallyChangesPixelsInStandardAndFullSBS() async throws {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
-        let app = XCUIApplication()
-        let fixture = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "moving-stereo", withExtension: "mp4"))
-        app.launchArguments = ["--ui-test-moving-video"]
-        app.launchEnvironment["NICE_UI_TEST_MOVIE"] = try Data(contentsOf: fixture).base64EncodedString()
-        app.launch()
+        let app = try launchMovie("moving-stereo", fileExtension: "mp4")
         defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
 
         let surface = app.descendants(matching: .any)["playbackSurfaceToggle"]
@@ -53,6 +49,46 @@ final class MovingMovieUITests: XCTestCase {
         XCTAssertGreaterThanOrEqual(try seconds(elapsed), before - 1)
         formats.tap()
         XCTAssertTrue(app.buttons["普通播放：切换到兼容显示"].exists)
+    }
+
+    func testSystemPlayerShowsChanging4KHEVCSamplesBeyond4GiBInOrdinaryAndVR() async throws {
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .landscapeLeft
+        let app = try launchMovie("moving4k-index", fileExtension: "bin", samples: "moving4k-samples")
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
+
+        let surface = app.descendants(matching: .any)["playbackSurfaceToggle"]
+        XCTAssertTrue(surface.waitForExistence(timeout: 15), app.debugDescription)
+        let format = app.buttons["videoFormatButton"]
+        let systemRoute = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "当前解码：系统播放器")).firstMatch
+        try await assertChangingEyes(in: app, surface: surface, mode: "4K HEVC ordinary")
+        revealControls(surface)
+        format.tap()
+        XCTAssertTrue(systemRoute.exists, app.debugDescription)
+        app.buttons["全宽 SBS（Full SBS）"].tap()
+
+        try await assertChangingEyes(in: app, surface: surface, mode: "4K HEVC full SBS")
+        revealControls(surface)
+        format.tap()
+        XCTAssertTrue(systemRoute.exists, app.debugDescription)
+        app.buttons["退出 VR，普通播放"].tap()
+        try await assertChangingEyes(in: app, surface: surface, mode: "4K HEVC after leaving VR")
+    }
+
+    private func launchMovie(_ resource: String, fileExtension: String, samples: String? = nil) throws -> XCUIApplication {
+        let bundle = Bundle(for: Self.self)
+        func encoded(_ name: String) throws -> String {
+            let url = try XCTUnwrap(bundle.url(forResource: name, withExtension: fileExtension))
+            let data = try Data(contentsOf: url) as NSData
+            // Simulator processes limit the total size of launch arguments and environment.
+            return try data.compressed(using: .zlib).base64EncodedString()
+        }
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-test-moving-video"]
+        app.launchEnvironment["NICE_UI_TEST_MOVIE"] = try encoded(resource)
+        if let samples { app.launchEnvironment["NICE_UI_TEST_SAMPLES"] = try encoded(samples) }
+        app.launch()
+        return app
     }
 
     private func seconds(_ label: XCUIElement) throws -> Int {

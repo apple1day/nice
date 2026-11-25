@@ -71,12 +71,21 @@ struct NiceVideosApp: App {
                 guard !opened, scenePhase == .active else { return }
                 opened = true
                 do {
-                    guard let encoded = ProcessInfo.processInfo.environment["NICE_UI_TEST_MOVIE"],
-                          let movie = Data(base64Encoded: encoded) else {
-                        throw ClientError("Missing test movie")
+                    let environment = ProcessInfo.processInfo.environment
+                    func fixtureData(_ key: String) throws -> Data {
+                        guard let encoded = environment[key], let compressed = Data(base64Encoded: encoded) else {
+                            throw ClientError("Missing test movie bytes")
+                        }
+                        return try (compressed as NSData).decompressed(using: .zlib) as Data
                     }
                     let url = FileManager.default.temporaryDirectory.appendingPathComponent("moving-stereo.mp4")
-                    try movie.write(to: url, options: .atomic)
+                    try fixtureData("NICE_UI_TEST_MOVIE").write(to: url, options: .atomic)
+                    if environment["NICE_UI_TEST_SAMPLES"] != nil {
+                        let handle = try FileHandle(forWritingTo: url)
+                        defer { try? handle.close() }
+                        try handle.seek(toOffset: UInt64(1) << 32)
+                        try handle.write(contentsOf: fixtureData("NICE_UI_TEST_SAMPLES"))
+                    }
                     let file = try await PickedVideoFile.open(url)
                     try store.playPickedFile(file)
                 } catch { store.errorMessage = error.localizedDescription }

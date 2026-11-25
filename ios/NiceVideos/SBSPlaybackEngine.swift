@@ -1,6 +1,24 @@
 import UIKit
 
-/// Both VLC outputs live under the same SwiftUI surface for the lifetime of a clip.
+enum MovieOutput: Equatable {
+    case system, vlcNative, vlcFrames
+
+    static func defaultOutput(for file: PickedVideoFile?) -> Self {
+        guard let file else { return .vlcNative }
+        switch file.url.pathExtension.lowercased() {
+        case "mp4", "m4v", "mov": return .system
+        default: return .vlcFrames
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .system: return "系统播放器"
+        case .vlcNative: return "VLC 原生显示"
+        case .vlcFrames: return "VLC 兼容显示"
+        }
+    }
+}
 final class SBSPlaybackView: UIView {
     private var pendingStart: ((SBSPlaybackView) -> Void)?
     private var startWork: DispatchWorkItem?
@@ -12,22 +30,17 @@ final class SBSPlaybackView: UIView {
     private(set) var renderer: SBSMetalView?
     var onOutputChange: (() -> Void)?
     private var format: SBSDisplayMode = .standard
-    private var standardFrameOutput: Bool?
+    private(set) var standardOutput: MovieOutput?
     var mode: SBSDisplayMode {
         get { format }
-        set { configure(mode: newValue, standardFrameOutput: standardFrameOutput) }
+        set { configure(mode: newValue, standardOutput: standardOutput) }
     }
 
-    func selectDefaultOutput(forPickedFile picked: Bool) {
-        if standardFrameOutput == nil { configure(mode: mode, standardFrameOutput: picked) }
-    }
-
-    func configure(mode: SBSDisplayMode, standardFrameOutput: Bool?) {
-        guard mode != format || standardFrameOutput != self.standardFrameOutput else { return }
-        let usedFrameOutput = renderer != nil
+    func configure(mode: SBSDisplayMode, standardOutput: MovieOutput?) {
+        guard mode != format || standardOutput != self.standardOutput else { return }
         format = mode
-        self.standardFrameOutput = standardFrameOutput
-        let needsFrames = mode != .standard || standardFrameOutput == true
+        self.standardOutput = standardOutput
+        let needsFrames = mode != .standard || standardOutput == .vlcFrames
         if needsFrames && renderer == nil {
             let view = SBSMetalView(frame: bounds)
             if mode != .standard || view.isReadyForDisplay {
@@ -43,8 +56,7 @@ final class SBSPlaybackView: UIView {
         }
         renderer?.mode = mode
         drawableView.isHidden = renderer != nil
-        // Flat and both stereo projections can share a single decoder and clock.
-        if usedFrameOutput != (renderer != nil) { onOutputChange?() }
+        onOutputChange?()
     }
 
     override init(frame: CGRect) {
@@ -117,13 +129,17 @@ final class SBSPlaybackView: UIView {
     }
 }
 
-/// VLC selects a native drawable or vmem when it opens a video output. Reopen only
-/// when crossing that boundary. The flat Metal view and both SBS formats share a decoder.
+// The Apple decoder can feed either the layer or the two-eye renderer.
+// VLC's native and callback-based outputs require separate decoder sessions.
+extension AppleFilePlaybackEngine: SwitchableVideoEngine {}
+
 final class SBSPlaybackEngine: LocalPlaybackEngine {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
-    private var session: VLCPlaybackEngine?
+    private var session: SwitchableVideoEngine?
     private weak var hostView: SBSPlaybackView?
-    private var usesFrameOutput = false
+    private(set) var currentOutput: MovieOutput?
+    private var systemFailed = false
+    private var systemStereo = false
     private let pickedFile: PickedVideoFile?
     private var file: URL?
     private var seconds = 0.0
@@ -146,30 +162,36 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
         MainActor.assumeIsolated {
             hostView?.onOutputChange = nil
             hostView = host
-            host.selectDefaultOutput(forPickedFile: pickedFile != nil)
+            if host.standardOutput == nil {
+                host.configure(mode: host.mode, standardOutput: MovieOutput.defaultOutput(for: pickedFile))
+            }
             host.onOutputChange = { [weak self, weak host] in
                 guard let self, let host, self.hostView === host else { return }
-                self.changeOutput(host)
+                self.reconcileOutput(host)
             }
-            if session == nil {
-                installOutput(host)
-            } else if usesFrameOutput != (host.renderer != nil) {
-                changeOutput(host)
-            } else if !usesFrameOutput {
-                session?.attach(to: host.drawableView)
-            }
+            reconcileOutput(host, attaching: true)
         }
     }
 
-    private func observe(_ newSession: VLCPlaybackEngine) {
+    private func observe(_ newSession: SwitchableVideoEngine) {
         session = newSession
-        newSession.onUpdate = { [weak self] snapshot in
-            guard let self, !self.stopped else { return }
+        newSession.onUpdate = { [weak self, weak newSession] snapshot in
+            guard let self, !self.stopped, self.session === newSession else { return }
+            if self.currentOutput == .system, snapshot.phase == .failed, let host = self.hostView {
+                self.systemFailed = true
+                // The failing input may be the first event, before it has a
+                // usable timestamp. Preserve the requested seek in that case.
+                if let seek = self.pendingSeek { self.seconds = seek }
+                else if snapshot.seconds.isFinite, snapshot.seconds > 0 { self.seconds = snapshot.seconds }
+                MainActor.assumeIsolated { self.reconcileOutput(host) }
+                return
+            }
             // A stopped event may trail EOF. Only an explicit reload can
             // restart that input, including when changing output at the end.
             let pickedFileFailure = self.pickedFile != nil && snapshot.phase == .failed
             if self.phase == .failed || (self.phase == .ended && !pickedFileFailure) { return }
             var visible = snapshot
+            visible.videoOutput = self.currentOutput
             if self.openingPaused && snapshot.phase == .paused {
                 self.openingPaused = false
                 if self.wantsPlayback { self.session?.play() }
@@ -203,39 +225,77 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
         }
     }
 
-    private func nativeSession() -> VLCPlaybackEngine {
+    private func nativeSession() -> SwitchableVideoEngine {
         if let session { return session }
         let newSession = VLCPlaybackEngine(frameHandler: nil, pickedFile: pickedFile)
+        currentOutput = .vlcNative
         observe(newSession)
         return newSession
     }
 
-    @MainActor private func installOutput(_ host: SBSPlaybackView) {
-        usesFrameOutput = host.renderer != nil
-        if usesFrameOutput {
-            observe(VLCPlaybackEngine(frameHandler: { [weak self] frame in
-                // Resolve the current SwiftUI host at delivery, including after reattachment.
-                MainActor.assumeIsolated { self?.hostView?.renderer?.display(frame) }
-            }, pickedFile: pickedFile))
-        } else {
-            nativeSession().attach(to: host.drawableView)
+    @MainActor private func frameHandler() -> (CVPixelBuffer) -> Void {
+        { [weak self] pixelBuffer in
+            MainActor.assumeIsolated { self?.hostView?.renderer?.display(pixelBuffer) }
         }
     }
 
-    @MainActor private func changeOutput(_ host: SBSPlaybackView) {
-        guard !stopped else { return }
+    @MainActor private func reconcileOutput(_ host: SBSPlaybackView, attaching: Bool = false) {
+        let system = host.standardOutput == .system && pickedFile != nil && !systemFailed
+        let next: MovieOutput = system ? .system : (host.renderer == nil ? .vlcNative : .vlcFrames)
+        if next == currentOutput, let session {
+            if attaching && next != .vlcFrames { session.attach(to: host.drawableView) }
+            if let apple = session as? AppleFilePlaybackEngine {
+                configureSystemStereo(apple, host: host)
+            }
+            return
+        }
+        if phase == .failed { phase = .opening }
+        session?.onUpdate = nil
         session?.stop()
         session = nil
-        installOutput(host)
+        currentOutput = next
+        systemStereo = false
+        if next == .system, let pickedFile {
+            let apple = AppleFilePlaybackEngine(pickedFile: pickedFile)
+            observe(apple)
+            apple.attach(to: host.drawableView)
+            configureSystemStereo(apple, host: host)
+        } else if next == .vlcFrames {
+            observe(VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile))
+        } else {
+            nativeSession().attach(to: host.drawableView)
+        }
+        reopenAfterOutputChange(host)
+    }
+
+    @MainActor private func configureSystemStereo(_ apple: AppleFilePlaybackEngine, host: SBSPlaybackView) {
+        let stereo = host.mode != .standard
+        if stereo != systemStereo {
+            systemStereo = stereo
+            apple.setVideoFrameHandler(stereo ? frameHandler() : nil)
+        }
+    }
+
+    @MainActor func retrySystemOutput() {
+        systemFailed = false
+        if let hostView { reconcileOutput(hostView) }
+    }
+
+    @MainActor private func reopenAfterOutputChange(_ host: SBSPlaybackView) {
         guard let file, let session else { return }
         do {
-            let resume = hasStarted && phase != .ended && phase != .failed
+            let resume = hasStarted && phase != .ended
             openingPaused = resume && !wantsPlayback
             awaitingOutput = resume
             pendingSeek = nil
             try session.load(fileURL: file, startAt: seconds, paused: openingPaused)
             if resume { session.play(waitForPausedFrame: openingPaused) }
         } catch {
+            if currentOutput == .system {
+                systemFailed = true
+                reconcileOutput(host)
+                return
+            }
             // This can happen if the local file disappears while the clip is open.
             phase = .failed
             let failure = PlaybackSnapshot(phase: .failed, error: "切换播放格式失败，请关闭并重新打开视频。\n" + error.localizedDescription)
@@ -248,7 +308,6 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
 
     func load(fileURL: URL) throws {
         guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
-        try nativeSession().load(fileURL: fileURL)
         file = fileURL
         seconds = 0
         phase = .idle
@@ -256,6 +315,13 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
         awaitingOutput = false
         pendingSeek = nil
         hasStarted = false
+        do {
+            try nativeSession().load(fileURL: fileURL)
+        } catch {
+            guard currentOutput == .system, let hostView else { throw error }
+            systemFailed = true
+            MainActor.assumeIsolated { reconcileOutput(hostView) }
+        }
     }
 
     func play() {

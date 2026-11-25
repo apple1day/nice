@@ -8,6 +8,7 @@ Tests/Fixtures/*.mp4
 Tests/Fixtures/*.mkv
 Tests/Fixtures/*.bin
 UITests/moving-stereo.mp4
+UITests/moving4k-*.bin
 Licenses/MobileVLCKit-COPYING.txt
 Licenses/Acknowledgements.txt
 .project-backups/

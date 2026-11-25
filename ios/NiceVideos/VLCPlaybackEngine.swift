@@ -12,6 +12,8 @@ struct PlaybackSnapshot {
     var seekable = false
     var hasVideo = false
     var error: String?
+    var videoOutput: MovieOutput?
+    var videoDetails: String?
 }
 
 // Keeps the UI pinned to the user's requested position while VLC is still
@@ -52,6 +54,11 @@ protocol LocalPlaybackEngine: AnyObject {
     func stop()
 }
 
+protocol SwitchableVideoEngine: LocalPlaybackEngine {
+    func load(fileURL: URL, startAt seconds: Double, paused: Bool) throws
+    func play(waitForPausedFrame: Bool)
+}
+
 // A VLC byte callback runs off-main and can report failure just before native
 // EOF/state notifications arrive. Keep the first real error per opened input.
 private final class PickedFileReadStatus {
@@ -87,7 +94,7 @@ private final class PickedFileReadStatus {
     }
 }
 
-final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDelegate {
+final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDelegate {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private static var lifetimeAssociationKey: UInt8 = 0
     private let playerResource: BackgroundPlaybackResource<VLCMediaPlayer>

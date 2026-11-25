@@ -52,8 +52,11 @@ def make_fixture(source):
              "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-movflags", "+faststart",
              str(compact)], check=True,
         )
-        atoms = list(boxes(compact.read_bytes()))
+        write_sparse_parts(compact, source.with_name("co64"))
 
+
+def write_sparse_parts(compact, prefix):
+    atoms = list(boxes(compact.read_bytes()))
     [(mdat_pos, samples)] = [(pos, data) for pos, kind, data in atoms if kind == b"mdat"]
     [ftyp] = [data for _, kind, data in atoms if kind == b"ftyp"]
     [moov] = [data for _, kind, data in atoms if kind == b"moov"]
@@ -63,9 +66,12 @@ def make_fixture(source):
     # Its first sample is exactly at 4 GiB; subsequent chunks are above it.
     mdat_size = SAMPLE_START + len(samples) - len(index)
     index += struct.pack(">I4sQ", 1, b"mdat", mdat_size)
-    source.with_name("co64-index.bin").write_bytes(index)
-    source.with_name("co64-samples.bin").write_bytes(samples)
+    prefix.with_name(prefix.name + "-index.bin").write_bytes(index)
+    prefix.with_name(prefix.name + "-samples.bin").write_bytes(samples)
 
 
 if __name__ == "__main__":
-    make_fixture(Path(sys.argv[1]))
+    if len(sys.argv) == 2:
+        make_fixture(Path(sys.argv[1]))
+    else:
+        write_sparse_parts(Path(sys.argv[1]), Path(sys.argv[2]))

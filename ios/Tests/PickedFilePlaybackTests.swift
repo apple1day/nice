@@ -19,6 +19,52 @@ final class PickedFilePlaybackTests: XCTestCase {
         try file.write(contentsOf: Data(contentsOf: samples))
     }
 
+    func testUnsupportedSystemContainerFallsBackToVLCOnOriginalOpenFile() async throws {
+        // The MP4 extension selects AVPlayer. Its contents are non-WebM
+        // Matroska (MPEG-4 Part 2 / AAC), already decoded in our VLC tests.
+        let fixture = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "offline", withExtension: "mkv",
+                                                               subdirectory: "Fixtures"))
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
+        try FileManager.default.copyItem(at: fixture, to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let file = try await PickedVideoFile.open(url)
+        try Data("replacement at the same URL".utf8).write(to: url, options: .atomic)
+
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+        let engine = SBSPlaybackEngine(pickedFile: file)
+        defer { engine.stop(); window.isHidden = true }
+        var errors: [String] = []
+        var firstVideoTime: Double?
+        var advanced = false
+        let playing = expectation(description: "VLC recovers the original movie and advances with video")
+        engine.onUpdate = { state in
+            if state.phase == .failed { errors.append(state.error ?? "unspecified failure") }
+            guard state.videoOutput == .vlcNative, state.phase == .playing, state.hasVideo else { return }
+            if let firstVideoTime {
+                if !advanced && state.seconds > firstVideoTime + 0.1 {
+                    advanced = true
+                    playing.fulfill()
+                }
+            } else {
+                firstVideoTime = state.seconds
+            }
+        }
+        engine.attach(to: host)
+        XCTAssertEqual(engine.currentOutput, .system)
+        try engine.load(fileURL: url)
+        engine.play()
+        await fulfillment(of: [playing], timeout: 15)
+        XCTAssertEqual(engine.currentOutput, .vlcNative)
+        XCTAssertTrue(errors.isEmpty, "System failure escaped before fallback: \(errors)")
+    }
+
     func testPickedMovieBeyond4GiBPlaysAndSeeksAfterItsProviderReplacesThePath() async throws {
         let fm = FileManager.default
         let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -68,7 +114,7 @@ final class PickedFilePlaybackTests: XCTestCase {
         let receive = try XCTUnwrap(engine.onUpdate)
         let ordinaryFrame = XCTestExpectation(description: "Flat view plays samples beyond 4 GiB")
         let sought = XCTestExpectation(description: "Playback clock advances past the requested time")
-        let vrFrame = XCTestExpectation(description: "Playback continues while the same renderer switches to VR")
+        let vrFrame = XCTestExpectation(description: "System decoder delivers a stereo frame after switching to VR")
         var sawOrdinaryFrame = false
         var seekRequested = false
         var passedSeek = false
@@ -94,7 +140,7 @@ final class PickedFilePlaybackTests: XCTestCase {
                     passedSeek = true
                     sought.fulfill()
                 }
-            } else if host.mode == .half && !sawVRFrame {
+            } else if host.mode == .half && state.videoOutput == .system && !sawVRFrame {
                 sawVRFrame = true
                 vrFrame.fulfill()
             }
@@ -109,9 +155,10 @@ final class PickedFilePlaybackTests: XCTestCase {
         model.player.seek(to: 5)
         await fulfillment(of: [sought], timeout: 8)
         guard passedSeek else { XCTFail(diagnostic()); return }
-        let flatRenderer = try XCTUnwrap(host.renderer)
+        XCTAssertEqual(engine.currentOutput, .system, diagnostic())
+        XCTAssertNil(host.renderer)
         host.mode = .half
-        XCTAssertTrue(flatRenderer === host.renderer)
+        XCTAssertNotNil(host.renderer)
         await fulfillment(of: [vrFrame], timeout: 15)
         XCTAssertTrue(sawVRFrame, diagnostic())
         XCTAssertFalse(model.canMove(.next))
