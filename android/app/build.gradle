@@ -1,0 +1,39 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.anxiong.nicevideos'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.anxiong.nicevideos'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.0.0'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    sourceSets.androidTest.assets.srcDir(layout.buildDirectory.dir('generated/playbackFixtures'))
+}
+
+def fixtures = tasks.register('generatePlaybackFixtures', Exec) {
+    def script = rootProject.file('test-fixtures.sh')
+    def helper = rootProject.file('../ios/tools/make_large_mp4_fixture.py')
+    def destination = layout.buildDirectory.dir('generated/playbackFixtures')
+    inputs.files(script, helper)
+    outputs.dir(destination)
+    commandLine 'bash', script.absolutePath, destination.get().asFile.absolutePath, helper.absolutePath
+}
+tasks.matching { it.name == 'mergeDebugAndroidTestAssets' }.configureEach { dependsOn fixtures }
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test:core:1.6.1'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+}

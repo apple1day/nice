@@ -1,0 +1,98 @@
+name: Android APK and playback tests
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '!android/NiceVideos.apk'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install media fixture tools
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y ffmpeg
+          fi
+      - name: Assemble app and tests
+        working-directory: android
+        run: ./gradlew --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest
+      - name: Verify the installable APK
+        working-directory: android
+        run: |
+          set -euo pipefail
+          cp app/build/outputs/apk/debug/app-debug.apk NiceVideos.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs NiceVideos.apk
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging NiceVideos.apk | sed -n '1,15p'
+          sha256sum NiceVideos.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NiceVideos-Android
+          path: android/NiceVideos.apk
+      - name: Enable KVM for Android Emulator
+        run: sudo chmod 666 /dev/kvm
+      - name: Test installed APK on Android
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: cd android && ./gradlew :app:connectedDebugAndroidTest
+      - name: Verify tested artifact and publish test counts
+        working-directory: android
+        run: |
+          cmp NiceVideos.apk app/build/outputs/apk/debug/app-debug.apk
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          results = list(Path("app/build/outputs/androidTest-results").rglob("TEST-*.xml"))
+          count = sum(len(ET.parse(f).findall(".//testcase")) for f in results)
+          print(f"Android instrumentation tests: {count}")
+          if not count:
+              raise SystemExit("No instrumentation tests executed")
+          PY
+      - name: Save Android test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-test-results
+          path: |
+            android/app/build/reports/androidTests/
+            android/app/build/outputs/androidTest-results/
+            android/app/build/reports/tests/
+
+  package:
+    name: Register verified APK for repository distribution
+    needs: android
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: NiceVideos-Android
+      - name: Register APK blob
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY' | gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq '.sha'
+          import base64, json, pathlib
+          data = pathlib.Path("NiceVideos.apk").read_bytes()
+          print(json.dumps({"content": base64.b64encode(data).decode("ascii"), "encoding": "base64"}))
+          PY
+          sha256sum NiceVideos.apk
