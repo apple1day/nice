@@ -30,25 +30,7 @@ final class SBSMovieTests: XCTestCase {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
         let queue = try XCTUnwrap(device.makeCommandQueue())
         let view = SBSMetalView(frame: .zero)
-        let attrs: [String: Any] = [
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
-        ]
-        var image: CVPixelBuffer?
-        XCTAssertEqual(CVPixelBufferCreate(nil, 32, 16, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &image), kCVReturnSuccess)
-        let frame = try XCTUnwrap(image)
-        XCTAssertEqual(CVPixelBufferLockBaseAddress(frame, []), kCVReturnSuccess)
-        let pixels = try XCTUnwrap(CVPixelBufferGetBaseAddress(frame)).assumingMemoryBound(to: UInt8.self)
-        for y in 0..<16 {
-            for x in 0..<32 {
-                let i = y * CVPixelBufferGetBytesPerRow(frame) + x * 4
-                pixels[i] = 0
-                pixels[i + 1] = x < 16 ? 0 : 255
-                pixels[i + 2] = x < 16 ? 255 : 0
-                pixels[i + 3] = 255
-            }
-        }
-        CVPixelBufferUnlockBaseAddress(frame, [])
+        let frame = try splitFrame(width: 32, height: 16, left: SIMD3(255, 0, 0), right: SIMD3(0, 255, 0))
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
                                                                  width: 128, height: 64, mipmapped: false)
         descriptor.storageMode = .shared
@@ -88,8 +70,52 @@ final class SBSMovieTests: XCTestCase {
         XCTAssertEqual(rgb(half, x: 32, y: 12), [0, 0, 0])
         XCTAssertEqual(rgb(half, x: 32, y: 32), [255, 0, 0])
         XCTAssertEqual(rgb(half, x: 96, y: 32), [0, 255, 0])
+        // Switch the paused movie to ordinary playback. Its full 2:1 frame now
+        // fills the 2:1 target, including corners excluded by the lens warp.
+        view.mode = .standard
+        let ordinary = try render()
+        XCTAssertEqual(rgb(ordinary, x: 1, y: 1), [255, 0, 0])
+        XCTAssertEqual(rgb(ordinary, x: 126, y: 62), [0, 255, 0])
+
+        // Feed new surfaces with changing colors and aspect. A renderer
+        // stuck sampling its first texture fails on the very next frame.
+        for i in 0..<8 {
+            let red = UInt8(20 + i * 15), blue = UInt8(240 - i * 12)
+            let changing = try splitFrame(width: 32, height: 32, left: SIMD3(red, 0, 0), right: SIMD3(0, 0, blue))
+            view.display(changing)
+            let output = try render()
+            XCTAssertEqual(rgb(output, x: 16, y: 32), [0, 0, 0]) // pillarbox for square movies
+            XCTAssertEqual(rgb(output, x: 47, y: 32), [red, 0, 0])
+            XCTAssertEqual(rgb(output, x: 80, y: 32), [0, 0, blue])
+            XCTAssertEqual(rgb(output, x: 110, y: 32), [0, 0, 0])
+        }
         view.clear()
         let cleared = try render()
         XCTAssertEqual(rgb(cleared, x: 32, y: 32), [0, 0, 0])
+    }
+
+    private func splitFrame(width: Int, height: Int, left: SIMD3<UInt8>, right: SIMD3<UInt8>) throws -> CVPixelBuffer {
+        let attrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
+        ]
+        var image: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA,
+                                           attrs as CFDictionary, &image), kCVReturnSuccess)
+        let frame = try XCTUnwrap(image)
+        XCTAssertEqual(CVPixelBufferLockBaseAddress(frame, []), kCVReturnSuccess)
+        defer { CVPixelBufferUnlockBaseAddress(frame, []) }
+        let pixels = try XCTUnwrap(CVPixelBufferGetBaseAddress(frame)).assumingMemoryBound(to: UInt8.self)
+        for y in 0..<height {
+            for x in 0..<width {
+                let i = y * CVPixelBufferGetBytesPerRow(frame) + x * 4
+                let rgb = x < width / 2 ? left : right
+                pixels[i] = rgb.z
+                pixels[i + 1] = rgb.y
+                pixels[i + 2] = rgb.x
+                pixels[i + 3] = 255
+            }
+        }
+        return frame
     }
 }

@@ -66,9 +66,9 @@ final class PickedFilePlaybackTests: XCTestCase {
         defer { model.close(); window.isHidden = true }
 
         let receive = try XCTUnwrap(engine.onUpdate)
-        let ordinaryFrame = XCTestExpectation(description: "Native drawable plays samples beyond 4 GiB")
-        let sought = XCTestExpectation(description: "Native clock advances past the requested time")
-        let vrFrame = XCTestExpectation(description: "Reopened VR decoder delivers a frame from the same file")
+        let ordinaryFrame = XCTestExpectation(description: "Flat view plays samples beyond 4 GiB")
+        let sought = XCTestExpectation(description: "Playback clock advances past the requested time")
+        let vrFrame = XCTestExpectation(description: "Playback continues while the same renderer switches to VR")
         var sawOrdinaryFrame = false
         var seekRequested = false
         var passedSeek = false
@@ -109,7 +109,9 @@ final class PickedFilePlaybackTests: XCTestCase {
         model.player.seek(to: 5)
         await fulfillment(of: [sought], timeout: 8)
         guard passedSeek else { XCTFail(diagnostic()); return }
+        let flatRenderer = try XCTUnwrap(host.renderer)
         host.mode = .half
+        XCTAssertTrue(flatRenderer === host.renderer)
         await fulfillment(of: [vrFrame], timeout: 15)
         XCTAssertTrue(sawVRFrame, diagnostic())
         XCTAssertFalse(model.canMove(.next))

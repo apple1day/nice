@@ -275,17 +275,19 @@ final class PlaybackModel: ObservableObject {
 private struct VLCVideoSurface: UIViewRepresentable {
     let model: PlaybackModel
     let mode: SBSDisplayMode
+    let standardFrameOutput: Bool
     func makeCoordinator() -> PlaybackModel { model }
     func makeUIView(context: Context) -> SBSPlaybackView {
         let view = SBSPlaybackView(frame: .zero)
-        view.mode = mode
-        DispatchQueue.main.async { [weak model, weak view] in
-            if let view { model?.attach(to: view) }
-        }
+        view.configure(mode: mode, standardFrameOutput: standardFrameOutput)
+        view.startPlaybackWhenReady { [weak model] view in model?.attach(to: view) }
         return view
     }
-    func updateUIView(_ view: SBSPlaybackView, context: Context) { view.mode = mode }
-    static func dismantleUIView(_ view: SBSPlaybackView, coordinator: PlaybackModel) { coordinator.close() }
+    func updateUIView(_ view: SBSPlaybackView, context: Context) { view.configure(mode: mode, standardFrameOutput: standardFrameOutput) }
+    static func dismantleUIView(_ view: SBSPlaybackView, coordinator: PlaybackModel) {
+        view.cancelPendingStart()
+        coordinator.close()
+    }
 }
 
 // Draft changes stay in this small view, without store/playlist traversal or
@@ -378,6 +380,8 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     @State private var showsPlaylist = false
     @State private var showsVideoFormats = false
     @State private var displayMode: SBSDisplayMode = .standard
+    @State private var standardFrameOverride: Bool?
+    private var standardFrameOutput: Bool { standardFrameOverride ?? (request.pickedFile != nil) }
     private var request: PlaybackRequest { playlist.current }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
     private var isFullscreen: Bool { controls.isFullscreen || displayMode != .standard }
@@ -396,7 +400,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             GeometryReader { proxy in
                 ZStack {
                     Color.black.ignoresSafeArea()
-                    VLCVideoSurface(model: model, mode: displayMode)
+                    VLCVideoSurface(model: model, mode: displayMode, standardFrameOutput: standardFrameOutput)
                         .id(request.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .ignoresSafeArea(.container, edges: isFullscreen ? .all : [])
@@ -638,10 +642,16 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         .accessibilityLabel("VR 播放格式")
         .accessibilityValue(displayMode == .standard ? "普通播放" : (displayMode == .half ? "半宽 SBS" : "全宽 SBS"))
         .accessibilityIdentifier("videoFormatButton")
-        .confirmationDialog("左右分屏播放格式", isPresented: $showsVideoFormats, titleVisibility: .visible) {
+        .confirmationDialog("视频显示方式", isPresented: $showsVideoFormats, titleVisibility: .visible) {
             Button("半宽 SBS（Half SBS）") { displayMode = .half }
             Button("全宽 SBS（Full SBS）") { displayMode = .full }
-            if displayMode != .standard { Button("退出 VR，普通播放") { displayMode = .standard } }
+            if displayMode != .standard {
+                Button("退出 VR，普通播放") { displayMode = .standard }
+            } else {
+                Button(standardFrameOutput ? "普通播放：切换到原生显示" : "普通播放：切换到兼容显示") {
+                    standardFrameOverride = !standardFrameOutput
+                }
+            }
             Button("取消", role: .cancel) {}
         } message: {
             Text("按片源选择格式。每只眼的画面被横向压缩时选半宽，保持原比例时选全宽。")

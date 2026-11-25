@@ -19,13 +19,13 @@ vertex SBSVaryings sbsMovieVertex(uint index [[vertex_id]],
 
 fragment float4 sbsMovieFragment(SBSVaryings input [[stage_in]],
                                  texture2d<float> movie [[texture(0)]],
-                                 constant float &eyeStart [[buffer(0)]]) {
+                                 constant float2 &region [[buffer(0)]]) {
     constexpr sampler linearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
     // Clamp to actual texel centers. If a scaled frame is odd in width,
     // discard its ambiguous center column rather than sample the other eye.
     float width = float(movie.get_width());
-    float eyeWidth = floor(width * 0.5f);
-    float first = eyeStart == 0 ? 0 : width - eyeWidth;
-    float u = (first + clamp(input.movieUV.x * eyeWidth, 0.5f, eyeWidth - 0.5f)) / width;
+    float sampleWidth = floor(width * region.y);
+    float first = region.x == 0 ? 0 : width - sampleWidth;
+    float u = (first + clamp(input.movieUV.x * sampleWidth, 0.5f, sampleWidth - 0.5f)) / width;
     return float4(movie.sample(linearSampler, float2(u, input.movieUV.y)).rgb, 1);
 }

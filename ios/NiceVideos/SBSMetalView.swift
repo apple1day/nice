@@ -79,7 +79,7 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     }
 
     var mode: SBSDisplayMode = .standard {
-        didSet { if oldValue != mode { metalView.setNeedsDisplay() } }
+        didSet { if oldValue != mode { requestDraw() } }
     }
 
     private let metalView = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
@@ -91,6 +91,21 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     private var vertexBuffer: MTLBuffer?
     private var geometry: SBSMovieGeometry?
     private var frameToDraw: Frame?
+    var isReadyForDisplay: Bool {
+        metalView.device != nil && queue != nil && pipeline != nil && indexBuffer != nil
+    }
+
+    private var needsDraw = false
+    private var missedDrawables = 0
+    // Leave room in the decoder's bounded pool for its scratch, incoming and
+    // newest pending frame. Never wait for the GPU on the UI thread.
+    private let gpuSlots = DispatchSemaphore(value: 2)
+    private static let flatQuad = [
+        SBSMovieVertex(position: SIMD2(-1, 1), movieUV: SIMD2(0, 0)),
+        SBSMovieVertex(position: SIMD2(-1, -1), movieUV: SIMD2(0, 1)),
+        SBSMovieVertex(position: SIMD2(1, 1), movieUV: SIMD2(1, 0)),
+        SBSMovieVertex(position: SIMD2(1, -1), movieUV: SIMD2(1, 1))
+    ]
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -101,7 +116,7 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         metalView.clearColor = MTLClearColorMake(0, 0, 0, 1)
         metalView.isPaused = true
-        metalView.enableSetNeedsDisplay = true
+        metalView.enableSetNeedsDisplay = false
         metalView.delegate = self
 
         errorLabel.textColor = .white
@@ -111,13 +126,19 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         errorLabel.frame = bounds
         addSubview(errorLabel)
         configureMetal()
+        for event in [UIApplication.didBecomeActiveNotification, UIScene.didActivateNotification, UIWindow.didBecomeVisibleNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(presentationDidBecomeAvailable(_:)),
+                                                   name: event, object: nil)
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(applicationWillResignActive(_:)),
+                                               name: UIApplication.willResignActiveNotification, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
 
     private func configureMetal() {
         guard let device = metalView.device else {
-            errorLabel.text = "当前设备无法启用 VR 图形显示。"
+            errorLabel.text = "当前设备无法启用视频画面。"
             return
         }
         queue = device.makeCommandQueue()
@@ -131,20 +152,20 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         let indices = SBSMovieGeometry.indices
         indexBuffer = device.makeBuffer(bytes: indices, length: indices.count * MemoryLayout<UInt16>.stride, options: [])
         if queue == nil || pipeline == nil || indexBuffer == nil {
-            errorLabel.text = "无法初始化 VR 画面，请退出 VR 模式。"
+            errorLabel.text = "无法初始化视频显示，请重新打开视频。"
         }
     }
 
     func clear() {
         frameToDraw = nil
-        metalView.setNeedsDisplay()
+        requestDraw()
     }
 
     func display(_ pixelBuffer: CVPixelBuffer) {
         guard let device = metalView.device, pipeline != nil, queue != nil, indexBuffer != nil else { return }
         let width = CVPixelBufferGetWidth(pixelBuffer), height = CVPixelBufferGetHeight(pixelBuffer)
         guard width >= 2, height > 0, CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
-            errorLabel.text = "VR 模式无法显示该视频帧。"
+            errorLabel.text = "无法显示该视频帧。"
             clear()
             return
         }
@@ -158,7 +179,7 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         let texture = cvTexture.flatMap { CVMetalTextureGetTexture($0) }
             ?? upload(pixelBuffer, width: width, height: height, device: device)
         guard let texture else {
-            errorLabel.text = "无法上传 VR 视频帧，请退出 VR 模式。"
+            errorLabel.text = "无法显示视频帧，请重新打开视频。"
             clear()
             return
         }
@@ -168,7 +189,7 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         frameToDraw = Frame(pixelBuffer: pixelBuffer, imageTexture: cvTexture,
                             texture: texture, packedAspect: aspect)
         errorLabel.text = nil
-        metalView.setNeedsDisplay()
+        requestDraw()
     }
 
     private func upload(_ buffer: CVPixelBuffer, width: Int, height: Int, device: MTLDevice) -> MTLTexture? {
@@ -185,50 +206,109 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         return texture
     }
 
+    private var canPresent: Bool {
+        guard let window, !isHidden, !window.isHidden, bounds.width > 0, bounds.height > 0 else { return false }
+        if let scene = window.windowScene { return scene.activationState == .foregroundActive }
+        return UIApplication.shared.applicationState == .active
+    }
+
+    @objc private func presentationDidBecomeAvailable(_ note: Notification) { requestDraw() }
+
+    @objc private func applicationWillResignActive(_ note: Notification) { metalView.isPaused = true }
+
+    private func requestDraw() {
+        needsDraw = true
+        missedDrawables = 0
+        if canPresent && isReadyForDisplay { metalView.isPaused = false }
+    }
+
+    private func missedDisplayTick() {
+        // When a paused video loses its window or the GPU stays unavailable,
+        // do not spin forever. A new frame, layout, or reactivation wakes it.
+        missedDrawables += 1
+        if missedDrawables >= 12 { metalView.isPaused = true }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { metalView.isPaused = true }
+        else { requestDraw() }
+    }
+
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-        view.setNeedsDisplay()
+        if size.width > 0 && size.height > 0 { requestDraw() }
     }
 
     func draw(in view: MTKView) {
+        // In particular, Files dismissal, rotation and returning from the
+        // background can deliver frames before a drawable is available. Keep
+        // the newest one dirty and retry at the next display tick, even paused.
+        guard needsDraw, canPresent else {
+            view.isPaused = true
+            return
+        }
+        guard gpuSlots.wait(timeout: .now()) == .success else {
+            missedDisplayTick()
+            return
+        }
         guard let command = queue?.makeCommandBuffer(), let pass = view.currentRenderPassDescriptor,
-              let drawable = view.currentDrawable else { return }
+              let drawable = view.currentDrawable else {
+            gpuSlots.signal()
+            missedDisplayTick()
+            return
+        }
         encodeMovie(pass: pass, command: command)
+        command.addCompletedHandler { [gpuSlots] _ in gpuSlots.signal() }
         command.present(drawable)
+        needsDraw = false
         command.commit()
     }
 
     // The view and offscreen render tests use the same render pass.
     func encodeMovie(pass: MTLRenderPassDescriptor, command: MTLCommandBuffer) {
-        guard let device = metalView.device, let target = pass.colorAttachments[0].texture,
+        guard let target = pass.colorAttachments[0].texture,
               let encoder = command.makeRenderCommandEncoder(descriptor: pass) else { return }
-        if let frame = frameToDraw, mode != .standard, let pipeline, let indexBuffer {
-            let width = Double(target.width) / 2, height = Double(target.height)
-            let nextGeometry = SBSMovieGeometry(eyeViewportSize: CGSize(width: width, height: height),
-                                               eyeAspect: mode.eyeAspect(packedAspect: frame.packedAspect))
+        defer { encoder.endEncoding() }
+        guard let frame = frameToDraw, let pipeline else { return }
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setFragmentTexture(frame.texture, index: 0)
+        let width = Double(target.width), height = Double(target.height)
+        if mode == .standard {
+            // Fit the complete, unwarped picture, including non-square source pixels.
+            let fitHeight = min(height, width / Double(frame.packedAspect))
+            let fitWidth = fitHeight * Double(frame.packedAspect)
+            encoder.setViewport(MTLViewport(originX: (width - fitWidth) / 2, originY: (height - fitHeight) / 2,
+                                            width: fitWidth, height: fitHeight, znear: 0, zfar: 1))
+            encoder.setVertexBytes(Self.flatQuad, length: MemoryLayout<SBSMovieVertex>.stride * 4, index: 0)
+            setTextureRegion(rightHalf: false, widthFraction: 1, encoder: encoder)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        } else {
+            let eyeWidth = width / 2
+            let nextGeometry = SBSMovieGeometry(eyeViewportSize: CGSize(width: eyeWidth, height: height),
+                                                eyeAspect: mode.eyeAspect(packedAspect: frame.packedAspect))
             if geometry != nextGeometry || vertexBuffer == nil {
                 let vertices = nextGeometry.vertices
-                vertexBuffer = vertices.isEmpty ? nil : device.makeBuffer(
+                vertexBuffer = vertices.isEmpty ? nil : metalView.device?.makeBuffer(
                     bytes: vertices, length: vertices.count * MemoryLayout<SBSMovieVertex>.stride, options: []
                 )
                 geometry = nextGeometry
             }
-            if let vertexBuffer {
-                encoder.setRenderPipelineState(pipeline)
-                encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-                encoder.setFragmentTexture(frame.texture, index: 0)
-                for eye in 0..<2 {
-                    encoder.setViewport(MTLViewport(originX: Double(eye) * width, originY: 0, width: width,
-                                                    height: height, znear: 0, zfar: 1))
-                    var start = Float(eye) * 0.5
-                    encoder.setFragmentBytes(&start, length: MemoryLayout<Float>.stride, index: 0)
-                    encoder.drawIndexedPrimitives(type: .triangle, indexCount: SBSMovieGeometry.indices.count,
-                                                  indexType: .uint16, indexBuffer: indexBuffer, indexBufferOffset: 0)
-                }
-                // The GPU may still be reading this IOSurface after the next video
-                // frame arrives. Keep both the CVMetalTexture and source buffer alive.
-                command.addCompletedHandler { _ in withExtendedLifetime(frame) {} }
+            guard let vertexBuffer, let indexBuffer else { return }
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            for eye in 0..<2 {
+                encoder.setViewport(MTLViewport(originX: Double(eye) * eyeWidth, originY: 0, width: eyeWidth,
+                                                height: height, znear: 0, zfar: 1))
+                setTextureRegion(rightHalf: eye == 1, widthFraction: 0.5, encoder: encoder)
+                encoder.drawIndexedPrimitives(type: .triangle, indexCount: SBSMovieGeometry.indices.count,
+                                              indexType: .uint16, indexBuffer: indexBuffer, indexBufferOffset: 0)
             }
         }
-        encoder.endEncoding()
+        // GPU sampling can outlive this callback, including across output changes.
+        command.addCompletedHandler { _ in withExtendedLifetime(frame) {} }
+    }
+
+    private func setTextureRegion(rightHalf: Bool, widthFraction: Float, encoder: MTLRenderCommandEncoder) {
+        var region = SIMD2<Float>(rightHalf ? 1 : 0, widthFraction)
+        encoder.setFragmentBytes(&region, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
     }
 }

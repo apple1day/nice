@@ -44,6 +44,9 @@ struct NiceVideosApp: App {
             } else if ProcessInfo.processInfo.arguments.contains("--ui-test-file-picker") {
                 if let store = Self.emptyFilePickerTestStore { NiceVideosRootView(store: store) }
                 else { Text("无法创建文件选择器测试片库") }
+            } else if ProcessInfo.processInfo.arguments.contains("--ui-test-moving-video"),
+                      let store = Self.emptyFilePickerTestStore {
+                MovingVideoUITestRoot(store: store)
             } else {
                 NiceVideosRootView(store: .shared)
             }
@@ -53,6 +56,34 @@ struct NiceVideosApp: App {
         }
     }
 }
+
+#if DEBUG
+// Only the test runner carries the movie. Open its bytes through the same
+// document and store entry points that a successful Files selection uses.
+@MainActor private struct MovingVideoUITestRoot: View {
+    let store: VideoStore
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var opened = false
+
+    var body: some View {
+        NiceVideosRootView(store: store)
+            .task(id: scenePhase) {
+                guard !opened, scenePhase == .active else { return }
+                opened = true
+                do {
+                    guard let encoded = ProcessInfo.processInfo.environment["NICE_UI_TEST_MOVIE"],
+                          let movie = Data(base64Encoded: encoded) else {
+                        throw ClientError("Missing test movie")
+                    }
+                    let url = FileManager.default.temporaryDirectory.appendingPathComponent("moving-stereo.mp4")
+                    try movie.write(to: url, options: .atomic)
+                    let file = try await PickedVideoFile.open(url)
+                    try store.playPickedFile(file)
+                } catch { store.errorMessage = error.localizedDescription }
+            }
+    }
+}
+#endif
 
 @MainActor private struct NiceVideosRootView: View {
     @StateObject private var signing = SigningStatusModel()

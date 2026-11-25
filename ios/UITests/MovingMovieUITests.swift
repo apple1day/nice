@@ -1,0 +1,125 @@
+import UIKit
+import XCTest
+
+@MainActor
+final class MovingMovieUITests: XCTestCase {
+    func testPickedMovieActuallyChangesPixelsInStandardAndFullSBS() async throws {
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        let fixture = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "moving-stereo", withExtension: "mp4"))
+        app.launchArguments = ["--ui-test-moving-video"]
+        app.launchEnvironment["NICE_UI_TEST_MOVIE"] = try Data(contentsOf: fixture).base64EncodedString()
+        app.launch()
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
+
+        let surface = app.descendants(matching: .any)["playbackSurfaceToggle"]
+        XCTAssertTrue(surface.waitForExistence(timeout: 15), app.debugDescription)
+        try await assertChangingEyes(in: app, surface: surface, mode: "ordinary portrait")
+        revealControls(surface)
+        // Move sufficiently far into the clip that restarting at zero on a
+        // format change is unambiguous even on a slow simulator.
+        app.buttons["前进15秒"].tap()
+        try await assertChangingEyes(in: app, surface: surface, mode: "after seek")
+        revealControls(surface)
+        let elapsed = app.staticTexts["playbackElapsedTime"]
+        let before = try seconds(elapsed)
+        XCTAssertGreaterThanOrEqual(before, 15)
+
+        XCUIDevice.shared.orientation = .landscapeLeft
+        let landscape = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in app.frame.width > app.frame.height }, object: nil)
+        await fulfillment(of: [landscape], timeout: 8)
+        revealControls(surface)
+        let formats = app.buttons["videoFormatButton"]
+        formats.tap()
+        app.buttons["全宽 SBS（Full SBS）"].tap()
+        try await assertChangingEyes(in: app, surface: surface, mode: "full SBS")
+        revealControls(surface)
+        XCTAssertEqual(formats.value as? String, "全宽 SBS")
+        XCTAssertGreaterThanOrEqual(try seconds(elapsed), before - 1)
+
+        formats.tap()
+        app.buttons["退出 VR，普通播放"].tap()
+        try await assertChangingEyes(in: app, surface: surface, mode: "back to normal")
+        revealControls(surface)
+        XCTAssertEqual(formats.value as? String, "普通播放")
+        XCTAssertGreaterThanOrEqual(try seconds(elapsed), before - 1)
+
+        formats.tap()
+        app.buttons["普通播放：切换到原生显示"].tap()
+        try await assertChangingEyes(in: app, surface: surface, mode: "native ordinary landscape")
+        revealControls(surface)
+        XCTAssertGreaterThanOrEqual(try seconds(elapsed), before - 1)
+        formats.tap()
+        XCTAssertTrue(app.buttons["普通播放：切换到兼容显示"].exists)
+    }
+
+    private func seconds(_ label: XCUIElement) throws -> Int {
+        let fields = label.label.split(separator: ":")
+        guard fields.count >= 2 else { throw NSError(domain: "Missing elapsed time: " + label.label, code: 1) }
+        return try fields.reduce(0) { $0 * 60 + (try XCTUnwrap(Int($1))) }
+    }
+
+    private func revealControls(_ surface: XCUIElement) {
+        // Inside the control panel's padding when visible, inside the video tap
+        // target otherwise. This point never toggles playing video controls off.
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.95)).tap()
+    }
+
+    private func assertChangingEyes(in app: XCUIApplication, surface: XCUIElement, mode: String) async throws {
+        let viewport = surface.frame
+        let window = app.frame
+        guard !viewport.isEmpty, !window.isEmpty else {
+            return XCTFail("Missing video bounds for \(mode): surface \(viewport), window \(window)")
+        }
+        var phases = Set<Int>()
+        var last = ""
+        let deadline = Date().addingTimeInterval(12)
+        while Date() < deadline {
+            let shot = XCUIScreen.main.screenshot()
+            let colors = try sampleEyes(image: shot.image, viewport: viewport, window: window)
+            let (left, right) = colors
+            last = "\(left), \(right)"
+            if left.r > left.g + 55 && left.r > left.b + 55
+                && right.b > right.r + 55 && right.b > right.g + 55 { phases.insert(0) }
+            if left.g > left.r + 55 && left.g > left.b + 55
+                && right.r > right.b + 55 && right.g > right.b + 55 { phases.insert(1) }
+            if phases.count == 2 { return }
+            try await Task.sleep(nanoseconds: 150_000_000)
+        }
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        attachment.name = mode
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        XCTFail("\(mode): expected red/blue AND green/yellow on screen, got phases \(phases), last RGB pair \(last), surface \(viewport), window \(window)")
+    }
+
+    private typealias RGB = (r: Int, g: Int, b: Int)
+
+    // Sample the system-composited screenshot. Time labels and transport
+    // controls sit outside the centers of the two eye images.
+    private func sampleEyes(image: UIImage, viewport: CGRect, window: CGRect) throws -> (RGB, RGB) {
+        let w = 96, h = 54
+        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+        try rgba.withUnsafeMutableBytes { buffer in
+            let context = try XCTUnwrap(CGContext(data: buffer.baseAddress, width: w, height: h,
+                bitsPerComponent: 8, bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue))
+            context.translateBy(x: 0, y: CGFloat(h))
+            context.scaleBy(x: 1, y: -1)
+            UIGraphicsPushContext(context)
+            image.draw(in: CGRect(x: 0, y: 0, width: w, height: h))
+            UIGraphicsPopContext()
+        }
+        func pixel(at fraction: CGFloat) -> RGB {
+            let relativeX = (viewport.minX + fraction * viewport.width - window.minX) / window.width
+            let relativeY = (viewport.midY - window.minY) / window.height
+            let x = min(w - 1, max(0, Int(relativeX * CGFloat(w))))
+            let y = min(h - 1, max(0, Int(relativeY * CGFloat(h))))
+            let i = 4 * (y * w + x)
+            return (Int(rgba[i]), Int(rgba[i + 1]), Int(rgba[i + 2]))
+        }
+        return (pixel(at: 0.25), pixel(at: 0.75))
+    }
+}

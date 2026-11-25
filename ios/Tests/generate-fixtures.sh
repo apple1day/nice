@@ -11,3 +11,8 @@ python3 ../../tools/make_large_mp4_fixture.py offline.mp4
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -i 'color=c=red:size=128x96:rate=12' -f lavfi -i 'color=c=blue:size=128x96:rate=12' \
   -filter_complex 'hstack,setsar=3/2' -t 2 -c:v libx264 -pix_fmt yuv420p -movflags +faststart sbs.mp4
+# Generated in the UI-test target only. Every second both eye colors change.
+ffmpeg -hide_banner -loglevel error -y \
+  -f lavfi -i 'color=red:size=320x180:rate=8' -f lavfi -i 'color=blue:size=320x180:rate=8' \
+  -filter_complex "[0:v]drawbox=c=lime:t=fill:enable='gte(mod(t,2),1)'[l];[1:v]drawbox=c=yellow:t=fill:enable='gte(mod(t,2),1)'[r];[l][r]hstack" \
+  -t 90 -c:v libx264 -g 8 -pix_fmt yuv420p -movflags +faststart ../../UITests/moving-stereo.mp4

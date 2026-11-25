@@ -2,29 +2,49 @@ import UIKit
 
 /// Both VLC outputs live under the same SwiftUI surface for the lifetime of a clip.
 final class SBSPlaybackView: UIView {
+    private var pendingStart: ((SBSPlaybackView) -> Void)?
+    private var startWork: DispatchWorkItem?
+    private var didStartPlayback = false
+    private static let readinessNotifications = [
+        UIWindow.didBecomeVisibleNotification, UIScene.didActivateNotification, UIApplication.didBecomeActiveNotification
+    ]
     let drawableView = UIView()
     private(set) var renderer: SBSMetalView?
     var onOutputChange: (() -> Void)?
-    var mode: SBSDisplayMode = .standard {
-        didSet {
-            guard mode != oldValue else { return }
-            if mode == .standard {
-                renderer?.clear()
-                renderer?.removeFromSuperview()
-                renderer = nil
-                drawableView.isHidden = false
-            } else {
-                let view = renderer ?? SBSMetalView(frame: bounds)
-                if renderer == nil {
-                    view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-                    addSubview(view)
-                    renderer = view
-                }
-                view.mode = mode
-                drawableView.isHidden = true
+    private var format: SBSDisplayMode = .standard
+    private var standardFrameOutput: Bool?
+    var mode: SBSDisplayMode {
+        get { format }
+        set { configure(mode: newValue, standardFrameOutput: standardFrameOutput) }
+    }
+
+    func selectDefaultOutput(forPickedFile picked: Bool) {
+        if standardFrameOutput == nil { configure(mode: mode, standardFrameOutput: picked) }
+    }
+
+    func configure(mode: SBSDisplayMode, standardFrameOutput: Bool?) {
+        guard mode != format || standardFrameOutput != self.standardFrameOutput else { return }
+        let usedFrameOutput = renderer != nil
+        format = mode
+        self.standardFrameOutput = standardFrameOutput
+        let needsFrames = mode != .standard || standardFrameOutput == true
+        if needsFrames && renderer == nil {
+            let view = SBSMetalView(frame: bounds)
+            if mode != .standard || view.isReadyForDisplay {
+                view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                addSubview(view)
+                renderer = view
             }
-            if (oldValue == .standard) != (mode == .standard) { onOutputChange?() }
         }
+        if !needsFrames || (mode == .standard && renderer?.isReadyForDisplay == false) {
+            renderer?.clear()
+            renderer?.removeFromSuperview()
+            renderer = nil
+        }
+        renderer?.mode = mode
+        drawableView.isHidden = renderer != nil
+        // Flat and both stereo projections can share a single decoder and clock.
+        if usedFrameOutput != (renderer != nil) { onOutputChange?() }
     }
 
     override init(frame: CGRect) {
@@ -36,13 +56,74 @@ final class SBSPlaybackView: UIView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unsupported") }
+
+    // SwiftUI can create the view before giving it a window or a size. Opening
+    // VLC on that first zero-size drawable can leave an unusable framebuffer.
+    func startPlaybackWhenReady(_ start: @escaping (SBSPlaybackView) -> Void) {
+        guard !didStartPlayback, pendingStart == nil else { return }
+        pendingStart = start
+        for name in Self.readinessNotifications {
+            NotificationCenter.default.addObserver(self, selector: #selector(windowBecameAvailable(_:)),
+                                                   name: name, object: nil)
+        }
+        scheduleStartIfReady()
+    }
+
+    func cancelPendingStart() {
+        pendingStart = nil
+        startWork?.cancel()
+        startWork = nil
+        for name in Self.readinessNotifications {
+            NotificationCenter.default.removeObserver(self, name: name, object: nil)
+        }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            startWork?.cancel()
+            startWork = nil
+        } else {
+            scheduleStartIfReady()
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        scheduleStartIfReady()
+    }
+
+    @objc private func windowBecameAvailable(_ notification: Notification) { scheduleStartIfReady() }
+
+    private var hasReadyViewport: Bool {
+        guard let window, !window.isHidden, bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0 else { return false }
+        if let scene = window.windowScene { return scene.activationState == .foregroundActive }
+        return true
+    }
+
+    private func scheduleStartIfReady() {
+        guard pendingStart != nil, startWork == nil, hasReadyViewport else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.startWork = nil
+            guard self.hasReadyViewport, let start = self.pendingStart else { return }
+            self.didStartPlayback = true
+            self.cancelPendingStart()
+            start(self)
+        }
+        startWork = work
+        DispatchQueue.main.async(execute: work)
+    }
 }
 
 /// VLC selects a native drawable or vmem when it opens a video output. Reopen only
-/// when crossing that boundary. Both SBS formats share the same decoder and clock.
+/// when crossing that boundary. The flat Metal view and both SBS formats share a decoder.
 final class SBSPlaybackEngine: LocalPlaybackEngine {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private var session: VLCPlaybackEngine?
+    private weak var hostView: SBSPlaybackView?
+    private var usesFrameOutput = false
     private let pickedFile: PickedVideoFile?
     private var file: URL?
     private var seconds = 0.0
@@ -63,16 +144,19 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
             return
         }
         MainActor.assumeIsolated {
+            hostView?.onOutputChange = nil
+            hostView = host
+            host.selectDefaultOutput(forPickedFile: pickedFile != nil)
             host.onOutputChange = { [weak self, weak host] in
-                guard let self, let host else { return }
+                guard let self, let host, self.hostView === host else { return }
                 self.changeOutput(host)
             }
             if session == nil {
                 installOutput(host)
-            } else if host.mode == .standard {
-                session?.attach(to: host.drawableView)
-            } else {
+            } else if usesFrameOutput != (host.renderer != nil) {
                 changeOutput(host)
+            } else if !usesFrameOutput {
+                session?.attach(to: host.drawableView)
             }
         }
     }
@@ -127,10 +211,11 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
     }
 
     @MainActor private func installOutput(_ host: SBSPlaybackView) {
-        if let renderer = host.renderer {
-            observe(VLCPlaybackEngine(frameHandler: { [weak renderer] frame in
-                // The frame-delivery bridge coalesces output onto the main queue.
-                MainActor.assumeIsolated { renderer?.display(frame) }
+        usesFrameOutput = host.renderer != nil
+        if usesFrameOutput {
+            observe(VLCPlaybackEngine(frameHandler: { [weak self] frame in
+                // Resolve the current SwiftUI host at delivery, including after reattachment.
+                MainActor.assumeIsolated { self?.hostView?.renderer?.display(frame) }
             }, pickedFile: pickedFile))
         } else {
             nativeSession().attach(to: host.drawableView)
