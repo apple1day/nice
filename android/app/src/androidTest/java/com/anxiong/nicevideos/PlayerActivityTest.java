@@ -8,7 +8,7 @@ import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
-import android.os.Build;
+import android.os.ParcelFileDescriptor;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -34,7 +34,7 @@ import org.junit.runner.RunWith;
 import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.RandomAccessFile;
+import java.io.FileOutputStream;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -89,28 +89,57 @@ public class PlayerActivityTest {
     @Test public void decodesAndSeeksPastFourGiBFileOffsets() throws Exception {
         File clip = File.createTempFile("co64-", ".mp4", app.getCacheDir());
         try {
-            try (RandomAccessFile output = new RandomAccessFile(clip, "rw")) {
+            try (FileOutputStream output = new FileOutputStream(clip)) {
                 append(output, "co64-index.bin");
-                output.seek(1L << 32);
+                output.getChannel().position(1L << 32);
                 append(output, "co64-samples.bin");
             }
             assertTrue(clip.length() > (1L << 32));
-            try (ActivityScenario<PlayerActivity> scene = launch(Uri.fromFile(clip))) {
-                waitFor(scene, "large movie clock advances", a -> elapsed(a) >= 1);
-                assertTrue("Decoded color pattern at a sample offset beyond 4 GiB", hasColorFrame(scene));
-                scene.onActivity(a -> {
-                    SeekBar seek = (SeekBar) find(a, "播放进度");
-                    Bundle b = new Bundle();
-                    b.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE, 0.6f * seek.getMax());
-                    assertTrue(seek.performAccessibilityAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId(), b));
-                });
-                waitFor(scene, "clock after 60% seek", a -> elapsed(a) >= 6);
-                assertTrue("Video continues after seeking into 64-bit samples", hasColorFrame(scene));
-            }
+            verifyLargeMovie(Uri.fromFile(clip));
         } finally { clip.delete(); }
     }
 
-    private void append(RandomAccessFile target, String asset) throws Exception {
+    @Test @SdkSuppress(minSdkVersion = 29)
+    public void readsLargeVideoInPlaceFromAnAndroidContentProvider() throws Exception {
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Video.Media.DISPLAY_NAME, "nice-co64-" + System.nanoTime() + ".mp4");
+        values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+        values.put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/NiceVideosTests");
+        values.put(MediaStore.Video.Media.IS_PENDING, 1);
+        Uri uri = app.getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
+        assertNotNull(uri);
+        try {
+            ParcelFileDescriptor fd = app.getContentResolver().openFileDescriptor(uri, "rw");
+            assertNotNull(fd);
+            try (FileOutputStream stream = new ParcelFileDescriptor.AutoCloseOutputStream(fd)) {
+                append(stream, "co64-index.bin");
+                stream.getChannel().position(1L << 32);
+                append(stream, "co64-samples.bin");
+                assertTrue(stream.getChannel().size() > (1L << 32));
+            }
+            values.clear();
+            values.put(MediaStore.Video.Media.IS_PENDING, 0);
+            app.getContentResolver().update(uri, values, null, null);
+            verifyLargeMovie(uri);
+        } finally { app.getContentResolver().delete(uri, null, null); }
+    }
+
+    private void verifyLargeMovie(Uri uri) throws Exception {
+        try (ActivityScenario<PlayerActivity> scene = launch(uri)) {
+            waitFor(scene, "large movie clock advances", a -> elapsed(a) >= 1);
+            assertTrue("Decoded color pattern at a sample offset beyond 4 GiB", hasColorFrame(scene));
+            scene.onActivity(a -> {
+                SeekBar seek = (SeekBar) find(a, "播放进度");
+                Bundle b = new Bundle();
+                b.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE, 0.6f * seek.getMax());
+                assertTrue(seek.performAccessibilityAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId(), b));
+            });
+            waitFor(scene, "clock after 60% seek", a -> elapsed(a) >= 6);
+            assertTrue("Video continues after seeking into 64-bit samples", hasColorFrame(scene));
+        }
+    }
+
+    private void append(OutputStream target, String asset) throws Exception {
         try (InputStream in = tests.getAssets().open(asset)) {
             byte[] buffer = new byte[64 * 1024];
             for (int n; (n = in.read(buffer)) >= 0;) target.write(buffer, 0, n);

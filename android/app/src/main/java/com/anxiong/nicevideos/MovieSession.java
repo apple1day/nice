@@ -5,6 +5,7 @@ import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.util.Log;
 import android.view.Surface;
 
 import androidx.media3.common.AudioAttributes;
@@ -127,9 +128,13 @@ final class MovieSession implements Player.Listener {
         if (state == Player.STATE_READY) {
             Tracks tracks = player.getCurrentTracks();
             if (!tracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) {
-                fail(tracks.containsType(C.TRACK_TYPE_VIDEO)
-                        ? "当前解码器无法处理该视频轨道，请在片源信息中切换解码方式。"
-                        : "所选文件没有可播放的视频轨道。");
+                if (softwareOnly) {
+                    fail("设备上的软件解码器无法播放这条视频轨道。请在「片源信息」恢复自动解码。");
+                } else if (tracks.containsType(C.TRACK_TYPE_VIDEO)) {
+                    fail("当前解码器无法处理该视频轨道，请在片源信息中切换解码方式。");
+                } else {
+                    fail("所选文件没有可播放的视频轨道。");
+                }
                 return;
             }
             publishFormat();
@@ -199,6 +204,7 @@ final class MovieSession implements Player.Listener {
     private void fail(String message) {
         if (closed || failed) return;
         failed = true;
+        Log.w("NiceVideos-session", message);
         decoder.removeCallbacks(ticker);
         if (player != null) player.pause();
         deliver(() -> listener.onError(message));
@@ -220,7 +226,8 @@ final class MovieSession implements Player.Listener {
                     player = null;
                 }
             } finally {
-                thread.quitSafely();
+                // release() enqueues final analytics events on this looper.
+                decoder.post(thread::quitSafely);
                 if (released != null) main.post(released);
             }
         });

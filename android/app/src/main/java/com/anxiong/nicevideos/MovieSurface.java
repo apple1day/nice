@@ -43,6 +43,9 @@ public final class MovieSurface extends GLSurfaceView {
     private volatile Size frameSize = new Size(0, 0);
     private volatile boolean active = true;
     private volatile long decoderGeneration;
+    private volatile long presentedSamples;
+
+    long presentedSamples() { return presentedSamples; }
 
     public MovieSurface(Context context, Listener listener) {
         super(context);
@@ -137,6 +140,7 @@ public final class MovieSurface extends GLSurfaceView {
         private int viewWidth, viewHeight, textureName, program;
         private int position, texMatrix, poseMatrix, projectionId, fit, lens, rayExtent, fisheyeDisc, eyeRect, inset;
         private long imageGeneration = -1, announcedGeneration = -1;
+        private long imageTimestamp, presentedTimestamp;
 
         VideoRenderer() {
             quad.put(new float[] {-1, -1, 1, -1, -1, 1, 1, 1}).position(0);
@@ -215,6 +219,7 @@ public final class MovieSurface extends GLSurfaceView {
                 try {
                     image.updateTexImage();
                     image.getTransformMatrix(transform);
+                    imageTimestamp = image.getTimestamp();
                     imageGeneration = generation;
                 } catch (RuntimeException e) {
                     reportError(e);
@@ -242,6 +247,11 @@ public final class MovieSurface extends GLSurfaceView {
                 int split = viewWidth / 2;
                 drawEye(0, split, selected, false, width, height);
                 drawEye(split, viewWidth - split, selected, true, width, height);
+            }
+            // Camera and HUD redraws reuse the same decoder sample.
+            if (announcedGeneration != generation || imageTimestamp != presentedTimestamp) {
+                presentedTimestamp = imageTimestamp;
+                presentedSamples++;
             }
             if (announcedGeneration != generation) {
                 announcedGeneration = generation;

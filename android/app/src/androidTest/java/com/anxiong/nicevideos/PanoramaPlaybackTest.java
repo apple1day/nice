@@ -19,6 +19,10 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import androidx.media3.common.Format;
+import androidx.media3.common.MimeTypes;
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -29,6 +33,8 @@ import java.io.File;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -93,21 +99,30 @@ public final class PanoramaPlaybackTest {
         } finally { file.delete(); }
     }
 
+    @Test public void hdHevcDeliversChangingProjectedEyesWhenDeviceSupportsIt() throws Exception {
+        requireHevcMotion("hevc-hd", 1280, 640);
+    }
+
     @Test public void fourKHevcDeliversChangingProjectedEyesWhenDeviceSupportsIt() throws Exception {
-        MediaFormat source = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, 3840, 1920);
+        requireHevcMotion("hevc", 3840, 1920);
+    }
+
+    private void requireHevcMotion(String asset, int width, int height) throws Exception {
+        String format = width + "×" + height + " HEVC";
+        MediaFormat source = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, width, height);
         source.setInteger(MediaFormat.KEY_FRAME_RATE, 4);
         String decoder = new MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(source);
-        Assume.assumeTrue("Device advertises no HEVC decoder for 3840×1920 at 4 fps", decoder != null);
-        File file = fixture("hevc");
+        Assume.assumeTrue("Device advertises no decoder for " + format + " at 4 fps", decoder != null);
+        File file = fixture(asset);
         try (ActivityScenario<PlayerActivity> player = open(file)) {
             MovieSurface movie = surface(player);
-            await("4K HEVC time did not advance (" + decoder + ")", () -> seconds(player) >= 1);
+            await(format + " time did not advance (" + decoder + ")", () -> seconds(player) >= 1);
             press(player, "进入 VR");
             try (Screen screen = new Screen(movie)) {
                 screen.frontMotion();
                 press(player, "切换眼镜显示");
                 boolean[] seen = new boolean[2];
-                screen.until("both 4K eyes must pulse together", (c, l, r) -> {
+                screen.until(format + ": both eyes must pulse together", (c, l, r) -> {
                     if (at(l, .5, .5) && at(r, .5, .5) && leftEye(l) && rightEye(r)) {
                         if (Color.blue(l) < 57 && Color.blue(r) < 185) seen[0] = true;
                         if (Color.blue(l) >= 57 && Color.blue(r) >= 185) seen[1] = true;
@@ -118,45 +133,85 @@ public final class PanoramaPlaybackTest {
         } finally { file.delete(); }
     }
 
-    @Test public void switchingToSoftwareAvcResumesThePanoramaAtItsPlayhead() throws Exception {
-        File file = fixture("sbs");
+    @Test public void switchingAvcDecoderKeepsThePlayheadOrAllowsRecovery() throws Exception {
+        exerciseSoftwareSwitch("sbs", softwareDecoders(MimeTypes.VIDEO_H264, 384, 192, 8));
+    }
+
+    @Test public void softwareDecoderCanActuallyRenderThePanorama() throws Exception {
+        List<String> vp9 = softwareDecoders(MimeTypes.VIDEO_VP9, 384, 192, 8);
+        if (!vp9.isEmpty()) {
+            exerciseSoftwareSwitch("vp9", vp9);
+            return;
+        }
+        List<String> hevc = softwareDecoders(MimeTypes.VIDEO_H265, 1280, 640, 4);
+        Assume.assumeTrue("No compatible software VP9 or HEVC decoder for either motion fixture", !hevc.isEmpty());
+        exerciseSoftwareSwitch("hevc-hd", hevc);
+    }
+
+    private static List<String> softwareDecoders(String mime, int width, int height, int fps) throws Exception {
+        Format source = new Format.Builder().setSampleMimeType(mime).setWidth(width).setHeight(height)
+                .setFrameRate(fps).build();
+        List<String> names = new ArrayList<>();
+        for (MediaCodecInfo codec : MediaCodecSelector.DEFAULT.getDecoderInfos(mime, false, false)) {
+            if (codec.softwareOnly && codec.isFormatSupported(source)) names.add(codec.name);
+        }
+        return names;
+    }
+
+    private void exerciseSoftwareSwitch(String fixtureName, List<String> software) throws Exception {
+        File file = fixture(fixtureName);
         try (ActivityScenario<PlayerActivity> player = open(file)) {
             MovieSurface movie = surface(player);
-            await("AVC playback didn't start", () -> seconds(player) >= 1);
+            await("Automatic playback didn't start", () -> seconds(player) >= 1);
             press(player, "快进15秒");
             await("Could not seek before switching decoder", () -> seconds(player) >= 15);
             press(player, "进入 VR");
             long before = seconds(player);
             press(player, "片源信息");
             dialogText("尝试软件解码", true);
-            await("Software decoder reset or stalled the clock", () -> seconds(player) >= before + 2);
+            if (software.isEmpty()) {
+                // The API 30 emulator's only AVC decoder is the goldfish codec.
+                // A failed software retry must leave a usable path back to it.
+                dialogText("设备上的软件解码器无法播放这条视频轨道", false);
+                press(player, "片源信息");
+                dialogText("恢复自动解码", true);
+            }
+            await("Decoder switch reset or stalled the clock at " + before,
+                    () -> seconds(player) >= before + 2);
             try (Screen screen = new Screen(movie)) { screen.frontMotion(); }
-            press(player, "片源信息");
-            // The selected-track detail gets this suffix only from the newly
-            // prepared software session; checking a menu preference is weaker.
-            dialogText("（软件）", false);
-            dialogText("关闭", true);
+            if (!software.isEmpty()) {
+                press(player, "片源信息");
+                await("Source details omitted the active software decoder " + software, () -> {
+                    for (String name : software) {
+                        if (inActiveWindow(name + "（软件）", false)) return true;
+                    }
+                    return false;
+                });
+                dialogText("关闭", true);
+            }
         } finally { file.delete(); }
     }
 
     /** AlertDialog is a separate window, accessed through the real accessibility tree. */
     private static void dialogText(String text, boolean click) throws Exception {
-        await("Missing dialog " + (click ? "button " : "text ") + text, () -> {
-            AccessibilityNodeInfo root = InstrumentationRegistry.getInstrumentation()
-                    .getUiAutomation().getRootInActiveWindow();
-            if (root == null) return false;
-            try {
-                for (AccessibilityNodeInfo node : root.findAccessibilityNodeInfosByText(text)) {
-                    try {
-                        if (!node.isVisibleToUser() || node.getText() == null) continue;
-                        if (!click && node.getText().toString().contains(text)) return true;
-                        if (click && text.contentEquals(node.getText()) && node.isClickable()
-                                && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
-                    } finally { node.recycle(); }
-                }
-                return false;
-            } finally { root.recycle(); }
-        });
+        await("Missing " + (click ? "button " : "text ") + text, () -> inActiveWindow(text, click));
+    }
+
+    private static boolean inActiveWindow(String text, boolean click) {
+        AccessibilityNodeInfo root = InstrumentationRegistry.getInstrumentation()
+                .getUiAutomation().getRootInActiveWindow();
+        if (root == null) return false;
+        try {
+            for (AccessibilityNodeInfo node : root.findAccessibilityNodeInfosByText(text)) {
+                try {
+                    if (!node.isVisibleToUser() || node.getText() == null) continue;
+                    if (!click && node.getText().toString().contains(text)) return true;
+                    if (click && text.contentEquals(node.getText()) && node.isClickable()
+                            && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+                } finally { node.recycle(); }
+            }
+            return false;
+        } finally { root.recycle(); }
     }
 
     private File fixture(String packing) throws Exception {

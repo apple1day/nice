@@ -35,11 +35,22 @@ for packing in sbs tb; do
     -movflags +faststart "$dest/vr-chart-$packing.mp4"
 done
 
-# Exercise a real 3840x1920 HEVC bitstream in the system codec. Scale the
-# coordinate chart before encoding; repeat the short GOP without transcoding.
-ffmpeg -nostdin -v error -y -i "$dest/vr-chart-sbs.mp4" -t 2 -vf 'fps=4,scale=3840:1920:flags=bilinear' \
-  -c:v libx265 -threads 2 -preset ultrafast \
-  -x265-params 'pools=2:frame-threads=2:keyint=4:min-keyint=4:scenecut=0:bframes=0:log-level=error' \
-  -pix_fmt yuv420p -tag:v hvc1 -c:a aac "$work/4k.mp4"
-ffmpeg -nostdin -v error -y -stream_loop 11 -i "$work/4k.mp4" -t 24 -c copy -tag:v hvc1 \
-  -movflags +faststart "$dest/vr-chart-hevc.mp4"
+# Use the same moving coordinate chart at a common decoder size and at 4K.
+# The two-second HEVC GOP can be repeated without re-encoding the test movie.
+for variant in hevc-hd hevc; do
+  if [[ "$variant" == hevc-hd ]]; then scale=1280:640; else scale=3840:1920; fi
+  ffmpeg -nostdin -v error -y -i "$dest/vr-chart-sbs.mp4" -t 2 -vf "fps=4,scale=$scale:flags=bilinear" \
+    -c:v libx265 -threads 2 -preset ultrafast \
+    -x265-params 'pools=2:frame-threads=2:keyint=4:min-keyint=4:scenecut=0:bframes=0:log-level=error' \
+    -pix_fmt yuv420p -tag:v hvc1 -an "$work/$variant.mp4"
+  ffmpeg -nostdin -v error -y -stream_loop 11 -i "$work/$variant.mp4" -f lavfi -i 'anullsrc=r=44100:cl=mono' \
+    -map 0:v:0 -map 1:a:0 -t 24 -c:v copy -tag:v hvc1 -c:a aac \
+    -movflags +faststart "$dest/vr-chart-$variant.mp4"
+done
+
+# Include a small VP9 profile-0 chart for devices with software VP9 but no
+# software AVC decoder. Check both a successful manual switch and AVC recovery.
+ffmpeg -nostdin -v error -y -i "$work/sbs.mp4" -t 2 -c:v libvpx-vp9 -threads 2 \
+  -deadline realtime -cpu-used 7 -g 8 -crf 26 -b:v 0 -pix_fmt yuv420p -c:a copy "$work/vp9.mp4"
+ffmpeg -nostdin -v error -y -stream_loop 29 -i "$work/vp9.mp4" -t 60 -c copy \
+  -movflags +faststart "$dest/vr-chart-vp9.mp4"

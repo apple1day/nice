@@ -65,6 +65,8 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     private String bookmarkKey, videoMime;
     private int width, height;
     private long duration, position, lastSave;
+    private long observedSamples = -1, samplePosition, sampleWallTime;
+    private boolean stalledPicture, playBeforeFailure;
     private boolean active, prepared, failed, ended, firstFrame, playing, wantsPlay = true;
     private boolean hasFocus, resumeOnGain, dragging, controlsVisible = true, dialogOpen, userFullscreen;
     private AudioManager audio;
@@ -310,7 +312,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("片源信息").setMessage(info)
                 .setPositiveButton("关闭", null)
                 .setNeutralButton(softwareDecoder ? "恢复自动解码" : "尝试软件解码", (d, w) -> {
-                    boolean resume = failed || wantsPlay;
+                    boolean resume = failed ? playBeforeFailure : wantsPlay;
                     softwareDecoder = !softwareDecoder;
                     retireSession();
                     failed = false;
@@ -328,7 +330,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     }
     private void armControls() {
         main.removeCallbacks(hide);
-        if (active && controlsVisible && playing && !dragging && !dialogOpen && !failed) main.postDelayed(hide, 4500);
+        if (active && controlsVisible && playing && !dragging && !dialogOpen && !failed && !stalledPicture) main.postDelayed(hide, 4500);
     }
     private void status(String message, boolean canRetry) {
         statusLabel.setText(message); statusLabel.setVisibility(message == null ? View.GONE : View.VISIBLE);
@@ -341,7 +343,9 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         if (!active || releasingSession || session != null || surface == null || !surface.isValid()
                 || failed || isFinishing() || isDestroyed()) return;
         if (wantsPlay && !acquireFocus()) wantsPlay = false;
-        prepared = false; playing = false; firstFrame = false; status("正在打开视频…", false);
+        prepared = false; playing = false; firstFrame = false; videoMime = null;
+        resetPictureWatch();
+        status("正在打开视频…", false);
         movie.expectNewDecoderFrame();
         session = new MovieSession(this); session.open(this, uri, surface, position, wantsPlay, softwareDecoder);
         refresh();
@@ -363,9 +367,42 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         refresh();
     }
     @Override public void onVideoSize(int w, int h) { width = w; height = h; movie.setVideoSize(w,h); }
-    @Override public void onBuffering(boolean buffering) { if (!failed) status(buffering ? "正在缓冲…" : null, false); }
+    @Override public void onBuffering(boolean buffering) {
+        if (buffering) resetPictureWatch();
+        if (!failed) status(buffering ? "正在缓冲…" : null, false);
+    }
+
+    private void resetPictureWatch() {
+        observedSamples = -1;
+        if (stalledPicture) {
+            stalledPicture = false;
+            if (!failed) status(null, false);
+            armControls();
+        }
+    }
+
+    private void checkPictureMotion(long current, boolean moving) {
+        if (!moving || !firstFrame || !prepared || failed) {
+            resetPictureWatch();
+            return;
+        }
+        long samples = movie.presentedSamples();
+        long now = SystemClock.elapsedRealtime();
+        if (samples != observedSamples || current < samplePosition) {
+            resetPictureWatch();
+            observedSamples = samples;
+            samplePosition = current;
+            sampleWallTime = now;
+        } else if (!stalledPicture && current - samplePosition >= 10000 && now - sampleWallTime >= 10000) {
+            stalledPicture = true;
+            String action = softwareDecoder ? "恢复自动解码" : "尝试软件解码";
+            status("播放进度仍在走，但已超过 10 秒没有新画面。可在「片源信息」" + action + "。", false);
+            showControls(true);
+        }
+    }
     @Override public void onProgress(long current, boolean motion) {
         boolean changed = playing != motion; playing = motion; position = current;
+        checkPictureMotion(current, motion);
         if (!dragging) {
             elapsed.setText(time(position));
             if (duration > 0) bar.setProgress((int) Math.min(STEPS, position * STEPS / duration));
@@ -378,15 +415,18 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     }
     @Override public void onEnded() {
         ended = true; playing = false; wantsPlay = false; position = 0;
+        resetPictureWatch();
         bookmarks.edit().remove(bookmarkKey).apply(); elapsed.setText(time(duration)); bar.setProgress(STEPS);
         abandonFocus(); showControls(true); refresh();
     }
     @Override public void onError(String message) {
+        if (!failed) playBeforeFailure = wantsPlay;
         failed = true; wantsPlay = false; playing = false; retireSession(); abandonFocus();
         status(message, true); showControls(true); refresh();
     }
     private void jump(long target) {
         if (!prepared || session == null || duration <= 0) return;
+        resetPictureWatch();
         ended = false; position = Math.min(duration, Math.max(0, target)); session.seek(position); armControls();
     }
     private void requestPlay() {
@@ -434,6 +474,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
             });
         }
         prepared = false; playing = false;
+        resetPictureWatch();
         bar.setEnabled(false); main.removeCallbacks(firstFrameCheck); main.removeCallbacks(hide);
     }
     private void saveBookmark() {
@@ -452,7 +493,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     }
     @Override protected void onPause() {
         if (movie != null) {
-            active = false; look.setResumed(false); saveBookmark(); wantsPlay = false; abandonFocus(); retireSession(); surface = null;
+            active = false; look.setResumed(false); saveBookmark(); wantsPlay = false; playBeforeFailure = false; abandonFocus(); retireSession(); surface = null;
             movie.onPause(); unregisterReceiver(noisy); refresh();
         }
         super.onPause();
