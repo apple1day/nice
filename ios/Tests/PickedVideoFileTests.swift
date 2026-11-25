@@ -73,7 +73,7 @@ final class PickedVideoFileTests: XCTestCase {
         var decoder = opened
         opened = nil
         XCTAssertNotNil(originalGrant, "The decoder must keep the picker's original grant")
-        XCTAssertEqual(try read(try XCTUnwrap(decoder), at: 4).1, [0x66])
+        XCTAssertEqual(try read(XCTUnwrap(decoder), at: 4).1, [0x66])
         decoder = nil
         await fulfillment(of: [stopped], timeout: 5)
         XCTAssertEqual(try Data(contentsOf: url), data)
@@ -133,6 +133,7 @@ final class PickedVideoFileTests: XCTestCase {
         coordinator.coordinate(writingItemAt: url, options: .forMoving,
                                writingItemAt: moved, options: .forReplacing, error: &error) { from, to in
             move = Result {
+                coordinator.item(at: from, willMoveTo: to)
                 try FileManager.default.moveItem(at: from, to: to)
                 coordinator.item(at: from, didMoveTo: to)
             }
