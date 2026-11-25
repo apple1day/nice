@@ -111,7 +111,7 @@ final class VideoLibrary {
     private void removeTransfer(Entry e) throws IOException {
         if (e.job >= 0) manager().remove(e.job);
         File f = file(e);
-        if (f.exists() && !f.delete()) throw new IOException("无法清理本机副本。");
+        if (!f.delete() && f.exists()) throw new IOException("无法清理本机副本。");
     }
 
     void enqueue(ServerVideos.Movie movie, Entry prior) throws IOException {
