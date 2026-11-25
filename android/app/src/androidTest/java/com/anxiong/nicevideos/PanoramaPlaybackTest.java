@@ -4,13 +4,17 @@ import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.media.AudioTrack;
 import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.net.Uri;
 import android.opengl.Matrix;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.view.InputDevice;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.PixelCopy;
 import android.view.View;
@@ -69,6 +73,150 @@ public final class PanoramaPlaybackTest {
             }
             assertTrue("Entering and leaving VR reset the playhead", seconds(player) >= before);
         } finally { file.delete(); }
+    }
+
+    @Test public void draggingPanoramaAndScrubbingTimelineKeepAudioPlaying() throws Exception {
+        File file = fixture("sbs");
+        try (ActivityScenario<PlayerActivity> scene = open(file)) {
+            await("Movie didn't start", () -> seconds(scene) >= 1);
+            press(scene, "进入 VR");
+            PlayerAudioProbe probe = new PlayerAudioProbe(scene);
+            await("Platform audio output didn't start", () -> {
+                AudioTrack track = probe.track();
+                return track != null && track.getPlaybackHeadPosition() > 0;
+            });
+            dragWithAudio(scene, "视频画面", probe, MotionEvent.ACTION_UP);
+            assertEquals("Looking around issued a seek", 0, probe.seeks.get());
+            dragWithAudio(scene, "播放进度", probe, MotionEvent.ACTION_CANCEL);
+            assertEquals("Cancelled preview issued a seek", 0, probe.seeks.get());
+            dragWithAudio(scene, "播放进度", probe, MotionEvent.ACTION_UP);
+            await("Release did not commit the target position", () ->
+                    probe.seeks.get() == 1 && probe.mediaPosition() > 34000 && probe.mediaPosition() < 52000);
+            await("Audio output did not resume after committed seek", () -> {
+                AudioTrack track = probe.track();
+                if (track == null || track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) return false;
+                int start = track.getPlaybackHeadPosition();
+                SystemClock.sleep(250);
+                return probe.track() == track && track.getPlaybackHeadPosition() - start > track.getSampleRate() / 10;
+            });
+            assertEquals("Multiple seeks on one release", 1, probe.seeks.get());
+        } finally { file.delete(); }
+    }
+
+    @Test public void repeatedAccessibleSeekWhilePausedCommitsOnceAndStaysPaused() throws Exception {
+        File file = fixture("sbs");
+        try (ActivityScenario<PlayerActivity> scene = open(file)) {
+            await("Movie didn't start", () -> seconds(scene) >= 1);
+            PlayerAudioProbe probe = new PlayerAudioProbe(scene);
+            press(scene, "播放或暂停");
+            await("Pause didn't reach decoder", () -> probe.pauses.get() == 1);
+            scene.onActivity(a -> {
+                SeekBar slider = (SeekBar) control(a, "播放进度");
+                for (float fraction : new float[]{.2f, .35f, .55f, .75f}) {
+                    Bundle args = new Bundle();
+                    args.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE, fraction * slider.getMax());
+                    assertTrue("Accessible seek rejected", slider.performAccessibilityAction(
+                            AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId(), args));
+                }
+            });
+            await("Accessible updates should seek once to 75%", () -> probe.seeks.get() == 1
+                    && Math.abs(probe.mediaPosition() - 45000) < 1300);
+            long pausedAt = probe.mediaPosition();
+            SystemClock.sleep(400);
+            assertEquals("Paused scrubbing started playback", pausedAt, probe.mediaPosition());
+            AudioTrack track = probe.track();
+            assertTrue("Paused scrubbing started platform audio",
+                    track == null || track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING);
+            assertEquals("Additional seeks after debounce", 1, probe.seeks.get());
+        } finally { file.delete(); }
+    }
+
+    private static void dragWithAudio(ActivityScenario<PlayerActivity> scene, String target,
+                                      PlayerAudioProbe probe, int terminalAction) throws Exception {
+        int[] bounds = new int[4];
+        scene.onActivity(a -> {
+            View v = control(a, target);
+            if (!v.isShown()) control(a, "视频画面").performClick();
+            assertTrue("Drag target hidden", v.isShown());
+            int[] origin = new int[2];
+            v.getLocationOnScreen(origin);
+            bounds[0] = origin[0]; bounds[1] = origin[1];
+            bounds[2] = v.getWidth(); bounds[3] = v.getHeight();
+        });
+        AudioTrack track = probe.track();
+        assertNotNull(track);
+        int underruns = track.getUnderrunCount();
+        int rendererUnderruns = probe.underruns.get();
+        int seeks = probe.seeks.get(), pauses = probe.pauses.get();
+        float y = bounds[1] + bounds[3] * .5f;
+        long down = SystemClock.uptimeMillis();
+        float x = bounds[0] + bounds[2] * .25f;
+        pointer(down, MotionEvent.ACTION_DOWN, x, y);
+        try {
+            for (int window = 0; window < 3; window++) {
+                long start = SystemClock.elapsedRealtime();
+                int first = track.getPlaybackHeadPosition();
+                for (int i = 1; i <= 20; i++) {
+                    x = bounds[0] + bounds[2] * (.25f + .45f * (window * 20 + i) / 60);
+                    pointer(down, MotionEvent.ACTION_MOVE, x, y);
+                    SystemClock.sleep(24);
+                }
+                long elapsed = SystemClock.elapsedRealtime() - start;
+                long played = 1000L * (track.getPlaybackHeadPosition() - first) / track.getSampleRate();
+                assertTrue(target + " PCM playout advanced " + played + " ms during " + elapsed + " ms",
+                        played >= elapsed * .65 - 40);
+                assertSame(target + " reopened platform audio output", track, probe.track());
+            }
+            assertEquals(target + " starved AudioTrack", underruns, track.getUnderrunCount());
+            assertEquals(target + " reported audio underruns", rendererUnderruns, probe.underruns.get());
+            assertEquals(target + " paused audio", pauses, probe.pauses.get());
+            assertEquals(target + " issued a seek during movement", seeks, probe.seeks.get());
+        } finally { pointer(down, terminalAction, x, y); }
+    }
+
+    private static void pointer(long down, int action, float x, float y) {
+        MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action, x, y, 0);
+        event.setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN);
+        try { InstrumentationRegistry.getInstrumentation().sendPointerSync(event); }
+        finally { event.recycle(); }
+    }
+
+    @Test public void gamepadPausesOnceSeeksAndRecentersInVr() throws Exception {
+        File file = fixture("sbs");
+        try (ActivityScenario<PlayerActivity> player = open(file)) {
+            MovieSurface movie = surface(player);
+            await("Movie didn't start", () -> seconds(player) >= 1);
+            press(player, "进入 VR");
+            sendButton(player, KeyEvent.KEYCODE_BUTTON_A);
+            player.onActivity(a -> assertEquals("播放", ((TextView) control(a, "播放或暂停")).getText().toString()));
+            sendButton(player, KeyEvent.KEYCODE_BUTTON_R1);
+            await("Gamepad seek didn't reach the requested position", () -> seconds(player) >= 15);
+            long at = seconds(player);
+            swipeLeft(player, movie);
+            try (Screen screen = new Screen(movie)) {
+                screen.until("drag while paused moves the view", (c, l, r) -> Color.red(c) > 145 && leftEye(c));
+                sendButton(player, KeyEvent.KEYCODE_BUTTON_X);
+                screen.single("gamepad recentered a paused movie", .50, .50);
+            }
+            sendButton(player, KeyEvent.KEYCODE_BUTTON_Y);
+            player.onActivity(a -> assertFalse(control(a, "播放或暂停").isShown()));
+            sendButton(player, KeyEvent.KEYCODE_BUTTON_A);
+            await("Gamepad resume didn't advance", () -> seconds(player) > at);
+            sendButton(player, KeyEvent.KEYCODE_BUTTON_L1);
+            await("Gamepad rewind didn't seek", () -> seconds(player) < 10);
+        } finally { file.delete(); }
+    }
+
+    private static void sendButton(ActivityScenario<PlayerActivity> player, int code) {
+        player.onActivity(a -> {
+            long down = SystemClock.uptimeMillis();
+            for (int repeat = 0; repeat <= 2; repeat++) {
+                int action = repeat == 2 ? KeyEvent.ACTION_UP : KeyEvent.ACTION_DOWN;
+                KeyEvent event = new KeyEvent(down, SystemClock.uptimeMillis(), action, code,
+                        repeat == 1 ? 1 : 0, 0, 0, 0, 0, InputDevice.SOURCE_GAMEPAD);
+                assertTrue(a.dispatchKeyEvent(event));
+            }
+        });
     }
 
     @Test public void projectedRaysSampleExpectedDirectionsAndTopBottomEyes() throws Exception {
@@ -212,6 +360,51 @@ public final class PanoramaPlaybackTest {
             }
             return false;
         } finally { root.recycle(); }
+    }
+
+    @Test public void configuredDoubleTapTogglesOnlyAfterReleaseAndHoldingThenDraggingLooksAround() throws Exception {
+        VrGestureSettings previous = VrGestureSettings.read(app);
+        File file = fixture("sbs");
+        new VrGestureSettings(VrGestureSettings.DoubleTap.PLAY_PAUSE, VrGestureSettings.Pinch.FINE).save(app);
+        try (ActivityScenario<PlayerActivity> player = open(file)) {
+            await("Movie didn't start", () -> seconds(player) >= 1);
+            press(player, "进入 VR");
+            MovieSurface movie = surface(player);
+            // A stationary press followed by a drag must still turn the VR camera.
+            long down = SystemClock.uptimeMillis();
+            touchMovie(player, movie, down, MotionEvent.ACTION_DOWN, .74f);
+            SystemClock.sleep(android.view.ViewConfiguration.getLongPressTimeout() + 75);
+            touchMovie(player, movie, down, MotionEvent.ACTION_MOVE, .39f);
+            touchMovie(player, movie, down, MotionEvent.ACTION_UP, .32f);
+            try (Screen screen = new Screen(movie)) {
+                screen.until("long hold then drag still looks right", (center, l, r) ->
+                        Color.red(center) > 144 && near(Color.green(center), 128) && leftEye(center));
+            }
+            player.onActivity(a -> assertEquals("暂停", ((TextView) control(a, "播放或暂停")).getText().toString()));
+            SystemClock.sleep(android.view.ViewConfiguration.getDoubleTapTimeout() + 75);
+            down = SystemClock.uptimeMillis();
+            touchMovie(player, movie, down, MotionEvent.ACTION_DOWN, .5f);
+            touchMovie(player, movie, down, MotionEvent.ACTION_UP, .5f);
+            SystemClock.sleep(75);
+            down = SystemClock.uptimeMillis();
+            touchMovie(player, movie, down, MotionEvent.ACTION_DOWN, .5f);
+            player.onActivity(a -> assertEquals("Double tap paused before release", "暂停",
+                    ((TextView) control(a, "播放或暂停")).getText().toString()));
+            touchMovie(player, movie, down, MotionEvent.ACTION_UP, .5f);
+            SystemClock.sleep(android.view.ViewConfiguration.getDoubleTapTimeout() + 75);
+            player.onActivity(a -> assertEquals("Double tap did not pause exactly once", "播放",
+                    ((TextView) control(a, "播放或暂停")).getText().toString()));
+        } finally { previous.save(app); file.delete(); }
+    }
+
+    private static void touchMovie(ActivityScenario<PlayerActivity> scene, MovieSurface movie, long down,
+                                   int action, float xFraction) {
+        scene.onActivity(a -> {
+            MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action,
+                    xFraction * movie.getWidth(), .5f * movie.getHeight(), 0);
+            event.setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN);
+            try { movie.dispatchTouchEvent(event); } finally { event.recycle(); }
+        });
     }
 
     private File fixture(String packing) throws Exception {

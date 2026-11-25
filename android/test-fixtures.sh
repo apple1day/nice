@@ -31,8 +31,10 @@ for packing in sbs tb; do
     -i "color=black:s=$size:r=8,format=gbrp,geq=r='32+192*mod(X,192)/191':g='32+192*mod(Y,192)/191':b='36+128*$eye+42*gte(mod(N,16),8)'" \
     -f lavfi -i 'anullsrc=r=44100:cl=mono' -t 2 -c:v libx264 -threads 2 -g 8 -bf 0 \
     -pix_fmt yuv420p -c:a aac "$work/$packing.mp4"
-  ffmpeg -nostdin -v error -y -stream_loop 29 -i "$work/$packing.mp4" -c copy -t 60 \
-    -movflags +faststart "$dest/vr-chart-$packing.mp4"
+  # Give the gesture tests a continuous audible track across the looped video.
+  ffmpeg -nostdin -v error -y -stream_loop 29 -i "$work/$packing.mp4" \
+    -f lavfi -i 'sine=frequency=440:sample_rate=44100' -map 0:v:0 -map 1:a:0 \
+    -c:v copy -c:a aac -t 60 -movflags +faststart "$dest/vr-chart-$packing.mp4"
 done
 
 # Use the same moving coordinate chart at a common decoder size and at 4K.

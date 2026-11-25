@@ -21,6 +21,9 @@ import androidx.media3.datasource.DefaultDataSource;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.analytics.AnalyticsListener;
+import androidx.media3.exoplayer.audio.AudioSink;
+import androidx.media3.exoplayer.audio.DefaultAudioSink;
+import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider;
 import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
 import androidx.media3.exoplayer.source.ProgressiveMediaSource;
@@ -45,6 +48,7 @@ final class MovieSession implements Player.Listener {
     private final HandlerThread thread = new HandlerThread("NiceVideos-session");
     private final Handler decoder;
     private volatile boolean closed;
+    private volatile int audioUnderruns;
     private ExoPlayer player;
     private boolean failed;
     private boolean softwareOnly;
@@ -58,6 +62,8 @@ final class MovieSession implements Player.Listener {
         decoder = new Handler(thread.getLooper());
     }
 
+    int audioUnderruns() { return audioUnderruns; }
+
     private void deliver(Runnable callback) {
         main.post(() -> { if (!closed) callback.run(); });
     }
@@ -68,8 +74,20 @@ final class MovieSession implements Player.Listener {
             if (closed) return;
             softwareOnly = software;
             try {
-                DefaultRenderersFactory renderers = new DefaultRenderersFactory(app)
-                        .setEnableDecoderFallback(true);
+                DefaultRenderersFactory renderers = new DefaultRenderersFactory(app) {
+                    @Override protected AudioSink buildAudioSink(Context context, boolean floatOutput,
+                            boolean trackPlaybackParams) {
+                        // A larger PCM queue absorbs short scheduling gaps while rendering a panorama.
+                        // Media3 still uses its normal bounds for passthrough and offloaded audio.
+                        return new DefaultAudioSink.Builder(context)
+                                .setEnableFloatOutput(floatOutput)
+                                .setEnableAudioTrackPlaybackParams(trackPlaybackParams)
+                                .setAudioTrackBufferSizeProvider(new DefaultAudioTrackBufferSizeProvider.Builder()
+                                        .setMinPcmBufferDurationUs(500_000).build())
+                                .build();
+                    }
+                };
+                renderers.setEnableDecoderFallback(true);
                 if (software) {
                     renderers.setMediaCodecSelector((mime, secure, tunneled) -> {
                         List<MediaCodecInfo> choices = MediaCodecSelector.DEFAULT.getDecoderInfos(mime, secure, tunneled);
@@ -84,6 +102,10 @@ final class MovieSession implements Player.Listener {
                         .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), false);
                 player.addListener(this);
                 player.addAnalyticsListener(new AnalyticsListener() {
+                    @Override public void onAudioUnderrun(EventTime eventTime, int bufferSize,
+                            long bufferSizeMs, long elapsedSinceLastFeedMs) {
+                        audioUnderruns++;
+                    }
                     @Override public void onVideoDecoderInitialized(EventTime eventTime, String name,
                             long initializedAtMs, long durationMs) {
                         codecName = name;

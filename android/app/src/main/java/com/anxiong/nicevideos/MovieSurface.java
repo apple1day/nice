@@ -9,6 +9,7 @@ import android.opengl.Matrix;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Size;
+import android.view.Choreographer;
 import android.view.Surface;
 
 import java.io.BufferedReader;
@@ -45,6 +46,13 @@ public final class MovieSurface extends GLSurfaceView {
     private volatile long decoderGeneration;
     private volatile long presentedSamples;
 
+    private final Choreographer display = Choreographer.getInstance();
+    private final Choreographer.FrameCallback drawAtVsync = this::drawAtVsync;
+    private boolean redrawScheduled, newContent;
+    private long lastDrawTime;
+    // 16 ms allows normal 60 Hz vsync jitter. Decoder and layout changes bypass this limit.
+    private static final long POSE_INTERVAL_NS = 16_000_000L;
+
     long presentedSamples() { return presentedSamples; }
 
     public MovieSurface(Context context, Listener listener) {
@@ -68,7 +76,7 @@ public final class MovieSurface extends GLSurfaceView {
     public void setFormat(VrFormat value) {
         if (value == null) throw new IllegalArgumentException("Missing video format");
         format = value;
-        requestRender();
+        queueDraw(true);
     }
 
     /** OpenGL column-major rotation: world rays = this matrix * camera rays. */
@@ -76,29 +84,60 @@ public final class MovieSurface extends GLSurfaceView {
         if (cameraToWorld == null || cameraToWorld.length < 16) return;
         for (int i = 0; i < 16; i++) if (!Float.isFinite(cameraToWorld[i])) return;
         synchronized (orientation) { System.arraycopy(cameraToWorld, 0, orientation, 0, 16); }
-        if (format.projection != VrFormat.Projection.FLAT) requestRender();
+        if (format.projection != VrFormat.Projection.FLAT) queueDraw(false);
     }
 
     public void setFieldOfView(float degrees) {
         if (!Float.isFinite(degrees)) return;
-        shortFov = Math.min(110f, Math.max(45f, degrees));
-        requestRender();
+        float value = Math.min(110f, Math.max(45f, degrees));
+        if (value == shortFov) return;
+        shortFov = value;
+        queueDraw(false);
     }
 
     // Called on the main thread after any previous decoder has released its
     // Surface. Redrawing its cached texture cannot announce a new first frame.
     public void expectNewDecoderFrame() {
         decoderGeneration++;
-        requestRender();
+        queueDraw(true);
     }
 
     public void setVideoSize(int width, int height) {
         frameSize = new Size(Math.max(0, width), Math.max(0, height));
+        queueDraw(true);
+    }
+
+    // Share one draw between all camera samples and video frames received in a display tick.
+    // A final queued camera change is still displayed when the movie is paused.
+    private synchronized void queueDraw(boolean videoOrLayout) {
+        if (!active) return;
+        newContent |= videoOrLayout;
+        if (!redrawScheduled) {
+            redrawScheduled = true;
+            display.postFrameCallback(drawAtVsync);
+        }
+    }
+
+    private synchronized void drawAtVsync(long frameTime) {
+        if (!active) return;
+        if (!newContent && frameTime - lastDrawTime < POSE_INTERVAL_NS) {
+            display.postFrameCallback(drawAtVsync);
+            return;
+        }
+        redrawScheduled = newContent = false;
+        lastDrawTime = frameTime;
         requestRender();
+    }
+
+    private synchronized void cancelDraw() {
+        display.removeFrameCallback(drawAtVsync);
+        redrawScheduled = newContent = false;
+        lastDrawTime = 0;
     }
 
     @Override public void onPause() {
         active = false;
+        cancelDraw();
         super.onPause();
         renderer.releaseProducer(); // GL thread is paused and its context discarded.
     }
@@ -109,6 +148,7 @@ public final class MovieSurface extends GLSurfaceView {
     }
 
     @Override protected void onDetachedFromWindow() {
+        cancelDraw();
         super.onDetachedFromWindow();
         renderer.releaseProducer(); // GL thread has exited.
     }
@@ -176,7 +216,7 @@ public final class MovieSurface extends GLSurfaceView {
                 image.setOnFrameAvailableListener(frame -> {
                     if (active && decoderTexture == frame) {
                         pendingGeneration.set(decoderGeneration);
-                        requestRender();
+                        queueDraw(true);
                     }
                 }, main);
                 Surface surface = new Surface(image);

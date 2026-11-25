@@ -21,6 +21,8 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
 import android.view.WindowManager;
@@ -65,6 +67,8 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     private String bookmarkKey, videoMime;
     private int width, height;
     private long duration, position, lastSave;
+    private long scrubTarget = -1, discreteTarget = -1, displayedSecond = -1;
+    private final Runnable commitDiscreteSeek = () -> jump(discreteTarget);
     private long observedSamples = -1, samplePosition, sampleWallTime;
     private boolean stalledPicture, playBeforeFailure;
     private boolean active, prepared, failed, ended, firstFrame, playing, wantsPlay = true;
@@ -103,7 +107,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         movie = new MovieSurface(this, this);
-        look = new VrLookControls(this, movie, () -> { fieldOfView = look.fieldOfView(); saveVrSettings(); });
+        look = new VrLookControls(this, movie, () -> { fieldOfView = look.fieldOfView(); saveVrSettings(); }, this::togglePlayback);
         movie.setContentDescription("视频画面");
         movie.setOnClickListener(v -> showControls(!controlsVisible));
         root.addView(movie, new FrameLayout.LayoutParams(-1, -1));
@@ -160,27 +164,35 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         timeline.addView(bar, new LinearLayout.LayoutParams(0, dp(44), 1));
         timeline.addView(total);
         footer.addView(timeline);
+        bar.setOnTouchListener((v, event) -> {
+            // SeekBar also fires onStopTrackingTouch for ACTION_CANCEL.
+            if (event.getActionMasked() == MotionEvent.ACTION_CANCEL) endScrub(false);
+            return false;
+        });
         bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onStartTrackingTouch(SeekBar b) { dragging = true; main.removeCallbacks(hide); }
+            @Override public void onStartTrackingTouch(SeekBar b) { beginScrub(); }
             @Override public void onProgressChanged(SeekBar b, int value, boolean user) {
-                if (!user) return;
+                if (!user || !prepared || duration <= 0) return;
                 long target = duration * value / STEPS;
-                elapsed.setText(time(target));
-                if (!dragging) jump(target);
+                if (dragging) previewScrub(target);
+                else {
+                    // Keyboard and accessibility progress events have no touch-end callback.
+                    discreteTarget = target;
+                    showElapsed(target);
+                    main.removeCallbacks(commitDiscreteSeek);
+                    main.postDelayed(commitDiscreteSeek, 180);
+                }
             }
-            @Override public void onStopTrackingTouch(SeekBar b) {
-                dragging = false;
-                jump(duration * b.getProgress() / STEPS);
-            }
+            @Override public void onStopTrackingTouch(SeekBar b) { endScrub(true); }
         });
         LinearLayout actions = new LinearLayout(this);
-        play = button("暂停", "播放或暂停", v -> { if (wantsPlay && !ended) pause(); else requestPlay(); });
+        play = button("暂停", "播放或暂停", v -> togglePlayback());
         formats = button("VR", "进入 VR", v -> {
             if (inVr) chooseFormat();
             else {
                 inVr = true;
                 applyMode(); saveVrSettings(); showControls(true);
-                if (panorama()) Toast.makeText(this, "拖动环顾，双指缩放，双击回正", Toast.LENGTH_SHORT).show();
+                if (panorama()) Toast.makeText(this, "拖动环顾，双指缩放。双击动作可在 VR 设置中更改。", Toast.LENGTH_SHORT).show();
             }
         });
         fullscreen = button("全屏", "全屏", v -> {
@@ -223,6 +235,35 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         });
         setContentView(root);
         status("正在打开视频…", false);
+    }
+
+    private void togglePlayback() {
+        if (wantsPlay && !ended) pause();
+        else requestPlay();
+    }
+
+    // Gamepad button codes are separate from Android's Back and volume keys.
+    // Dispatch before the focused view so immersive mode and the toolbar agree.
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (!active || !inVr || dialogOpen) return super.dispatchKeyEvent(event);
+        boolean trigger = event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0;
+        switch (event.getKeyCode()) {
+            case KeyEvent.KEYCODE_BUTTON_A:
+                if (trigger) togglePlayback();
+                return true;
+            case KeyEvent.KEYCODE_BUTTON_X:
+                if (trigger && panorama()) look.recenter();
+                return true;
+            case KeyEvent.KEYCODE_BUTTON_Y:
+                if (trigger) showControls(!controlsVisible);
+                return true;
+            case KeyEvent.KEYCODE_BUTTON_L1:
+            case KeyEvent.KEYCODE_BUTTON_R1:
+                if (trigger) jump(position + (event.getKeyCode() == KeyEvent.KEYCODE_BUTTON_L1 ? -15000 : 15000));
+                return true;
+            default:
+                return super.dispatchKeyEvent(event);
+        }
     }
 
     private void checkFirstFrame() {
@@ -308,7 +349,8 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         String dims = width > 0 && height > 0 ? width + " × " + height : "暂未识别";
         String info = "分辨率  " + dims + "\n视频轨道  " + (videoMime == null ? "暂未识别" : videoMime)
                 + "\n播放器  Media3 ExoPlayer · Android 解码器"
-                + "\n解码偏好  " + (softwareDecoder ? "软件解码" : "自动选择");
+                + "\n解码偏好  " + (softwareDecoder ? "软件解码" : "自动选择")
+                + (session == null ? "" : "\n本次播放音频缓冲耗尽  " + session.audioUnderruns() + " 次");
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("片源信息").setMessage(info)
                 .setPositiveButton("关闭", null)
                 .setNeutralButton(softwareDecoder ? "恢复自动解码" : "尝试软件解码", (d, w) -> {
@@ -403,10 +445,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     @Override public void onProgress(long current, boolean motion) {
         boolean changed = playing != motion; playing = motion; position = current;
         checkPictureMotion(current, motion);
-        if (!dragging) {
-            elapsed.setText(time(position));
-            if (duration > 0) bar.setProgress((int) Math.min(STEPS, position * STEPS / duration));
-        }
+        if (!dragging && discreteTarget < 0) showTimeline(current);
         if (playing && SystemClock.elapsedRealtime() - lastSave >= 5000) saveBookmark();
         if (changed) {
             refresh(); main.removeCallbacks(firstFrameCheck);
@@ -416,7 +455,8 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     @Override public void onEnded() {
         ended = true; playing = false; wantsPlay = false; position = 0;
         resetPictureWatch();
-        bookmarks.edit().remove(bookmarkKey).apply(); elapsed.setText(time(duration)); bar.setProgress(STEPS);
+        bookmarks.edit().remove(bookmarkKey).apply();
+        if (!dragging && discreteTarget < 0) showTimeline(duration);
         abandonFocus(); showControls(true); refresh();
     }
     @Override public void onError(String message) {
@@ -424,10 +464,55 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         failed = true; wantsPlay = false; playing = false; retireSession(); abandonFocus();
         status(message, true); showControls(true); refresh();
     }
+    private void showElapsed(long target) {
+        long second = target / 1000;
+        if (second != displayedSecond) {
+            elapsed.setText(time(target));
+            displayedSecond = second;
+        }
+    }
+
+    private void showTimeline(long target) {
+        showElapsed(target);
+        if (duration > 0) bar.setProgress((int) Math.round(
+                STEPS * Math.min(1.0, Math.max(0.0, (double) target / duration))));
+    }
+
+    private boolean beginScrub() {
+        if (!prepared || session == null || duration <= 0) return false;
+        cancelDiscreteSeek();
+        dragging = true;
+        scrubTarget = -1;
+        main.removeCallbacks(hide);
+        return true;
+    }
+
+    private void previewScrub(long target) {
+        if (!dragging) return;
+        scrubTarget = Math.min(duration, Math.max(0, target));
+        showTimeline(scrubTarget);
+    }
+
+    private void endScrub(boolean commit) {
+        if (!dragging) return;
+        dragging = false;
+        if (commit && scrubTarget >= 0) jump(scrubTarget);
+        else showTimeline(ended ? duration : position);
+        scrubTarget = -1;
+        armControls();
+    }
+
+    private void cancelDiscreteSeek() {
+        main.removeCallbacks(commitDiscreteSeek);
+        discreteTarget = -1;
+    }
+
     private void jump(long target) {
+        cancelDiscreteSeek();
         if (!prepared || session == null || duration <= 0) return;
         resetPictureWatch();
-        ended = false; position = Math.min(duration, Math.max(0, target)); session.seek(position); armControls();
+        ended = false; position = Math.min(duration, Math.max(0, target));
+        showTimeline(position); session.seek(position); armControls();
     }
     private void requestPlay() {
         if (failed) { restart(); return; }
@@ -464,6 +549,8 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         }
     }
     private void retireSession() {
+        cancelDiscreteSeek();
+        endScrub(false);
         if (session != null) {
             MovieSession old = session;
             session = null;
