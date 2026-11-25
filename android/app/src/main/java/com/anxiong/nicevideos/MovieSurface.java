@@ -5,15 +5,20 @@ import android.graphics.SurfaceTexture;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
+import android.opengl.Matrix;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Size;
 import android.view.Surface;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
@@ -31,13 +36,18 @@ public final class MovieSurface extends GLSurfaceView {
     private final Listener listener;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final VideoRenderer renderer;
-    private volatile Mode mode = Mode.STANDARD;
+    private volatile VrFormat format = VrFormat.ORDINARY;
+    // This lock covers only 16 floats. Sensor/UI and GL threads never wait on a GPU operation.
+    private final float[] orientation = new float[16];
+    private volatile float shortFov = 80f;
     private volatile Size frameSize = new Size(0, 0);
     private volatile boolean active = true;
+    private volatile long decoderGeneration;
 
     public MovieSurface(Context context, Listener listener) {
         super(context);
         this.listener = listener;
+        Matrix.setIdentityM(orientation, 0);
         setEGLContextClientVersion(2);
         setEGLConfigChooser(8, 8, 8, 8, 0, 0);
         setPreserveEGLContextOnPause(false);
@@ -47,8 +57,36 @@ public final class MovieSurface extends GLSurfaceView {
     }
 
     public void setMode(Mode value) {
-        mode = value;
-        requestRender(); // Switch projections even while paused on a frame.
+        setFormat(value == Mode.STANDARD ? VrFormat.ORDINARY :
+                new VrFormat(VrFormat.Projection.FLAT,
+                        value == Mode.HALF ? VrFormat.Layout.SBS_HALF : VrFormat.Layout.SBS_FULL, true));
+    }
+
+    public void setFormat(VrFormat value) {
+        if (value == null) throw new IllegalArgumentException("Missing video format");
+        format = value;
+        requestRender();
+    }
+
+    /** OpenGL column-major rotation: world rays = this matrix * camera rays. */
+    public void setViewOrientation(float[] cameraToWorld) {
+        if (cameraToWorld == null || cameraToWorld.length < 16) return;
+        for (int i = 0; i < 16; i++) if (!Float.isFinite(cameraToWorld[i])) return;
+        synchronized (orientation) { System.arraycopy(cameraToWorld, 0, orientation, 0, 16); }
+        if (format.projection != VrFormat.Projection.FLAT) requestRender();
+    }
+
+    public void setFieldOfView(float degrees) {
+        if (!Float.isFinite(degrees)) return;
+        shortFov = Math.min(110f, Math.max(45f, degrees));
+        requestRender();
+    }
+
+    // Called on the main thread after any previous decoder has released its
+    // Surface. Redrawing its cached texture cannot announce a new first frame.
+    public void expectNewDecoderFrame() {
+        decoderGeneration++;
+        requestRender();
     }
 
     public void setVideoSize(int width, int height) {
@@ -76,29 +114,29 @@ public final class MovieSurface extends GLSurfaceView {
             "attribute vec2 pos; varying vec2 screenPos; void main(){"
             + "screenPos=pos; gl_Position=vec4(pos,0.,1.); }";
 
-    // Inverse-map display pixels to movie UV. The v1 Cardboard polynomial and
-    // 40-degree half-FOV match the optics in the iOS player.
-    private static final String FRAGMENT =
-            "#extension GL_OES_EGL_image_external : require\n"
-            + "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
-            + "varying vec2 screenPos; uniform samplerExternalOES movie; uniform mat4 transform;"
-            + "uniform vec2 fit, lens, slice; uniform float inset;"
-            + "void main(){ vec2 ray=screenPos*lens; float r2=dot(ray,ray);"
-            + "vec2 p=screenPos*(1.+r2*(.441+.156*r2))/fit;"
-            + "if(max(abs(p.x),abs(p.y))>1.){gl_FragColor=vec4(0.,0.,0.,1.);return;}"
-            + "vec2 uv=p*.5+.5; uv.x=clamp(mix(slice.x,slice.y,uv.x),slice.x+inset,slice.y-inset);"
-            + "gl_FragColor=vec4(texture2D(movie,(transform*vec4(uv,0.,1.)).xy).rgb,1.); }";
+    private String readFragmentShader() {
+        try (BufferedReader source = new BufferedReader(new InputStreamReader(
+                getResources().openRawResource(R.raw.vr_projection), StandardCharsets.UTF_8))) {
+            StringBuilder code = new StringBuilder();
+            String line;
+            while ((line = source.readLine()) != null) code.append(line).append('\n');
+            return code.toString();
+        } catch (IOException e) {
+            throw new IllegalStateException("无法读取视频显示程序", e);
+        }
+    }
 
     private final class VideoRenderer implements Renderer {
-        private final AtomicBoolean frameAvailable = new AtomicBoolean();
+        private final AtomicLong pendingGeneration = new AtomicLong(-1);
         private final FloatBuffer quad = ByteBuffer.allocateDirect(8 * Float.BYTES)
                 .order(ByteOrder.nativeOrder()).asFloatBuffer();
         private final float[] transform = new float[16];
+        private final float[] pose = new float[16];
         private volatile SurfaceTexture decoderTexture;
         private volatile Surface decoderSurface;
         private int viewWidth, viewHeight, textureName, program;
-        private int position, texMatrix, fit, lens, slice, inset;
-        private boolean hasImage, announcedFrame;
+        private int position, texMatrix, poseMatrix, projectionId, fit, lens, rayExtent, fisheyeDisc, eyeRect, inset;
+        private long imageGeneration = -1, announcedGeneration = -1;
 
         VideoRenderer() {
             quad.put(new float[] {-1, -1, 1, -1, -1, 1, 1, 1}).position(0);
@@ -106,15 +144,19 @@ public final class MovieSurface extends GLSurfaceView {
 
         @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
             releaseProducer();
-            hasImage = announcedFrame = false;
+            imageGeneration = announcedGeneration = -1;
             try {
-                program = createProgram();
+                program = createProgram(readFragmentShader());
                 position = GLES20.glGetAttribLocation(program, "pos");
-                texMatrix = GLES20.glGetUniformLocation(program, "transform");
+                texMatrix = GLES20.glGetUniformLocation(program, "textureTransform");
                 fit = GLES20.glGetUniformLocation(program, "fit");
                 lens = GLES20.glGetUniformLocation(program, "lens");
-                slice = GLES20.glGetUniformLocation(program, "slice");
-                inset = GLES20.glGetUniformLocation(program, "inset");
+                poseMatrix = GLES20.glGetUniformLocation(program, "cameraToWorld");
+                projectionId = GLES20.glGetUniformLocation(program, "projection");
+                rayExtent = GLES20.glGetUniformLocation(program, "rayExtent");
+                fisheyeDisc = GLES20.glGetUniformLocation(program, "fisheyeDisc");
+                eyeRect = GLES20.glGetUniformLocation(program, "eyeRect");
+                inset = GLES20.glGetUniformLocation(program, "texelInset");
 
                 int[] textures = new int[1];
                 GLES20.glGenTextures(1, textures, 0);
@@ -129,7 +171,7 @@ public final class MovieSurface extends GLSurfaceView {
                 decoderTexture = image;
                 image.setOnFrameAvailableListener(frame -> {
                     if (active && decoderTexture == frame) {
-                        frameAvailable.set(true);
+                        pendingGeneration.set(decoderGeneration);
                         requestRender();
                     }
                 }, main);
@@ -149,7 +191,7 @@ public final class MovieSurface extends GLSurfaceView {
             SurfaceTexture image = decoderTexture;
             decoderSurface = null;
             decoderTexture = null;
-            frameAvailable.set(false);
+            pendingGeneration.set(-1);
             if (surface != null) surface.release();
             if (image != null) {
                 image.setOnFrameAvailableListener(null);
@@ -167,17 +209,19 @@ public final class MovieSurface extends GLSurfaceView {
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
             SurfaceTexture image = decoderTexture;
             if (!active || image == null || viewWidth < 1 || viewHeight < 1) return;
-            if (frameAvailable.getAndSet(false)) {
+            long pending = pendingGeneration.getAndSet(-1);
+            long generation = decoderGeneration;
+            if (pending == generation) {
                 try {
                     image.updateTexImage();
                     image.getTransformMatrix(transform);
-                    hasImage = true;
+                    imageGeneration = generation;
                 } catch (RuntimeException e) {
                     reportError(e);
                     return;
                 }
             }
-            if (!hasImage) return;
+            if (imageGeneration != generation) return;
             Size video = frameSize;
             int width = video.getWidth(), height = video.getHeight();
             if (width == 0 || height == 0) return;
@@ -187,34 +231,58 @@ public final class MovieSurface extends GLSurfaceView {
             GLES20.glUniformMatrix4fv(texMatrix, 1, false, transform, 0);
             GLES20.glVertexAttribPointer(position, 2, GLES20.GL_FLOAT, false, 0, quad);
             GLES20.glEnableVertexAttribArray(position);
-            GLES20.glUniform1f(inset, .5f / width);
-            float aspect = width / (float) height;
-            Mode projection = mode;
-            if (projection == Mode.STANDARD || width < 2 || viewWidth < 2) {
-                drawView(0, viewWidth, aspect, false, 0, 1);
+            GLES20.glUniform2f(inset, .5f / width, .5f / height);
+            synchronized (orientation) { System.arraycopy(orientation, 0, pose, 0, 16); }
+            GLES20.glUniformMatrix4fv(poseMatrix, 1, false, pose, 0);
+            VrFormat selected = format;
+            GLES20.glUniform1i(projectionId, selected.projection.shaderId);
+            if (!selected.headset || viewWidth < 2) {
+                drawEye(0, viewWidth, selected, false, width, height);
             } else {
-                // Exclude the middle column of an odd-width frame from both eyes.
                 int split = viewWidth / 2;
-                float half = (width / 2) / (float) width;
-                float eyeAspect = projection == Mode.HALF ? aspect : aspect * .5f;
-                drawView(0, split, eyeAspect, true, 0, half);
-                drawView(split, viewWidth - split, eyeAspect, true, 1 - half, 1);
+                drawEye(0, split, selected, false, width, height);
+                drawEye(split, viewWidth - split, selected, true, width, height);
             }
-            if (!announcedFrame) {
-                announcedFrame = true;
+            if (announcedGeneration != generation) {
+                announcedGeneration = generation;
                 main.post(() -> {
-                    if (active && decoderTexture == image) listener.onFirstFrameDrawn();
+                    if (active && decoderTexture == image && decoderGeneration == generation) listener.onFirstFrameDrawn();
                 });
             }
         }
 
-        private void drawView(int left, int width, float aspect, boolean stereo, float from, float to) {
-            float screenAspect = width / (float) viewHeight;
-            GLES20.glViewport(left, 0, width, viewHeight);
-            GLES20.glUniform2f(fit, Math.min(1f, aspect / screenAspect), Math.min(1f, screenAspect / aspect));
-            float radial = stereo ? 0.83909965f / Math.min(width, viewHeight) : 0f; // tan(40°)
-            GLES20.glUniform2f(lens, radial * width, radial * viewHeight);
-            GLES20.glUniform2f(slice, from, to);
+        private void drawEye(int left, int viewportWidth, VrFormat selected, boolean right,
+                             int frameWidth, int frameHeight) {
+            // Use integer eye boundaries to leave an ambiguous odd center row/column unused.
+            int x = 0, y = 0, w = frameWidth, h = frameHeight;
+            float pixelWidth = 1f;
+            switch (selected.layout) {
+                case SBS_HALF:
+                case SBS_FULL:
+                    w = Math.max(1, frameWidth / 2);
+                    x = right ? frameWidth - w : 0;
+                    pixelWidth = selected.layout == VrFormat.Layout.SBS_HALF ? 2f : 1f;
+                    break;
+                case TOP_BOTTOM:
+                    h = Math.max(1, frameHeight / 2);
+                    y = right ? 0 : frameHeight - h;
+                    break;
+                case MONO:
+                    break;
+            }
+            GLES20.glUniform4f(eyeRect, (float)x / frameWidth, (float)y / frameHeight,
+                    (float)(x + w) / frameWidth, (float)(y + h) / frameHeight);
+            float eyeAspect = pixelWidth * w / h;
+            float screenAspect = (float)viewportWidth / viewHeight;
+            GLES20.glViewport(left, 0, viewportWidth, viewHeight);
+            GLES20.glUniform2f(fit, Math.min(1f, eyeAspect / screenAspect), Math.min(1f, screenAspect / eyeAspect));
+
+            float shortSide = Math.min(viewportWidth, viewHeight);
+            float lensScale = selected.headset ? .83909965f / shortSide : 0f; // Cardboard v1 tan(40°)
+            GLES20.glUniform2f(lens, lensScale * viewportWidth, lensScale * viewHeight);
+            float perspective = (float)Math.tan(Math.toRadians(shortFov * .5f)) / shortSide;
+            GLES20.glUniform2f(rayExtent, perspective * viewportWidth, perspective * viewHeight);
+            GLES20.glUniform2f(fisheyeDisc, Math.min(1f, 1f / eyeAspect), Math.min(1f, eyeAspect));
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         }
 
@@ -235,10 +303,10 @@ public final class MovieSurface extends GLSurfaceView {
         return id;
     }
 
-    private static int createProgram() {
+    private static int createProgram(String fragmentSource) {
         int id = GLES20.glCreateProgram();
         int vertex = shader(GLES20.GL_VERTEX_SHADER, VERTEX);
-        int fragment = shader(GLES20.GL_FRAGMENT_SHADER, FRAGMENT);
+        int fragment = shader(GLES20.GL_FRAGMENT_SHADER, fragmentSource);
         GLES20.glAttachShader(id, vertex);
         GLES20.glAttachShader(id, fragment);
         GLES20.glLinkProgram(id);

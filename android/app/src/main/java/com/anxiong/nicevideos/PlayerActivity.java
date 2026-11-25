@@ -29,6 +29,7 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
@@ -48,7 +49,13 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     private MovieSurface movie;
     private Surface surface;
     private MovieSession session;
-    private MovieSurface.Mode mode = MovieSurface.Mode.STANDARD;
+    private VrLookControls look;
+    private VrFormat vrFormat;
+    private float fieldOfView = 80;
+    private boolean inVr, followHead, softwareDecoder, releasingSession;
+    private LinearLayout vrActions;
+    private Button recenter, headsetButton, headButton;
+    private TextView vrSummary;
     private LinearLayout header, footer;
     private TextView statusLabel, elapsed, total;
     private Button play, formats, fullscreen, retry;
@@ -73,10 +80,11 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         bookmarks = getSharedPreferences("video_positions", MODE_PRIVATE);
         bookmarkKey = UUID.nameUUIDFromBytes(uri.toString().getBytes(StandardCharsets.UTF_8)).toString();
         position = Math.max(0, bookmarks.getLong(bookmarkKey, 0));
+        readVrSettings();
         if (state != null) {
             position = state.getLong("position", position);
             wantsPlay = state.getBoolean("wantsPlay", false);
-            mode = MovieSurface.Mode.valueOf(state.getString("mode", MovieSurface.Mode.STANDARD.name()));
+            softwareDecoder = state.getBoolean("softwareDecoder", false);
             userFullscreen = state.getBoolean("fullscreen", false);
         }
         audio = (AudioManager) getSystemService(AUDIO_SERVICE);
@@ -93,7 +101,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         movie = new MovieSurface(this, this);
-        movie.setMode(mode);
+        look = new VrLookControls(this, movie, () -> { fieldOfView = look.fieldOfView(); saveVrSettings(); });
         movie.setContentDescription("视频画面");
         movie.setOnClickListener(v -> showControls(!controlsVisible));
         root.addView(movie, new FrameLayout.LayoutParams(-1, -1));
@@ -108,7 +116,17 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         String name = getIntent().getStringExtra("title");
         if (name == null) name = "file".equals(uri.getScheme()) ? new File(uri.getPath()).getName() : "本地视频";
         title.setText(name);
-        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout heading = new LinearLayout(this);
+        heading.setOrientation(LinearLayout.VERTICAL);
+        heading.addView(title);
+        vrSummary = label(13);
+        vrSummary.setSingleLine(true);
+        vrSummary.setEllipsize(TextUtils.TruncateAt.END);
+        heading.addView(vrSummary);
+        header.addView(heading, new LinearLayout.LayoutParams(0, -2, 1));
+        recenter = button("回正", "视角回正", v -> { look.recenter(); armControls(); });
+        header.addView(recenter);
+        header.addView(button("片源信息", "片源信息", v -> showDetails()));
         header.addView(button("关闭", "关闭播放器", v -> finish()));
         root.addView(header, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
 
@@ -155,14 +173,41 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         });
         LinearLayout actions = new LinearLayout(this);
         play = button("暂停", "播放或暂停", v -> { if (wantsPlay && !ended) pause(); else requestPlay(); });
-        formats = button("格式", "视频格式", v -> chooseFormat());
-        fullscreen = button("全屏", "全屏", v -> {
-            userFullscreen = !wide();
-            if (!userFullscreen) mode = MovieSurface.Mode.STANDARD;
-            movie.setMode(mode);
-            applyMode();
-            showControls(true);
+        formats = button("VR", "进入 VR", v -> {
+            if (inVr) chooseFormat();
+            else {
+                inVr = true;
+                applyMode(); saveVrSettings(); showControls(true);
+                if (panorama()) Toast.makeText(this, "拖动环顾，双指缩放，双击回正", Toast.LENGTH_SHORT).show();
+            }
         });
+        fullscreen = button("全屏", "全屏", v -> {
+            boolean next = !wide();
+            if (!next && inVr && vrFormat.headset) {
+                vrFormat = new VrFormat(vrFormat.projection, vrFormat.layout, false);
+                saveVrSettings();
+            }
+            userFullscreen = next;
+            applyMode(); showControls(true);
+        });
+        vrActions = new LinearLayout(this);
+        headsetButton = button("双眼眼镜", "切换眼镜显示", v -> {
+            vrFormat = new VrFormat(vrFormat.projection, vrFormat.layout, !vrFormat.headset);
+            applyMode(); saveVrSettings(); showControls(true);
+        });
+        headButton = button("陀螺仪：关", "陀螺仪跟随", v -> {
+            if (!look.sensorAvailable()) {
+                Toast.makeText(this, "这台设备没有可用的方向传感器，可以拖动画面环顾。", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            followHead = !followHead;
+            applyMode(); saveVrSettings(); armControls();
+        });
+        for (Button b : new Button[]{headsetButton, headButton, button("退出 VR", "退出 VR", v -> {
+            inVr = false;
+            applyMode(); saveVrSettings(); showControls(true);
+        })}) vrActions.addView(b, new LinearLayout.LayoutParams(0, dp(44), 1));
+        footer.addView(vrActions);
         for (Button b : new Button[]{button("−15秒", "后退15秒", v -> jump(position - 15000)), play,
                 button("+15秒", "快进15秒", v -> jump(position + 15000)), formats, fullscreen})
             actions.addView(b, new LinearLayout.LayoutParams(0, dp(48), 1));
@@ -180,7 +225,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
 
     private void checkFirstFrame() {
         if (active && prepared && playing && !firstFrame && !ended && !failed) {
-            status("尚未显示视频画面。可在「格式 → 片源信息」查看分辨率和视频轨道。", false);
+            status("尚未显示视频画面。可在上方「片源信息」查看分辨率和解码器。", false);
         }
     }
     private int dp(int v) { return Math.round(getResources().getDisplayMetrics().density * v); }
@@ -193,37 +238,87 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         b.setPadding(dp(2),0,dp(2),0); b.setMinWidth(0); b.setMinimumWidth(0);
         b.setContentDescription(description); b.setOnClickListener(click); return b;
     }
-    private boolean wide() { return userFullscreen || mode != MovieSurface.Mode.STANDARD; }
+    private boolean wide() { return userFullscreen || (inVr && vrFormat.headset); }
+    private boolean panorama() { return inVr && vrFormat.projection != VrFormat.Projection.FLAT; }
+
+    private void readVrSettings() {
+        String key = "vr." + bookmarkKey + ".";
+        VrFormat.Projection projection = VrFormat.Projection.EQUIRECT_180;
+        VrFormat.Layout layout = VrFormat.Layout.SBS_FULL;
+        try {
+            projection = VrFormat.Projection.valueOf(bookmarks.getString(key + "projection", projection.name()));
+            layout = VrFormat.Layout.valueOf(bookmarks.getString(key + "layout", layout.name()));
+        } catch (IllegalArgumentException ignored) { /* Unknown saved choice from an earlier build. */ }
+        vrFormat = new VrFormat(projection, layout, bookmarks.getBoolean(key + "headset", false));
+        inVr = bookmarks.getBoolean(key + "active", false);
+        followHead = bookmarks.getBoolean(key + "follow", false);
+        fieldOfView = bookmarks.getFloat(key + "fov", 80);
+    }
+
+    private void saveVrSettings() {
+        String key = "vr." + bookmarkKey + ".";
+        bookmarks.edit().putString(key + "projection", vrFormat.projection.name())
+                .putString(key + "layout", vrFormat.layout.name()).putBoolean(key + "headset", vrFormat.headset)
+                .putBoolean(key + "active", inVr).putBoolean(key + "follow", followHead)
+                .putFloat(key + "fov", fieldOfView).apply();
+    }
 
     private void applyMode() {
+        movie.setFormat(inVr ? vrFormat : VrFormat.ORDINARY);
+        look.configure(panorama(), inVr && vrFormat.headset, followHead, fieldOfView);
         int orientation = wide() ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE : ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
         if (getRequestedOrientation() != orientation) setRequestedOrientation(orientation);
         int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
         if (wide()) flags |= View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION;
         getWindow().getDecorView().setSystemUiVisibility(flags);
-        fullscreen.setText(wide() ? "退出" : "全屏");
-        formats.setText(mode == MovieSurface.Mode.STANDARD ? "格式" : "VR");
+        fullscreen.setText(wide() ? "退出全屏" : "全屏");
+        formats.setText(inVr ? "VR 设置" : "VR");
+        formats.setContentDescription(inVr ? "VR 设置" : "进入 VR");
+        vrActions.setVisibility(inVr ? View.VISIBLE : View.GONE);
+        vrSummary.setVisibility(inVr ? View.VISIBLE : View.GONE);
+        vrSummary.setText(VrOptionsDialog.projectionName(vrFormat.projection) + " · " +
+                VrOptionsDialog.layoutName(vrFormat) + " · " + (vrFormat.headset ? "双眼" : "单屏"));
+        recenter.setVisibility(panorama() ? View.VISIBLE : View.GONE);
+        headButton.setVisibility(panorama() ? View.VISIBLE : View.GONE);
+        headButton.setText(!look.sensorAvailable() ? "仅触摸" : (followHead ? "陀螺仪：开" : "陀螺仪：关"));
+        headsetButton.setText(vrFormat.headset ? "切到单屏" : "双眼眼镜");
     }
 
     private void chooseFormat() {
+        AlertDialog dialog = VrOptionsDialog.create(this, vrFormat, fieldOfView, (choice, fov) -> {
+            vrFormat = choice;
+            fieldOfView = fov;
+            applyMode();
+            saveVrSettings();
+        }, () -> main.post(this::showDetails));
+        showPlayerDialog(dialog);
+    }
+
+    private void showPlayerDialog(AlertDialog dialog) {
         main.removeCallbacks(hide);
         dialogOpen = true;
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("视频格式")
-                .setSingleChoiceItems(new String[]{"普通播放", "半宽 SBS", "全宽 SBS"}, mode.ordinal(), (d, which) -> {
-                    mode = MovieSurface.Mode.values()[which]; movie.setMode(mode); applyMode(); d.dismiss();
-                }).setNegativeButton("关闭", null)
-                .setNeutralButton("片源信息", (d, which) -> main.post(this::showDetails)).create();
-        dialog.setOnDismissListener(d -> { dialogOpen = false; armControls(); }); dialog.show();
+        dialog.setOnDismissListener(d -> { dialogOpen = false; armControls(); });
+        dialog.show();
     }
 
     private void showDetails() {
         if (!active || isFinishing()) return;
-        dialogOpen = true; main.removeCallbacks(hide);
         String dims = width > 0 && height > 0 ? width + " × " + height : "暂未识别";
         String info = "分辨率  " + dims + "\n视频轨道  " + (videoMime == null ? "暂未识别" : videoMime)
-                + "\n播放器  Android 系统 MediaPlayer\n\n每只眼的画面被横向压缩时选半宽，保持原比例时选全宽。";
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("片源信息").setMessage(info).setPositiveButton("关闭", null).create();
-        dialog.setOnDismissListener(d -> { dialogOpen = false; armControls(); }); dialog.show();
+                + "\n播放器  Media3 ExoPlayer · Android 解码器"
+                + "\n解码偏好  " + (softwareDecoder ? "软件解码" : "自动选择");
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("片源信息").setMessage(info)
+                .setPositiveButton("关闭", null)
+                .setNeutralButton(softwareDecoder ? "恢复自动解码" : "尝试软件解码", (d, w) -> {
+                    boolean resume = failed || wantsPlay;
+                    softwareDecoder = !softwareDecoder;
+                    retireSession();
+                    failed = false;
+                    ended = false;
+                    wantsPlay = resume;
+                    startIfReady();
+                }).create();
+        showPlayerDialog(dialog);
     }
 
     private void showControls(boolean visible) {
@@ -243,10 +338,12 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         retireSession(); failed = false; ended = false; wantsPlay = true; startIfReady();
     }
     private void startIfReady() {
-        if (!active || session != null || surface == null || !surface.isValid() || failed) return;
+        if (!active || releasingSession || session != null || surface == null || !surface.isValid()
+                || failed || isFinishing() || isDestroyed()) return;
         if (wantsPlay && !acquireFocus()) wantsPlay = false;
-        prepared = false; playing = false; status("正在打开视频…", false);
-        session = new MovieSession(this); session.open(this, uri, surface, position, wantsPlay);
+        prepared = false; playing = false; firstFrame = false; status("正在打开视频…", false);
+        movie.expectNewDecoderFrame();
+        session = new MovieSession(this); session.open(this, uri, surface, position, wantsPlay, softwareDecoder);
         refresh();
     }
     @Override public void onSurfaceReady(Surface newSurface) {
@@ -327,7 +424,16 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         }
     }
     private void retireSession() {
-        if (session != null) session.close(); session = null; prepared = false; playing = false;
+        if (session != null) {
+            MovieSession old = session;
+            session = null;
+            releasingSession = true;
+            old.close(() -> {
+                releasingSession = false;
+                startIfReady();
+            });
+        }
+        prepared = false; playing = false;
         bar.setEnabled(false); main.removeCallbacks(firstFrameCheck); main.removeCallbacks(hide);
     }
     private void saveBookmark() {
@@ -342,18 +448,18 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         IntentFilter filter = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(noisy, filter, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(noisy, filter);
-        movie.onResume(); startIfReady();
+        movie.onResume(); look.setResumed(true); startIfReady();
     }
     @Override protected void onPause() {
         if (movie != null) {
-            active = false; saveBookmark(); wantsPlay = false; abandonFocus(); retireSession(); surface = null;
+            active = false; look.setResumed(false); saveBookmark(); wantsPlay = false; abandonFocus(); retireSession(); surface = null;
             movie.onPause(); unregisterReceiver(noisy); refresh();
         }
         super.onPause();
     }
     @Override protected void onSaveInstanceState(Bundle out) {
         super.onSaveInstanceState(out); out.putLong("position", position); out.putBoolean("wantsPlay", wantsPlay);
-        out.putString("mode", mode.name()); out.putBoolean("fullscreen", userFullscreen);
+        out.putBoolean("softwareDecoder", softwareDecoder); out.putBoolean("fullscreen", userFullscreen);
     }
     static String time(long ms) {
         long s = Math.max(0, ms) / 1000;

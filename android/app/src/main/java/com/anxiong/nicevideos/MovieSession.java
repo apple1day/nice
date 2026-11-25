@@ -1,19 +1,35 @@
 package com.anxiong.nicevideos;
 
 import android.content.Context;
-import android.media.AudioAttributes;
-import android.media.MediaFormat;
-import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
-import android.os.PersistableBundle;
 import android.view.Surface;
-import java.io.IOException;
 
-/** A single decoder looper also keeps provider opens and codec retirement off the UI thread. */
-final class MovieSession {
+import androidx.media3.common.AudioAttributes;
+import androidx.media3.common.C;
+import androidx.media3.common.Format;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.MimeTypes;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Player;
+import androidx.media3.common.Tracks;
+import androidx.media3.common.VideoSize;
+import androidx.media3.datasource.DefaultDataSource;
+import androidx.media3.exoplayer.DefaultRenderersFactory;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.analytics.AnalyticsListener;
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
+import androidx.media3.exoplayer.source.ProgressiveMediaSource;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
+/** One local input, audio clock and video surface across all VR projections. */
+final class MovieSession implements Player.Listener {
     interface Listener {
         void onPrepared(long duration, String mime);
         void onVideoSize(int width, int height);
@@ -23,23 +39,17 @@ final class MovieSession {
         void onError(String message);
     }
 
-    private final Handler main = new Handler(Looper.getMainLooper());
-    private final HandlerThread thread = new HandlerThread("NiceVideos-player");
-    private final Handler decoder;
     private final Listener listener;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final HandlerThread thread = new HandlerThread("NiceVideos-session");
+    private final Handler decoder;
     private volatile boolean closed;
-    private MediaPlayer player;
-    private boolean ready, wantsPlay, seeking, ended;
-    private long pendingSeek = -1, duration;
-    private final Runnable ticker = new Runnable() {
-        @Override public void run() {
-            if (closed || !ready || seeking) return;
-            long time = Math.max(0L, player.getCurrentPosition());
-            boolean playing = player.isPlaying();
-            deliver(() -> listener.onProgress(time, playing));
-            if (wantsPlay && !ended) decoder.postDelayed(this, 350);
-        }
-    };
+    private ExoPlayer player;
+    private boolean failed;
+    private boolean softwareOnly;
+    private String codecName;
+    private String lastInfo;
+    private long lastDuration = -1;
 
     MovieSession(Listener listener) {
         this.listener = listener;
@@ -51,145 +61,168 @@ final class MovieSession {
         main.post(() -> { if (!closed) callback.run(); });
     }
 
-    void open(Context context, Uri uri, Surface surface, long start, boolean play) {
+    void open(Context context, Uri uri, Surface surface, long start, boolean play, boolean software) {
         Context app = context.getApplicationContext();
         decoder.post(() -> {
             if (closed) return;
-            wantsPlay = play;
-            pendingSeek = start > 0 ? start : -1;
+            softwareOnly = software;
             try {
-                player = new MediaPlayer();
-                player.setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build());
-                player.setSurface(surface);
-                player.setOnPreparedListener(mp -> {
-                    if (closed) return;
-                    ready = true;
-                    duration = Math.max(0L, mp.getDuration());
-                    String mime = null;
-                    for (MediaPlayer.TrackInfo track : mp.getTrackInfo()) {
-                        if (track.getTrackType() == MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_VIDEO) {
-                            MediaFormat format = track.getFormat();
-                            mime = format == null ? null : format.getString(MediaFormat.KEY_MIME);
-                            if (mime == null) mime = "视频轨道";
-                            break;
-                        }
+                DefaultRenderersFactory renderers = new DefaultRenderersFactory(app)
+                        .setEnableDecoderFallback(true);
+                if (software) {
+                    renderers.setMediaCodecSelector((mime, secure, tunneled) -> {
+                        List<MediaCodecInfo> choices = MediaCodecSelector.DEFAULT.getDecoderInfos(mime, secure, tunneled);
+                        if (!MimeTypes.isVideo(mime)) return choices;
+                        List<MediaCodecInfo> result = new ArrayList<>();
+                        for (MediaCodecInfo choice : choices) if (choice.softwareOnly) result.add(choice);
+                        return result;
+                    });
+                }
+                player = new ExoPlayer.Builder(app, renderers).setLooper(thread.getLooper()).build();
+                player.setAudioAttributes(new AudioAttributes.Builder().setUsage(C.USAGE_MEDIA)
+                        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), false);
+                player.addListener(this);
+                player.addAnalyticsListener(new AnalyticsListener() {
+                    @Override public void onVideoDecoderInitialized(EventTime eventTime, String name,
+                            long initializedAtMs, long durationMs) {
+                        codecName = name;
+                        publishFormat();
                     }
-                    if (mime == null && mp.getVideoWidth() == 0 && mp.getVideoHeight() == 0) {
-                        fail("没有可播放的视频轨道，请检查片源的编码。");
-                        return;
-                    }
-                    // TrackInfo.getFormat() can omit video details. When available, the
-                    // framework's own metrics describe the selected track and actual decoder.
-                    PersistableBundle metrics = mp.getMetrics();
-                    if (metrics != null) {
-                        String reported = metrics.getString(MediaPlayer.MetricsConstants.MIME_TYPE_VIDEO);
-                        String codec = metrics.getString(MediaPlayer.MetricsConstants.CODEC_VIDEO);
-                        if (reported != null && !reported.isEmpty()) mime = reported;
-                        if (codec != null && !codec.isEmpty()) mime = (mime == null ? "" : mime + " · ") + codec;
-                    }
-                    String info = mime;
-                    deliver(() -> listener.onPrepared(duration, info));
-                    size(mp.getVideoWidth(), mp.getVideoHeight());
-                    applyIntent();
                 });
-                player.setOnVideoSizeChangedListener((mp,w,h) -> size(w,h));
-                player.setOnInfoListener((mp, what, extra) -> {
-                    if (what == MediaPlayer.MEDIA_INFO_BUFFERING_START || what == MediaPlayer.MEDIA_INFO_BUFFERING_END)
-                        deliver(() -> listener.onBuffering(what == MediaPlayer.MEDIA_INFO_BUFFERING_START));
-                    return false;
-                });
-                player.setOnSeekCompleteListener(mp -> {
-                    if (!closed && ready) { seeking = false; applyIntent(); }
-                });
-                player.setOnCompletionListener(mp -> {
-                    if (closed || !ready) return;
-                    ended = true;
-                    wantsPlay = false;
-                    decoder.removeCallbacks(ticker);
-                    deliver(listener::onEnded);
-                });
-                player.setOnErrorListener((mp, what, extra) -> {
-                    String detail;
-                    switch (extra) {
-                        case MediaPlayer.MEDIA_ERROR_IO: detail = "文件读取失败，请检查存储设备或文件提供方"; break;
-                        case MediaPlayer.MEDIA_ERROR_UNSUPPORTED: detail = "系统解码器不支持这个视频的格式或规格"; break;
-                        case MediaPlayer.MEDIA_ERROR_MALFORMED: detail = "视频封装或数据异常"; break;
-                        case MediaPlayer.MEDIA_ERROR_TIMED_OUT: detail = "读取超时，请检查云端文件是否已下载"; break;
-                        default: detail = "系统播放器无法继续解码，请确认片源完整且设备支持其编码";
-                    }
-                    fail(detail + "（" + what + " / " + extra + "）");
-                    return true;
-                });
-                player.setDataSource(app, uri);
-                if (!closed) player.prepareAsync();
-            } catch (IOException | RuntimeException e) {
-                fail("无法打开视频。请从「文件」重新选择，或把云端文件下载到设备。"
-                        + (e.getMessage() == null ? "" : "\n" + e.getMessage()));
+                player.setVideoSurface(surface);
+                // Explicit progressive source: the selected content URI is the only input.
+                ProgressiveMediaSource source = new ProgressiveMediaSource.Factory(
+                        new DefaultDataSource.Factory(app)).createMediaSource(MediaItem.fromUri(uri));
+                player.setMediaSource(source, Math.max(0L, start));
+                player.setPlayWhenReady(play);
+                player.prepare();
+            } catch (RuntimeException e) {
+                fail("无法打开视频：" + e.getLocalizedMessage());
             }
         });
     }
 
-    private void size(int w, int h) { if (w > 0 && h > 0) deliver(() -> listener.onVideoSize(w,h)); }
-
-    void setPlaying(boolean value) {
+    void setPlaying(boolean play) {
         decoder.post(() -> {
-            if (closed || player == null) return;
-            wantsPlay = value;
-            if (value && ended) { ended = false; pendingSeek = 0; }
-            if (!value && ready && player.isPlaying()) player.pause();
-            applyIntent();
+            if (closed || failed || player == null) return;
+            if (play && player.getPlaybackState() == Player.STATE_ENDED) player.seekTo(0);
+            player.setPlayWhenReady(play);
+            publishClock();
         });
     }
 
-    void seek(long target) {
+    void seek(long position) {
         decoder.post(() -> {
-            if (closed || player == null) return;
-            ended = false;
-            pendingSeek = Math.max(0, target);
-            applyIntent();
+            if (closed || failed || player == null) return;
+            player.seekTo(Math.max(0L, position));
+            publishClock();
         });
     }
 
-    private void applyIntent() {
-        if (closed || !ready || seeking) return;
-        if (pendingSeek >= 0) {
-            long target = duration > 0 ? Math.min(duration, pendingSeek) : pendingSeek;
-            pendingSeek = -1;
-            seeking = true;
-            player.seekTo(target, MediaPlayer.SEEK_CLOSEST);
-            return;
+    @Override public void onIsPlayingChanged(boolean playing) { publishClock(); }
+
+    @Override public void onPlaybackStateChanged(int state) {
+        if (closed || failed) return;
+        deliver(() -> listener.onBuffering(state == Player.STATE_BUFFERING));
+        if (state == Player.STATE_READY) {
+            Tracks tracks = player.getCurrentTracks();
+            if (!tracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) {
+                fail(tracks.containsType(C.TRACK_TYPE_VIDEO)
+                        ? "当前解码器无法处理该视频轨道，请在片源信息中切换解码方式。"
+                        : "所选文件没有可播放的视频轨道。");
+                return;
+            }
+            publishFormat();
         }
-        if (wantsPlay && !player.isPlaying()) player.start();
-        if (!wantsPlay && player.isPlaying()) player.pause();
+        if (state == Player.STATE_ENDED) {
+            player.setPlayWhenReady(false);
+            decoder.removeCallbacks(ticker);
+            deliver(listener::onEnded);
+        } else {
+            publishClock();
+        }
+    }
+
+    @Override public void onVideoSizeChanged(VideoSize size) {
+        if (size.width <= 0 || size.height <= 0) return;
+        int displayWidth = Math.max(1, Math.round(size.width * size.pixelWidthHeightRatio));
+        deliver(() -> listener.onVideoSize(displayWidth, size.height));
+        publishFormat();
+    }
+
+    private void publishFormat() {
+        if (closed || failed || player == null || player.getPlaybackState() != Player.STATE_READY) return;
+        Format format = player.getVideoFormat();
+        StringBuilder details = new StringBuilder();
+        if (format != null) {
+            if (format.sampleMimeType != null) details.append(format.sampleMimeType);
+            if (format.frameRate > 0) details.append(String.format(Locale.ROOT, " · %.1f fps", format.frameRate));
+        }
+        if (details.length() == 0) details.append("视频轨道");
+        if (codecName != null) details.append(" · ").append(codecName);
+        if (softwareOnly) details.append("（软件）");
+        long duration = Math.max(0, player.getDuration());
+        String info = details.toString();
+        if (duration != lastDuration || !info.equals(lastInfo)) {
+            lastDuration = duration;
+            lastInfo = info;
+            deliver(() -> listener.onPrepared(duration, info));
+        }
+    }
+
+    private final Runnable ticker = this::publishClock;
+    private void publishClock() {
         decoder.removeCallbacks(ticker);
-        ticker.run();
+        if (closed || failed || player == null || player.getPlaybackState() == Player.STATE_IDLE
+                || player.getPlaybackState() == Player.STATE_ENDED) return;
+        long position = Math.max(0, player.getCurrentPosition());
+        boolean moving = player.isPlaying();
+        deliver(() -> listener.onProgress(position, moving));
+        if (moving) decoder.postDelayed(ticker, 250);
+    }
+
+    @Override public void onPlayerError(PlaybackException error) {
+        String reason;
+        if (error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND
+                || error.errorCode == PlaybackException.ERROR_CODE_IO_NO_PERMISSION) {
+            reason = "无法读取原文件，请重新从「打开文件」选择。";
+        } else if (error.errorCode >= PlaybackException.ERROR_CODE_DECODER_INIT_FAILED
+                && error.errorCode <= PlaybackException.ERROR_CODE_DECODING_RESOURCES_RECLAIMED) {
+            reason = softwareOnly ? "设备上的软件解码器无法播放这条轨道。可在片源信息中恢复自动解码。"
+                    : "无法解码这部影片，可在片源信息中尝试软件解码。";
+        } else {
+            reason = "媒体读取或解析失败，请确认文件完整、存储仍可访问。";
+        }
+        fail(reason + "\n" + error.getErrorCodeName());
     }
 
     private void fail(String message) {
-        if (closed) return;
-        release();
+        if (closed || failed) return;
+        failed = true;
+        decoder.removeCallbacks(ticker);
+        if (player != null) player.pause();
         deliver(() -> listener.onError(message));
     }
 
-    private void release() {
-        ready = false;
-        decoder.removeCallbacks(ticker);
-        if (player != null) {
-            player.setOnPreparedListener(null);
-            player.setOnVideoSizeChangedListener(null);
-            player.setOnCompletionListener(null);
-            player.setOnSeekCompleteListener(null);
-            player.setOnErrorListener(null);
-            player.setOnInfoListener(null);
-            player.release();
-            player = null;
-        }
-    }
+    void close() { close(null); }
 
-    void close() {
+    // Each session owns a separate decoder looper. Release the old codec and
+    // its Surface producer before another session is allowed to open that Surface.
+    void close(Runnable released) {
         if (closed) return;
         closed = true;
-        decoder.post(() -> { release(); thread.quitSafely(); });
+        decoder.post(() -> {
+            try {
+                decoder.removeCallbacks(ticker);
+                if (player != null) {
+                    player.removeListener(this);
+                    player.release();
+                    player = null;
+                }
+            } finally {
+                thread.quitSafely();
+                if (released != null) main.post(released);
+            }
+        });
     }
 }
