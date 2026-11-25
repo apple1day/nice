@@ -1,13 +1,14 @@
 import Darwin
 import Foundation
+import UIKit
 
 /// Owns the security-scoped URL and the original read-only descriptor. Each VLC
 /// input has its own position and reads this descriptor using pread(2).
 final class PickedVideoFile {
-    let url: URL
+    var url: URL { selection.url }
     let byteCount: UInt64
     private let handle: FileHandle
-    private let original: stat
+    private let presentation: Presentation
     private let selection: Selection
 
     /// Created synchronously by the Files delegate. This same grant survives
@@ -24,6 +25,55 @@ final class PickedVideoFile {
         deinit { stop?() }
     }
 
+    /// Present the logical document selected in Files, even when a provider
+    /// supplies a different URL for the contents of a particular accessor.
+    private final class Presentation: NSObject, NSFilePresenter {
+        let presentedItemOperationQueue: OperationQueue = {
+            let queue = OperationQueue()
+            queue.name = "NiceVideos.Files.moves"
+            queue.maxConcurrentOperationCount = 1
+            return queue
+        }()
+        private let locationLock = NSLock()
+        private var location: URL
+        var currentURL: URL { locationLock.withLock { location } }
+        var presentedItemURL: URL? { currentURL }
+        func presentedItemDidMove(to newURL: URL) {
+            locationLock.withLock { location = newURL }
+        }
+
+        // Registration may ask for presentedItemURL, so it must not hold the
+        // location lock. An open finishing in the background stays unregistered.
+        private let registrationLock = NSLock()
+        private var active = false
+        private var foreground: Bool
+        private var registered = false
+        @MainActor init(_ url: URL) {
+            location = url
+            foreground = UIApplication.shared.applicationState != .background
+            super.init()
+            for notification in [UIApplication.didEnterBackgroundNotification, UIApplication.willEnterForegroundNotification] {
+                NotificationCenter.default.addObserver(self, selector: #selector(applicationStateChanged(_:)),
+                                                       name: notification, object: nil)
+            }
+        }
+        @objc private func applicationStateChanged(_ notification: Notification) {
+            updateRegistration(foreground: notification.name == UIApplication.willEnterForegroundNotification)
+        }
+        func updateRegistration(active: Bool? = nil, foreground: Bool? = nil) {
+            registrationLock.withLock {
+                if let active { self.active = active }
+                if let foreground { self.foreground = foreground }
+                let shouldRegister = self.active && self.foreground
+                guard registered != shouldRegister else { return }
+                if shouldRegister { NSFileCoordinator.addFilePresenter(self) }
+                else { NSFileCoordinator.removeFilePresenter(self) }
+                registered = shouldRegister
+            }
+        }
+        deinit { NotificationCenter.default.removeObserver(self) }
+    }
+
     private static let preparationQueue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "NiceVideos.Files.open"
@@ -31,30 +81,45 @@ final class PickedVideoFile {
         return queue
     }()
 
-    private init(url: URL, selection: Selection) throws {
-        try Self.validateURL(url)
-        let fd = url.withUnsafeFileSystemRepresentation { path in
-            path.map { Darwin.open($0, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC) } ?? -1
+    private init(contentsAt url: URL, selection: Selection, presentation: Presentation) throws {
+        try Self.requireLocalURL(url)
+        // Keep O_NONBLOCK until fstat excludes a FIFO or other special file.
+        let fd = try url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { throw CocoaError(.fileReadInvalidFileName) }
+            let descriptor = Darwin.open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+            guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+            return descriptor
         }
-        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+        guard fstat(fd, &info) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
               info.st_size > 0 else { throw OfflineMediaPolicy.Failure.missingFile }
-        // Validate the same open file that the decoder will read, even when the
-        // provider changes the picked path. Never read the whole movie as Data.
-        try OfflineMediaPolicy.validateHeader(handle.read(upToCount: 512) ?? Data())
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        // A regular File Provider item can fetch additional ranges on demand.
+        // Let reads on the decoder's I/O thread wait for those bytes.
+        guard let header = try handle.read(upToCount: 512), !header.isEmpty else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        try OfflineMediaPolicy.validateHeader(header)
         self.handle = handle
-        self.url = url
         self.selection = selection
-        original = info
+        self.presentation = presentation
         byteCount = UInt64(info.st_size)
+        presentation.updateRegistration(active: true)
     }
 
-    private static func validateURL(_ url: URL) throws {
+    private static func requireLocalURL(_ url: URL) throws {
         guard url.isFileURL, (url.host ?? "").isEmpty || url.host == "localhost" else {
             throw OfflineMediaPolicy.Failure.remoteURL
         }
+    }
+
+    private static func validateURL(_ url: URL) throws {
+        try requireLocalURL(url)
         guard OfflineMediaPolicy.extensions.contains(url.pathExtension.lowercased()) else {
             throw OfflineMediaPolicy.Failure.unsupported
         }
@@ -68,6 +133,7 @@ final class PickedVideoFile {
     static func open(_ selection: Selection) async throws -> PickedVideoFile {
         try Task.checkCancellation()
         try validateURL(selection.url)
+        let presentation = await Presentation(selection.url)
         let coordinator = NSFileCoordinator(filePresenter: nil)
         let intent = NSFileAccessIntent.readingIntent(with: selection.url, options: .withoutChanges)
         let result: Result<PickedVideoFile, Error> = await withTaskCancellationHandler {
@@ -75,7 +141,7 @@ final class PickedVideoFile {
                 coordinator.coordinate(with: [intent], queue: preparationQueue) { error in
                     continuation.resume(returning: Result {
                         if let error { throw error }
-                        return try PickedVideoFile(url: intent.url, selection: selection)
+                        return try PickedVideoFile(contentsAt: intent.url, selection: selection, presentation: presentation)
                     })
                 }
                 // Covers cancellation that occurred just before registration.
@@ -86,34 +152,52 @@ final class PickedVideoFile {
         return try result.get()
     }
 
-    /// Called only on VLC's I/O threads, in bounded chunks. Limit the provider's
-    /// coordinated read to this call, so pausing or suspending the app never
-    /// holds a coordination lock. A changed/unavailable source is a read error.
-    func read(into buffer: UnsafeMutableRawPointer, count: Int, at offset: UInt64) -> Int {
-        guard count >= 0, offset <= byteCount else { return -1 }
-        if count == 0 || offset == byteCount { return 0 }
+    /// Coordinate each bounded refill, keeping the original descriptor as the
+    /// only source of bytes. Provider timestamps and cache pathnames can change
+    /// while that descriptor is still readable.
+    func read(into buffer: UnsafeMutableRawPointer, count: Int, at offset: UInt64) throws -> Int {
+        guard count >= 0 else { throw POSIXError(.EINVAL) }
+        guard count > 0, offset < byteCount else { return 0 }
         let length = Int(min(UInt64(count), byteCount - offset))
-        var result = -1
-        var coordinationError: NSError?
-        NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: url, options: .withoutChanges,
-                                                        error: &coordinationError) { coordinatedURL in
-            var current = stat()
-            let status = coordinatedURL.withUnsafeFileSystemRepresentation { path in
-                path.map { lstat($0, &current) } ?? -1
+        var location = presentation.currentURL
+        var canRetryMove = true
+        while true {
+            var outcome: Result<Int, Error>?
+            var coordinationError: NSError?
+            let coordinator = NSFileCoordinator(filePresenter: presentation)
+            coordinator.coordinate(readingItemAt: location, options: .withoutChanges, error: &coordinationError) { _ in
+                outcome = Result { try readDescriptor(into: buffer, length: length, offset: off_t(offset)) }
             }
-            guard status == 0, current.st_dev == original.st_dev, current.st_ino == original.st_ino,
-                  current.st_size == original.st_size,
-                  current.st_mtimespec.tv_sec == original.st_mtimespec.tv_sec,
-                  current.st_mtimespec.tv_nsec == original.st_mtimespec.tv_nsec else { return }
-            repeat {
-                result = pread(handle.fileDescriptor, buffer, length, off_t(offset))
-            } while result < 0 && errno == EINTR
-            if result == 0 { result = -1 } // Truncation during a noncoordinated write.
+            if let coordinationError {
+                let updated = presentation.currentURL
+                guard canRetryMove, updated != location else { throw coordinationError }
+                canRetryMove = false
+                location = updated
+                continue
+            }
+            guard let outcome else { throw CocoaError(.fileReadUnknown) }
+            return try outcome.get()
         }
-        return coordinationError == nil ? result : -1
+    }
+
+    private func readDescriptor(into buffer: UnsafeMutableRawPointer, length: Int, offset: off_t) throws -> Int {
+        let fd = handle.fileDescriptor
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard info.st_size >= 0, UInt64(info.st_size) >= byteCount else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        while true {
+            let bytes = pread(fd, buffer, length, offset)
+            if bytes > 0 { return bytes }
+            if bytes == 0 { throw CocoaError(.fileReadCorruptFile) }
+            let errorCode = errno
+            if errorCode != EINTR { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errorCode)) }
+        }
     }
 
     deinit {
+        presentation.updateRegistration(active: false)
         // Close before releasing the URL's access, including failed/cancelled UI sessions.
         try? handle.close()
     }

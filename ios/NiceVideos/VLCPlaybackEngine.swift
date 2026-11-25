@@ -52,6 +52,41 @@ protocol LocalPlaybackEngine: AnyObject {
     func stop()
 }
 
+// A VLC byte callback runs off-main and can report failure just before native
+// EOF/state notifications arrive. Keep the first real error per opened input.
+private final class PickedFileReadStatus {
+    private let lock = NSLock()
+    private var firstError: String?
+
+    var message: String? { lock.withLock { firstError } }
+
+    func record(_ error: Error, at offset: UInt64) -> Bool {
+        lock.withLock {
+            guard firstError == nil else { return false }
+            let cause = error as NSError
+            let reason: String
+            switch (cause.domain, cause.code) {
+            case (NSCocoaErrorDomain, CocoaError.Code.fileReadCorruptFile.rawValue):
+                reason = "视频数据不完整。请确认文件已传输或下载完成，再重新打开。"
+            case (NSCocoaErrorDomain, CocoaError.Code.fileReadNoPermission.rawValue),
+                 (NSPOSIXErrorDomain, Int(EACCES)), (NSPOSIXErrorDomain, Int(EPERM)):
+                reason = "没有读取权限。请从「打开文件」重新选择视频。"
+            case (NSCocoaErrorDomain, CocoaError.Code.fileReadNoSuchFile.rawValue),
+                 (NSCocoaErrorDomain, CocoaError.Code.fileNoSuchFile.rawValue),
+                 (NSPOSIXErrorDomain, Int(ENOENT)), (NSPOSIXErrorDomain, Int(ENODEV)),
+                 (NSPOSIXErrorDomain, Int(ENXIO)):
+                reason = "文件或存储设备已不可用。请在「文件」中确认可以访问后重新打开。"
+            case (NSURLErrorDomain, _), ("NSFileProviderErrorDomain", _):
+                reason = "文件提供方暂时无法提供数据。请在「文件」中确认影片可以下载和打开。"
+            default:
+                reason = "读取视频失败。请在「文件」中检查原文件能否打开。"
+            }
+            firstError = "\(reason)\n\(cause.domain) \(cause.code) · 读取位置 \(offset) 字节"
+            return true
+        }
+    }
+}
+
 final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDelegate {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private static var lifetimeAssociationKey: UInt8 = 0
@@ -60,8 +95,7 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
     private var player: VLCMediaPlayer? { playerResource.resource }
     private let frameDelivery: NICEVLCFrameDelivery?
     private let pickedFile: PickedVideoFile?
-    private var pickedLoadID: UUID?
-    private var fileReadFailed = false
+    private var pickedReadStatus: PickedFileReadStatus?
     private var stopped = false
     private var loaded = false
     private var pausedPreviewDeadline: TimeInterval?
@@ -113,17 +147,19 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
             guard fileURL == pickedFile.url, let native = nativeLifetime?.resource else {
                 throw ClientError("无法打开所选文件，请重新选择视频。")
             }
-            let loadID = UUID()
-            pickedLoadID = loadID
-            fileReadFailed = false
+            let status = PickedFileReadStatus()
+            pickedReadStatus = status
             let opened = native.loadFile(byteCount: pickedFile.byteCount, options: options) { [weak self] buffer, count, offset in
-                let bytes = pickedFile.read(into: buffer, count: count, at: offset)
-                if bytes < 0 {
-                    // VLC's imem access module converts a read error to EOF.
-                    // Surface disappearance or replacement as a playback error.
-                    DispatchQueue.main.async { [weak self] in self?.fileReadDidFail(loadID) }
+                do {
+                    return try pickedFile.read(into: buffer, count: count, at: offset)
+                } catch {
+                    // imem can translate a failed read into EOF. Save the cause
+                    // before returning to VLC, including for already queued events.
+                    if status.record(error, at: offset) {
+                        DispatchQueue.main.async { [weak self] in self?.fileReadDidFail(status) }
+                    }
+                    return -1
                 }
-                return bytes
             }
             guard opened else { throw ClientError("无法打开所选文件，请重新选择视频。") }
         } else {
@@ -136,9 +172,8 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
         pausedPreviewDeadline = nil
         loaded = true
     }
-    private func fileReadDidFail(_ loadID: UUID) {
-        guard !stopped, pickedLoadID == loadID, !fileReadFailed else { return }
-        fileReadFailed = true
+    private func fileReadDidFail(_ status: PickedFileReadStatus) {
+        guard !stopped, pickedReadStatus === status else { return }
         player?.stop()
         publishNow()
     }
@@ -246,8 +281,8 @@ final class VLCPlaybackEngine: NSObject, LocalPlaybackEngine, VLCMediaPlayerDele
 
     private func makeSnapshot() -> PlaybackSnapshot? {
         guard !stopped, let player else { return nil }
-        if fileReadFailed {
-            return PlaybackSnapshot(phase: .failed, error: "无法继续读取所选视频。请检查文件和存储设备，再重新打开。")
+        if let message = pickedReadStatus?.message {
+            return PlaybackSnapshot(phase: .failed, error: message)
         }
         let phase: PlaybackPhase
         switch player.state {

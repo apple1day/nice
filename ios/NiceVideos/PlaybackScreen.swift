@@ -540,7 +540,10 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                 Text("请将手机横放后放入 VR 眼镜").font(.caption)
             }
             if model.phase == .opening { ProgressView("打开本地文件…").tint(.white).font(.caption) }
-            if let message = model.message { Text(message).font(.caption).foregroundStyle(.red).lineLimit(2) }
+            if let message = model.message {
+                Text(message).font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let notice = playlist.notice ?? store.deletionNotice {
                 Text(notice).font(.caption).lineLimit(2)
                     .accessibilityIdentifier("playbackActionNotice")

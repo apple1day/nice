@@ -19,7 +19,7 @@ final class PickedFilePlaybackTests: XCTestCase {
         try file.write(contentsOf: Data(contentsOf: samples))
     }
 
-    func testPickedMovieBeyond4GiBPlaysThroughNormalAndVRDecoderWithoutChangingLibrary() async throws {
+    func testPickedMovieBeyond4GiBPlaysAndSeeksAfterItsProviderReplacesThePath() async throws {
         let fm = FileManager.default
         let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: false)
@@ -45,6 +45,12 @@ final class PickedFilePlaybackTests: XCTestCase {
 
         let source = try await PickedVideoFile.open(url)
         XCTAssertGreaterThan(source.byteCount, UInt64(UInt32.max))
+        // A Files provider can update metadata and reuse its presentation URL
+        // after coordinated opening. Only the descriptor still names our movie.
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_234_567_890)],
+                             ofItemAtPath: url.path)
+        let replacement = Data("Different document at the same Files URL".utf8)
+        try replacement.write(to: url, options: .atomic)
         try store.playPickedFile(source)
         let request = try XCTUnwrap(store.playback)
         XCTAssertTrue(request.pickedFile === source)
@@ -116,6 +122,6 @@ final class PickedFilePlaybackTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: libraryFile), Data([1, 2, 3, 4]))
         XCTAssertEqual(try fm.contentsOfDirectory(atPath: libraryFile.deletingLastPathComponent().path),
                        [libraryFile.lastPathComponent])
-        XCTAssertEqual(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize, Int(source.byteCount))
+        XCTAssertEqual(try Data(contentsOf: url), replacement)
     }
 }

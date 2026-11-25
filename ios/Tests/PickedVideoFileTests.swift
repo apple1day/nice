@@ -1,4 +1,5 @@
 import Darwin
+import UIKit
 import XCTest
 @testable import NiceVideos
 
@@ -10,9 +11,9 @@ final class PickedVideoFileTests: XCTestCase {
         return dir
     }
 
-    private func read(_ file: PickedVideoFile, count: Int = 1, at offset: UInt64) -> (Int, [UInt8]) {
+    private func read(_ file: PickedVideoFile, count: Int = 1, at offset: UInt64) throws -> (Int, [UInt8]) {
         var bytes = [UInt8](repeating: 0, count: count)
-        let n = bytes.withUnsafeMutableBytes { file.read(into: $0.baseAddress!, count: count, at: offset) }
+        let n = try bytes.withUnsafeMutableBytes { try file.read(into: $0.baseAddress!, count: count, at: offset) }
         return (n, Array(bytes.prefix(max(0, n))))
     }
 
@@ -30,10 +31,10 @@ final class PickedVideoFileTests: XCTestCase {
         let source = try await PickedVideoFile.open(url)
         XCTAssertEqual(source.byteCount, tail + 3)
         XCTAssertEqual(source.url.lastPathComponent, url.lastPathComponent)
-        XCTAssertEqual(read(source, count: 8, at: tail).1, [0x12, 0x34, 0x56])
-        XCTAssertEqual(read(source, count: 4, at: 0).1, [0x1a, 0x45, 0xdf, 0xa3])
-        XCTAssertEqual(read(source, at: source.byteCount).0, 0)
-        XCTAssertEqual(read(source, at: UInt64.max).0, -1)
+        XCTAssertEqual(try read(source, count: 8, at: tail).1, [0x12, 0x34, 0x56])
+        XCTAssertEqual(try read(source, count: 4, at: 0).1, [0x1a, 0x45, 0xdf, 0xa3])
+        XCTAssertEqual(try read(source, at: source.byteCount).0, 0)
+        XCTAssertEqual(try read(source, at: UInt64.max).0, 0, "A seek beyond EOF yields zero bytes")
     }
 
     func testAbandonedSelectionReleasesGrantWithoutOpeningFile() throws {
@@ -72,25 +73,81 @@ final class PickedVideoFileTests: XCTestCase {
         var decoder = opened
         opened = nil
         XCTAssertNotNil(originalGrant, "The decoder must keep the picker's original grant")
-        XCTAssertEqual(read(try XCTUnwrap(decoder), at: 4).1, [0x66])
+        XCTAssertEqual(try read(try XCTUnwrap(decoder), at: 4).1, [0x66])
         decoder = nil
         await fulfillment(of: [stopped], timeout: 5)
         XCTAssertEqual(try Data(contentsOf: url), data)
     }
 
-    func testRejectsReplacementOrTruncationBetweenReads() async throws {
+    func testProviderMetadataChangeDoesNotInvalidateHealthyBytes() async throws {
+        let url = try makeFolder().appendingPathComponent("metadata.mp4")
+        try Data([1, 2, 3, 4]).write(to: url)
+        let source = try await PickedVideoFile.open(url)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_000)],
+                                              ofItemAtPath: url.path)
+        XCTAssertEqual(try read(source, count: 3, at: 1).1, [2, 3, 4])
+    }
+
+    func testSameNameReplacementDoesNotChangeAlreadyOpenedMovie() async throws {
         let url = try makeFolder().appendingPathComponent("same-name.mov")
         try Data([1, 2, 3, 4]).write(to: url)
         let original = try await PickedVideoFile.open(url)
         try Data([9, 8, 7, 6]).write(to: url, options: .atomic)
-        XCTAssertEqual(read(original, at: 0).0, -1, "Do not switch to a replacement file mid-movie")
-
+        XCTAssertEqual(try read(original, count: 4, at: 0).1, [1, 2, 3, 4])
         let replacement = try await PickedVideoFile.open(url)
-        XCTAssertEqual(read(replacement, at: 0).1, [9])
+        XCTAssertEqual(try read(replacement, count: 4, at: 0).1, [9, 8, 7, 6])
+    }
+
+    func testTruncationOfOriginalDescriptorReportsIncompleteFile() async throws {
+        let url = try makeFolder().appendingPathComponent("truncated.mov")
+        try Data([1, 2, 3, 4]).write(to: url)
+        let file = try await PickedVideoFile.open(url)
         let writer = try FileHandle(forWritingTo: url)
         try writer.truncate(atOffset: 1)
         try writer.close()
-        XCTAssertEqual(read(replacement, at: 0).0, -1, "Do not read invalidated offsets")
+        XCTAssertThrowsError(try read(file, at: 0)) { error in
+            let nsError = error as NSError
+            XCTAssertEqual(nsError.domain, NSCocoaErrorDomain)
+            XCTAssertEqual(nsError.code, CocoaError.Code.fileReadCorruptFile.rawValue)
+        }
+    }
+
+    @MainActor
+    func testPresenterTracksMovesAndRelinquishesRegistrationWhileBackgrounded() async throws {
+        let folder = try makeFolder()
+        let url = folder.appendingPathComponent("before.mp4")
+        let moved = folder.appendingPathComponent("after.mp4")
+        try Data([1, 2, 3, 4]).write(to: url)
+        var source: PickedVideoFile? = try await PickedVideoFile.open(url)
+        let presenter = try XCTUnwrap(NSFileCoordinator.filePresenters.first { $0.presentedItemURL == url })
+        func registered() -> Bool { NSFileCoordinator.filePresenters.contains { $0 === presenter } }
+        let center = NotificationCenter.default
+        center.post(name: UIApplication.didEnterBackgroundNotification, object: UIApplication.shared)
+        XCTAssertFalse(registered())
+        center.post(name: UIApplication.willEnterForegroundNotification, object: UIApplication.shared)
+        XCTAssertTrue(registered())
+
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var error: NSError?
+        var move: Result<Void, Error>?
+        coordinator.coordinate(writingItemAt: url, options: .forMoving,
+                               writingItemAt: moved, options: .forReplacing, error: &error) { from, to in
+            move = Result {
+                try FileManager.default.moveItem(at: from, to: to)
+                coordinator.item(at: from, didMoveTo: to)
+            }
+        }
+        if let error { throw error }
+        try XCTUnwrap(move).get()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while presenter.presentedItemURL?.lastPathComponent != moved.lastPathComponent,
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(presenter.presentedItemURL?.lastPathComponent, moved.lastPathComponent)
+        XCTAssertEqual(try read(XCTUnwrap(source), count: 4, at: 0).1, [1, 2, 3, 4])
+        source = nil
+        XCTAssertFalse(registered())
     }
 
     func testRejectsDisguisedPlaylistsAndBalancesSuccessfulScopeOnFailure() async throws {

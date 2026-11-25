@@ -11,23 +11,32 @@ import XCTest
         try await checkStereoOutput(picked: true)
     }
 
-    func testRemovedPickedFileReportsReadFailure() async throws {
+    func testTruncatedPickedFileReportsIncompleteDataToThePlayer() async throws {
         let original = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "sbs", withExtension: "mp4", subdirectory: "Fixtures"))
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
-        try FileManager.default.copyItem(at: original, to: url)
+        try Data(contentsOf: original).write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
         let file = try await PickedVideoFile.open(url)
+        // Keep the same inode but take away its bytes after successful opening.
+        let writer = try FileHandle(forWritingTo: url)
+        try writer.truncate(atOffset: 0)
+        try writer.close()
         let engine = SBSPlaybackEngine(pickedFile: file)
         defer { engine.stop() }
         try engine.load(fileURL: file.url)
-        try FileManager.default.removeItem(at: url)
-        let failed = expectation(description: "The Files read failure is shown to the user")
+        let failed = expectation(description: "A real premature EOF becomes a playback failure")
+        var failure: PlaybackSnapshot?
         engine.onUpdate = { state in
-            if state.phase == .failed, state.error?.contains("读取") == true { failed.fulfill() }
+            guard state.phase == .failed, failure == nil else { return }
+            failure = state
+            failed.fulfill()
         }
         engine.play()
         await fulfillment(of: [failed], timeout: 15)
+        let message = try XCTUnwrap(failure?.error)
+        XCTAssertTrue(message.contains("不完整"), message)
+        XCTAssertTrue(message.contains("\(NSCocoaErrorDomain) \(CocoaError.Code.fileReadCorruptFile.rawValue)"), message)
     }
 
     private func checkStereoOutput(picked: Bool) async throws {
