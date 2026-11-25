@@ -60,12 +60,25 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
 
     func setVideoFrameHandler(_ handler: ((CVPixelBuffer) -> Void)?) {
         guard !stopped else { return }
+        let returningToLayer = frameHandler != nil && handler == nil
         frameHandler = handler
         resetFrameWatch()
-        // The host hides its native view in VR. Keeping the layer associated
-        // lets AVFoundation prepare the item before a sized output is available.
-        MainActor.assumeIsolated { installStereoOutput() }
-        if handler == nil, let item = player.currentItem { prerollIfPaused(item) }
+        // Keep the native display alive under the opaque stereo view. A ready
+        // layer can be uncovered without an extra seek or decoder restart.
+        let needsPreroll = MainActor.assumeIsolated {
+            installStereoOutput()
+            guard returningToLayer, let old = surface, let host = old.superview,
+                  !old.videoLayer.isReadyForDisplay else { return false }
+            // If the layer lost readiness, replace only the display surface.
+            // Preroll the same item without overwriting a newer user seek.
+            displayObservation = nil
+            old.videoLayer.player = nil
+            old.removeFromSuperview()
+            surface = nil
+            attach(to: host)
+            return true
+        }
+        if needsPreroll, let item = player.currentItem { preroll(item) }
     }
 
     @MainActor private func installStereoOutput() {
@@ -78,7 +91,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             // several event turns after the user paused. Preroll it after attach.
             DispatchQueue.main.async {
                 guard let self, let item, self.frameHandler != nil else { return }
-                self.prerollIfPaused(item)
+                if !self.wantsPlayback { self.preroll(item) }
             }
         }) { [weak self, weak item] buffer in
             guard let self, let item, self.player.currentItem === item else { return }
@@ -90,9 +103,9 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         }
     }
 
-    private func prerollIfPaused(_ item: AVPlayerItem) {
+    private func preroll(_ item: AVPlayerItem) {
         guard player.currentItem === item, item.status == .readyToPlay,
-              !wantsPlayback, !seeking, pendingSeek == nil, !ended, !stopped else { return }
+              !seeking, pendingSeek == nil, !ended, !stopped else { return }
         seek(to: item.currentTime().seconds)
     }
 

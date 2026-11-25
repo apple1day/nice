@@ -40,7 +40,8 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
         ]
         let next = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
-        next.suppressesPlayerRendering = true
+        // Leave the native layer rendering behind the opaque stereo surface
+        // so exiting VR can reveal an up-to-date frame immediately.
         next.setDelegate(self, queue: .main)
         item.add(next)
         output = next

@@ -3,76 +3,74 @@ import XCTest
 
 @MainActor
 final class MovingMovieUITests: XCTestCase {
-    func testPickedMovieActuallyChangesPixelsInStandardAndFullSBS() async throws {
-        continueAfterFailure = false
+    func testPickedMovieActuallyChangesPixelsInStandardAndFullSBS() throws {
         XCUIDevice.shared.orientation = .portrait
         let app = try launchMovie("moving-stereo", fileExtension: "mp4")
         defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
 
         let surface = app.descendants(matching: .any)["playbackSurfaceToggle"]
-        XCTAssertTrue(surface.waitForExistence(timeout: 15), app.debugDescription)
-        try await assertChangingEyes(in: app, surface: surface, mode: "ordinary portrait")
+        try require(surface.waitForExistence(timeout: 15), app.debugDescription)
+        try assertChangingEyes(in: app, surface: surface, mode: "ordinary portrait")
         revealControls(surface)
         // Move sufficiently far into the clip that restarting at zero on a
         // format change is unambiguous even on a slow simulator.
         app.buttons["前进15秒"].tap()
-        try await assertChangingEyes(in: app, surface: surface, mode: "after seek")
+        try assertChangingEyes(in: app, surface: surface, mode: "after seek")
         revealControls(surface)
         let elapsed = app.staticTexts["playbackElapsedTime"]
         let before = try seconds(elapsed)
-        XCTAssertGreaterThanOrEqual(before, 15)
+        try require(before >= 15, "Fast-forward did not advance to 15 seconds. Elapsed: \(before)")
 
         XCUIDevice.shared.orientation = .landscapeLeft
         let landscape = XCTNSPredicateExpectation(
             predicate: NSPredicate { _, _ in app.frame.width > app.frame.height }, object: nil)
-        await fulfillment(of: [landscape], timeout: 8)
+        try require(XCTWaiter.wait(for: [landscape], timeout: 8) == .completed, "Landscape rotation timed out")
         revealControls(surface)
         let formats = app.buttons["videoFormatButton"]
         formats.tap()
         app.buttons["全宽 SBS（Full SBS）"].tap()
-        try await assertChangingEyes(in: app, surface: surface, mode: "full SBS")
+        try assertChangingEyes(in: app, surface: surface, mode: "full SBS")
         revealControls(surface)
-        XCTAssertEqual(formats.value as? String, "全宽 SBS")
-        XCTAssertGreaterThanOrEqual(try seconds(elapsed), before - 1)
+        try require(formats.value as? String == "全宽 SBS", "Expected full SBS")
+        try checkPosition(elapsed, after: before)
 
         formats.tap()
         app.buttons["退出 VR，普通播放"].tap()
-        try await assertChangingEyes(in: app, surface: surface, mode: "back to normal")
+        try assertChangingEyes(in: app, surface: surface, mode: "back to normal")
         revealControls(surface)
-        XCTAssertEqual(formats.value as? String, "普通播放")
-        XCTAssertGreaterThanOrEqual(try seconds(elapsed), before - 1)
+        try require(formats.value as? String == "普通播放", "Expected ordinary projection")
+        try checkPosition(elapsed, after: before)
 
         formats.tap()
         app.buttons["普通播放：切换到原生显示"].tap()
-        try await assertChangingEyes(in: app, surface: surface, mode: "native ordinary landscape")
+        try assertChangingEyes(in: app, surface: surface, mode: "native ordinary landscape")
         revealControls(surface)
-        XCTAssertGreaterThanOrEqual(try seconds(elapsed), before - 1)
+        try checkPosition(elapsed, after: before)
         formats.tap()
-        XCTAssertTrue(app.buttons["普通播放：切换到兼容显示"].exists)
+        try require(app.buttons["普通播放：切换到兼容显示"].exists, app.debugDescription)
     }
 
-    func testSystemPlayerShowsChanging4KHEVCSamplesBeyond4GiBInOrdinaryAndVR() async throws {
-        continueAfterFailure = false
+    func testSystemPlayerShowsChanging4KHEVCSamplesBeyond4GiBInOrdinaryAndVR() throws {
         XCUIDevice.shared.orientation = .landscapeLeft
         let app = try launchMovie("moving4k-index", fileExtension: "bin", samples: "moving4k-samples")
         defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
 
         let surface = app.descendants(matching: .any)["playbackSurfaceToggle"]
-        XCTAssertTrue(surface.waitForExistence(timeout: 15), app.debugDescription)
+        try require(surface.waitForExistence(timeout: 15), app.debugDescription)
         let format = app.buttons["videoFormatButton"]
         let systemRoute = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "当前解码：系统播放器")).firstMatch
-        try await assertChangingEyes(in: app, surface: surface, mode: "4K HEVC ordinary")
+        try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC ordinary")
         revealControls(surface)
         format.tap()
-        XCTAssertTrue(systemRoute.exists, app.debugDescription)
+        try require(systemRoute.exists, app.debugDescription)
         app.buttons["全宽 SBS（Full SBS）"].tap()
 
-        try await assertChangingEyes(in: app, surface: surface, mode: "4K HEVC full SBS")
+        try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC full SBS")
         revealControls(surface)
         format.tap()
-        XCTAssertTrue(systemRoute.exists, app.debugDescription)
+        try require(systemRoute.exists, app.debugDescription)
         app.buttons["退出 VR，普通播放"].tap()
-        try await assertChangingEyes(in: app, surface: surface, mode: "4K HEVC after leaving VR")
+        try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC after leaving VR")
     }
 
     private func launchMovie(_ resource: String, fileExtension: String, samples: String? = nil) throws -> XCUIApplication {
@@ -91,6 +89,22 @@ final class MovingMovieUITests: XCTestCase {
         return app
     }
 
+    private struct MotionFailure: LocalizedError {
+        let errorDescription: String?
+        init(_ message: String) { errorDescription = message }
+    }
+
+    // A failed pixel check must unwind this test and terminate its app before
+    // XCTest starts the next case. A detached async test could keep tapping it.
+    private func require(_ condition: Bool, _ message: @autoclosure () -> String) throws {
+        guard condition else { throw MotionFailure(message()) }
+    }
+
+    private func checkPosition(_ elapsed: XCUIElement, after previous: Int) throws {
+        let shown = try seconds(elapsed)
+        try require(shown >= previous - 1, "Playback position reset from \(previous) to \(shown) seconds")
+    }
+
     private func seconds(_ label: XCUIElement) throws -> Int {
         let fields = label.label.split(separator: ":")
         guard fields.count >= 2 else { throw NSError(domain: "Missing elapsed time: " + label.label, code: 1) }
@@ -103,11 +117,11 @@ final class MovingMovieUITests: XCTestCase {
         surface.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.95)).tap()
     }
 
-    private func assertChangingEyes(in app: XCUIApplication, surface: XCUIElement, mode: String) async throws {
+    private func assertChangingEyes(in app: XCUIApplication, surface: XCUIElement, mode: String) throws {
         let viewport = surface.frame
         let window = app.frame
         guard !viewport.isEmpty, !window.isEmpty else {
-            return XCTFail("Missing video bounds for \(mode): surface \(viewport), window \(window)")
+            throw MotionFailure("Missing video bounds for \(mode): surface \(viewport), window \(window)")
         }
         var phases = Set<Int>()
         var last = ""
@@ -122,13 +136,13 @@ final class MovingMovieUITests: XCTestCase {
             if left.g > left.r + 55 && left.g > left.b + 55
                 && right.r > right.b + 55 && right.g > right.b + 55 { phases.insert(1) }
             if phases.count == 2 { return }
-            try await Task.sleep(nanoseconds: 150_000_000)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
         }
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = mode
         attachment.lifetime = .keepAlways
         add(attachment)
-        XCTFail("\(mode): expected red/blue AND green/yellow on screen, got phases \(phases), last RGB pair \(last), surface \(viewport), window \(window)")
+        throw MotionFailure("\(mode): expected red/blue AND green/yellow on screen, got phases \(phases), last RGB pair \(last), surface \(viewport), window \(window)")
     }
 
     private typealias RGB = (r: Int, g: Int, b: Int)

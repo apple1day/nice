@@ -55,7 +55,7 @@ final class SBSPlaybackView: UIView {
             renderer = nil
         }
         renderer?.mode = mode
-        drawableView.isHidden = renderer != nil
+        drawableView.isHidden = renderer != nil && standardOutput != .system
         onOutputChange?()
     }
 

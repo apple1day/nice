@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreVideo
 import UIKit
 import XCTest
 @testable import NiceVideos
