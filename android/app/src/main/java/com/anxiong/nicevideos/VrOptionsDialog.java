@@ -62,14 +62,16 @@ final class VrOptionsDialog {
         fillLayouts(activity, layout, flat, current.layout);
         Spinner display = field(activity, panel, "观看方式");
         choices(activity, display, new String[]{"单屏观看", "双眼眼镜"}, current.headset ? 1 : 0);
-        VrGestureSettings gestures = VrGestureSettings.read(activity);
+        VrViewerSettings gestures = VrViewerSettings.read(activity);
+        Spinner quality = field(activity, panel, "VR 渲染清晰度");
+        choices(activity, quality, VrViewerSettings.Quality.values(), gestures.quality.ordinal());
         Spinner tap = field(activity, panel, "画面双击");
-        choices(activity, tap, VrGestureSettings.DoubleTap.values(), gestures.doubleTap.ordinal());
+        choices(activity, tap, VrViewerSettings.DoubleTap.values(), gestures.doubleTap.ordinal());
         LinearLayout zoom = new LinearLayout(activity);
         zoom.setOrientation(LinearLayout.VERTICAL);
         panel.addView(zoom);
         Spinner pinch = field(activity, zoom, "双指缩放幅度");
-        choices(activity, pinch, VrGestureSettings.Pinch.values(), gestures.pinch.ordinal());
+        choices(activity, pinch, VrViewerSettings.Pinch.values(), gestures.pinch.ordinal());
         TextView angleLabel = caption(activity, zoom, "");
         SeekBar angle = new SeekBar(activity);
         angle.setMax(65);
@@ -101,8 +103,9 @@ final class VrOptionsDialog {
                 .setPositiveButton("应用", (d, w) -> {
                     VrFormat.Projection p = PROJECTIONS[projection.getSelectedItemPosition()];
                     VrFormat.Layout[] layouts = p == VrFormat.Projection.FLAT ? FLAT_LAYOUTS : PANO_LAYOUTS;
-                    new VrGestureSettings((VrGestureSettings.DoubleTap) tap.getSelectedItem(),
-                            (VrGestureSettings.Pinch) pinch.getSelectedItem()).save(activity);
+                    new VrViewerSettings((VrViewerSettings.DoubleTap) tap.getSelectedItem(),
+                            (VrViewerSettings.Pinch) pinch.getSelectedItem(),
+                            (VrViewerSettings.Quality) quality.getSelectedItem()).save(activity);
                     apply.accept(new VrFormat(p, layouts[layout.getSelectedItemPosition()], display.getSelectedItemPosition() == 1),
                             angle.getProgress() + 45);
                 }).setNegativeButton("取消", null).setNeutralButton("片源信息", (d, w) -> details.run()).create();

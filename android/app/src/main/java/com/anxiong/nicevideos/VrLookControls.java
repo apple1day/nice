@@ -15,7 +15,7 @@ final class VrLookControls {
     private final float[] head = new float[16], touch = new float[16], camera = new float[16];
     private final int touchSlop;
     private final Runnable togglePlay;
-    private VrGestureSettings settings;
+    private VrViewerSettings settings;
     private float yaw, pitch, fieldOfView = 80, lastX, lastY;
     private boolean dragged;
     private boolean panorama, headset, resumed, followHead, multiplePointers;
@@ -25,7 +25,6 @@ final class VrLookControls {
         this.zoomFinished = zoomFinished;
         this.togglePlay = togglePlay;
         touchSlop = ViewConfiguration.get(owner).getScaledTouchSlop();
-        settings = VrGestureSettings.read(owner);
         Matrix.setIdentityM(head, 0);
         tracker = new VrHeadTracker(owner, orientation -> {
             System.arraycopy(orientation, 0, head, 0, 16);
@@ -53,8 +52,8 @@ final class VrLookControls {
                 // The second contact may turn into a look gesture. Commit the tap only on release.
                 if (event.getActionMasked() == MotionEvent.ACTION_UP && !dragged && !multiplePointers
                         && event.getEventTime() - event.getDownTime() < ViewConfiguration.getLongPressTimeout()) {
-                    if (settings.doubleTap == VrGestureSettings.DoubleTap.PLAY_PAUSE) togglePlay.run();
-                    else if (settings.doubleTap == VrGestureSettings.DoubleTap.RECENTER && panorama) recenter();
+                    if (settings.doubleTap == VrViewerSettings.DoubleTap.PLAY_PAUSE) togglePlay.run();
+                    else if (settings.doubleTap == VrViewerSettings.DoubleTap.RECENTER && panorama) recenter();
                     else movie.performClick();
                 }
                 return true;
@@ -95,8 +94,8 @@ final class VrLookControls {
         orient();
     }
 
-    void configure(boolean panorama, boolean headset, boolean followHead, float fov) {
-        settings = VrGestureSettings.read(movie.getContext());
+    void configure(boolean panorama, boolean headset, boolean followHead, float fov, VrViewerSettings preferences) {
+        settings = preferences;
         boolean changedProjection = panorama != this.panorama;
         this.panorama = panorama;
         this.headset = headset;

@@ -103,6 +103,33 @@ public final class PanoramaPlaybackTest {
         } finally { file.delete(); }
     }
 
+    @Test public void binocularHdAvcAtThirtyFpsKeepsAudioPlayingWhileLookingAround() throws Exception {
+        MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 960);
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, 30);
+        String decoder = new MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(format);
+        Assume.assumeTrue("No advertised AVC decoder for 1920×960 at 30 fps", decoder != null);
+        File file = fixture("avc-hd");
+        try (ActivityScenario<PlayerActivity> scene = open(file)) {
+            await("HD AVC didn't start with " + decoder, () -> seconds(scene) >= 1);
+            press(scene, "进入 VR");
+            press(scene, "切换眼镜显示");
+            MovieSurface movie = surface(scene);
+            try (Screen screen = new Screen(movie)) {
+                screen.eyes("HD binocular eye order", .5, .5);
+            }
+            PlayerAudioProbe probe = new PlayerAudioProbe(scene);
+            await("HD audio output did not start", () -> {
+                AudioTrack track = probe.track();
+                return track != null && track.getPlaybackHeadPosition() > 0;
+            });
+            long samples = movie.presentedSamples();
+            dragWithAudio(scene, "视频画面", probe, MotionEvent.ACTION_UP);
+            assertEquals("HD panorama drag issued a seek", 0, probe.seeks.get());
+            assertTrue("HD video stopped delivering frames during the drag",
+                    movie.presentedSamples() - samples >= 4);
+        } finally { file.delete(); }
+    }
+
     @Test public void repeatedAccessibleSeekWhilePausedCommitsOnceAndStaysPaused() throws Exception {
         File file = fixture("sbs");
         try (ActivityScenario<PlayerActivity> scene = open(file)) {
@@ -362,10 +389,48 @@ public final class PanoramaPlaybackTest {
         } finally { root.recycle(); }
     }
 
-    @Test public void configuredDoubleTapTogglesOnlyAfterReleaseAndHoldingThenDraggingLooksAround() throws Exception {
-        VrGestureSettings previous = VrGestureSettings.read(app);
+    @Test public void vrOutputCanResizeWithoutReopeningTheMovieOrAudioTrack() throws Exception {
+        VrViewerSettings previous = VrViewerSettings.read(app);
         File file = fixture("sbs");
-        new VrGestureSettings(VrGestureSettings.DoubleTap.PLAY_PAUSE, VrGestureSettings.Pinch.FINE).save(app);
+        new VrViewerSettings(previous.doubleTap, previous.pinch, VrViewerSettings.Quality.BALANCED).save(app);
+        try (ActivityScenario<PlayerActivity> scene = open(file)) {
+            await("Movie didn't start", () -> seconds(scene) >= 1);
+            MovieSurface movie = surface(scene);
+            PlayerAudioProbe probe = new PlayerAudioProbe(scene);
+            android.media.AudioTrack track = probe.track();
+            assertNotNull(track);
+            scene.onActivity(a -> movie.setLayoutParams(new android.widget.FrameLayout.LayoutParams(2048, 1024)));
+            checkBuffer(scene, movie, 2048, 1024);
+            press(scene, "进入 VR");
+            checkBuffer(scene, movie, 1920, 960);
+            scene.onActivity(a -> movie.setLayoutParams(new android.widget.FrameLayout.LayoutParams(1024, 2048)));
+            checkBuffer(scene, movie, 960, 1920);
+            scene.onActivity(a -> movie.setVrRenderQuality(true, VrViewerSettings.Quality.NATIVE));
+            checkBuffer(scene, movie, 1024, 2048);
+            scene.onActivity(a -> movie.setVrRenderQuality(true, VrViewerSettings.Quality.BALANCED));
+            checkBuffer(scene, movie, 960, 1920);
+            press(scene, "退出 VR");
+            checkBuffer(scene, movie, 1024, 2048);
+            long before = seconds(scene);
+            await("Movie stopped after resizing output", () -> seconds(scene) > before);
+            assertSame("Resizing reopened audio", track, probe.track());
+            assertEquals("Changing resolution caused a seek", 0, probe.seeks.get());
+        } finally { previous.save(app); file.delete(); }
+    }
+
+    private static void checkBuffer(ActivityScenario<PlayerActivity> scene, MovieSurface movie,
+                                    int expectedWidth, int expectedHeight) throws Exception {
+        await("Output buffer did not resize to " + expectedWidth + "×" + expectedHeight, () -> {
+            AtomicReference<android.graphics.Rect> bounds = new AtomicReference<>();
+            scene.onActivity(a -> bounds.set(new android.graphics.Rect(movie.getHolder().getSurfaceFrame())));
+            return bounds.get().width() == expectedWidth && bounds.get().height() == expectedHeight;
+        });
+    }
+
+    @Test public void configuredDoubleTapTogglesOnlyAfterReleaseAndHoldingThenDraggingLooksAround() throws Exception {
+        VrViewerSettings previous = VrViewerSettings.read(app);
+        File file = fixture("sbs");
+        new VrViewerSettings(VrViewerSettings.DoubleTap.PLAY_PAUSE, VrViewerSettings.Pinch.FINE, previous.quality).save(app);
         try (ActivityScenario<PlayerActivity> player = open(file)) {
             await("Movie didn't start", () -> seconds(player) >= 1);
             press(player, "进入 VR");

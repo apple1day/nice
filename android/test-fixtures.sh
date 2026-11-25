@@ -37,6 +37,16 @@ for packing in sbs tb; do
     -c:v copy -c:a aac -t 60 -movflags +faststart "$dest/vr-chart-$packing.mp4"
 done
 
+# A moving marker traverses each eye at 30 fps. Encode one full animation,
+# then repeat its GOPs against an uninterrupted mono tone in the HD file.
+ffmpeg -nostdin -v error -y -f lavfi \
+  -i "color=black:s=384x192:r=30,format=gbrp,geq=r='32+192*mod(X,192)/191':g='32+192*Y/191':b='36+128*gte(X,192)+42*gte(mod(N,60),30)+32*lt(Y,28)*lt(abs(mod(X,192)-3*N),6)'" \
+  -t 2 -vf 'scale=1920:960:flags=bilinear' -c:v libx264 -threads 2 -preset ultrafast \
+  -pix_fmt yuv420p -g 30 -bf 0 -an "$work/avc-hd.mp4"
+ffmpeg -nostdin -v error -y -stream_loop 14 -i "$work/avc-hd.mp4" \
+  -f lavfi -i 'sine=frequency=440:sample_rate=44100' -map 0:v:0 -map 1:a:0 -t 30 \
+  -c:v copy -c:a aac -movflags +faststart "$dest/vr-chart-avc-hd.mp4"
+
 # Use the same moving coordinate chart at a common decoder size and at 4K.
 # The two-second HEVC GOP can be repeated without re-encoding the test movie.
 for variant in hevc-hd hevc; do

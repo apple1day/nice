@@ -307,8 +307,10 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     }
 
     private void applyMode() {
+        VrViewerSettings preferences = VrViewerSettings.read(this);
+        movie.setVrRenderQuality(inVr, preferences.quality);
         movie.setFormat(inVr ? vrFormat : VrFormat.ORDINARY);
-        look.configure(panorama(), inVr && vrFormat.headset, followHead, fieldOfView);
+        look.configure(panorama(), inVr && vrFormat.headset, followHead, fieldOfView, preferences);
         int orientation = wide() ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE : ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
         if (getRequestedOrientation() != orientation) setRequestedOrientation(orientation);
         int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;

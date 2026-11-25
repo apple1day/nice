@@ -3,8 +3,8 @@ package com.anxiong.nicevideos;
 import android.content.Context;
 import android.content.SharedPreferences;
 
-/** Gesture preferences follow the viewer across movies. */
-final class VrGestureSettings {
+/** Gesture and display preferences apply across movies. */
+final class VrViewerSettings {
     enum DoubleTap {
         RECENTER("视角回正"), PLAY_PAUSE("播放／暂停"), CONTROLS("显示／隐藏控件");
         final String label;
@@ -20,23 +20,33 @@ final class VrGestureSettings {
         @Override public String toString() { return label; }
     }
 
-    final DoubleTap doubleTap;
-    final Pinch pinch;
-
-    VrGestureSettings(DoubleTap doubleTap, Pinch pinch) {
-        this.doubleTap = doubleTap;
-        this.pinch = pinch;
+    enum Quality {
+        BALANCED("流畅（最长边 1920）"), NATIVE("屏幕原生");
+        final String label;
+        Quality(String label) { this.label = label; }
+        @Override public String toString() { return label; }
     }
 
-    static VrGestureSettings read(Context context) {
+    final DoubleTap doubleTap;
+    final Pinch pinch;
+    final Quality quality;
+
+    VrViewerSettings(DoubleTap doubleTap, Pinch pinch, Quality quality) {
+        this.doubleTap = doubleTap;
+        this.pinch = pinch;
+        this.quality = quality;
+    }
+
+    static VrViewerSettings read(Context context) {
         SharedPreferences prefs = context.getSharedPreferences("vr_gestures", Context.MODE_PRIVATE);
-        return new VrGestureSettings(saved(prefs, "doubleTap", DoubleTap.RECENTER),
-                saved(prefs, "pinch", Pinch.NORMAL));
+        return new VrViewerSettings(saved(prefs, "doubleTap", DoubleTap.RECENTER),
+                saved(prefs, "pinch", Pinch.NORMAL), saved(prefs, "quality", Quality.BALANCED));
     }
 
     void save(Context context) {
         context.getSharedPreferences("vr_gestures", Context.MODE_PRIVATE).edit()
-                .putString("doubleTap", doubleTap.name()).putString("pinch", pinch.name()).apply();
+                .putString("doubleTap", doubleTap.name()).putString("pinch", pinch.name())
+                .putString("quality", quality.name()).apply();
     }
 
     private static <E extends Enum<E>> E saved(SharedPreferences prefs, String key, E fallback) {

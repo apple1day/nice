@@ -45,6 +45,9 @@ public final class MovieSurface extends GLSurfaceView {
     private volatile boolean active = true;
     private volatile long decoderGeneration;
     private volatile long presentedSamples;
+    private static final int VR_LONG_EDGE = 1920;
+    private boolean limitedVrResolution;
+    private int fixedWidth, fixedHeight;
 
     private final Choreographer display = Choreographer.getInstance();
     private final Choreographer.FrameCallback drawAtVsync = this::drawAtVsync;
@@ -65,6 +68,37 @@ public final class MovieSurface extends GLSurfaceView {
         renderer = new VideoRenderer();
         setRenderer(renderer);
         setRenderMode(RENDERMODE_WHEN_DIRTY);
+    }
+
+    // Only the composited display buffer changes. The incoming decoder SurfaceTexture,
+    // movie's sample dimensions and touch coordinates retain their original sizes.
+    void setVrRenderQuality(boolean inVr, VrViewerSettings.Quality quality) {
+        limitedVrResolution = inVr && quality == VrViewerSettings.Quality.BALANCED;
+        resizeDisplayBuffer(getWidth(), getHeight());
+    }
+
+    @Override protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
+        super.onSizeChanged(width, height, oldWidth, oldHeight);
+        resizeDisplayBuffer(width, height);
+    }
+
+    private void resizeDisplayBuffer(int width, int height) {
+        if (width < 1 || height < 1) return;
+        int longest = Math.max(width, height);
+        if (!limitedVrResolution || longest <= VR_LONG_EDGE) {
+            if (fixedWidth != 0) {
+                fixedWidth = fixedHeight = 0;
+                getHolder().setSizeFromLayout();
+            }
+            return;
+        }
+        double scale = (double) VR_LONG_EDGE / longest;
+        int pixelsWide = Math.max(1, (int) Math.round(width * scale));
+        int pixelsHigh = Math.max(1, (int) Math.round(height * scale));
+        if (pixelsWide == fixedWidth && pixelsHigh == fixedHeight) return;
+        fixedWidth = pixelsWide;
+        fixedHeight = pixelsHigh;
+        getHolder().setFixedSize(pixelsWide, pixelsHigh);
     }
 
     public void setMode(Mode value) {
