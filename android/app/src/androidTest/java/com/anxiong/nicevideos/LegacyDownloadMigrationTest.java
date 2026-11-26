@@ -160,6 +160,50 @@ public final class LegacyDownloadMigrationTest {
         }
     }
 
+    @Test public void resumesFromUsbRestoreDirectoryAndOnlyCleansRecordedSource() throws Exception {
+        byte[] externalBytes = {1, 2, 3}, restoredBytes = {4, 5, 6};
+        VideoLibrary.Entry old = legacy("USB-" + UUID.randomUUID() + ".mp4", externalBytes, externalBytes.length);
+        File unrelated = library.file(old);
+        File restored = new File(new File(app.getFilesDir(), "legacy_download_restore"), old.disk);
+        Files.createDirectories(restored.toPath().getParent());
+        Files.write(restored.toPath(), restoredBytes);
+        old.restoredPrivate = true;
+        assertTrue(library.saveCommitted(old));
+        Uri playback = library.uri(old);
+        try {
+            assertBytes(playback, restoredBytes);
+            assertTrue(migration.migrate(old.id));
+            VideoLibrary.Entry published = library.find(old.id);
+            assertFalse(published.restoredPrivate);
+            assertBytes(Uri.parse(published.publicUri), restoredBytes);
+            assertArrayEquals(externalBytes, Files.readAllBytes(unrelated.toPath()));
+            assertFalse(restored.exists());
+
+            // Recreate a stop after the catalog switched, then remove the public copy before cleanup.
+            Files.write(restored.toPath(), restoredBytes);
+            JSONObject tx = new JSONObject().put("original", old.disk).put("job", old.job)
+                    .put("restoredPrivate", true).put("target", published.publicUri).put("verified", true);
+            assertTrue(app.getSharedPreferences("legacy_download_migration", Context.MODE_PRIVATE)
+                    .edit().putString(old.id, tx.toString()).commit());
+            assertEquals(1, app.getContentResolver().delete(Uri.parse(published.publicUri), null, null));
+            LegacyDownloadMigration restarted = new LegacyDownloadMigration(new VideoLibrary(app));
+            restarted.recover();
+            VideoLibrary.Entry recovered = library.find(old.id);
+            assertTrue(recovered.restoredPrivate);
+            assertFalse(recovered.publicDownload);
+            assertBytes(playback, restoredBytes);
+            assertTrue(restarted.migrate(old.id));
+            assertBytes(playback, restoredBytes);
+            assertFalse(restored.exists());
+            assertArrayEquals(externalBytes, Files.readAllBytes(unrelated.toPath()));
+        } finally {
+            library.remove(library.find(old.id));
+            Files.deleteIfExists(unrelated.toPath());
+            Files.deleteIfExists(restored.toPath());
+            app.getSharedPreferences("legacy_download_migration", Context.MODE_PRIVATE).edit().remove(old.id).commit();
+        }
+    }
+
     @Test public void rejectsTruncatedFileWithoutLosingRecordAndCanRetryAfterRepair() throws Exception {
         byte[] original = {2, 7, 1, 8};
         // The low 32 bits match the length on disk: an int comparison would silently publish an incomplete file.

@@ -34,7 +34,7 @@ final class VideoLibrary {
         final String id;
         String name = "", document = "", source = "", disk = "", state = READY, error = "";
         long bytes = -1, time, job = -1;
-        boolean favorite, publicDownload;
+        boolean favorite, publicDownload, restoredPrivate;
         String publicUri = "";
         Entry(String id) { this.id = id; }
         boolean downloaded() { return !disk.isEmpty(); }
@@ -56,6 +56,7 @@ final class VideoLibrary {
             e.bytes = o.optLong("bytes", -1); e.time = o.optLong("time"); e.job = o.optLong("job", -1);
             e.favorite = o.optBoolean("favorite");
             e.publicDownload = o.optBoolean("publicDownload");
+            e.restoredPrivate = o.optBoolean("restoredPrivate");
             e.publicUri = o.optString("publicUri");
             return e;
         } catch (JSONException ex) { return null; }
@@ -80,7 +81,8 @@ final class VideoLibrary {
             o.put("id", e.id).put("name", e.name).put("document", e.document).put("source", e.source)
                 .put("disk", e.disk).put("state", e.state).put("error", e.error).put("bytes", e.bytes)
                 .put("time", e.time).put("job", e.job).put("favorite", e.favorite)
-                .put("publicDownload", e.publicDownload).put("publicUri", e.publicUri);
+                .put("publicDownload", e.publicDownload).put("publicUri", e.publicUri)
+                .put("restoredPrivate", e.restoredPrivate);
         } catch (JSONException ex) { throw new IllegalStateException(ex); }
         return prefs.edit().putString("movie." + e.id, o.toString());
     }
@@ -118,7 +120,8 @@ final class VideoLibrary {
     DownloadManager manager() { return (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE); }
 
     File file(Entry e) throws IOException {
-        File root = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+        File root = e.restoredPrivate ? new File(context.getFilesDir(), "legacy_download_restore")
+                : context.getExternalFilesDir(Environment.DIRECTORY_MOVIES);
         if (e.publicDownload || root == null || !e.disk.matches("[a-f0-9-]{36}\\.[a-z0-9]{1,10}"))
             throw new IOException("本机视频目录不可用。");
         return new File(root, e.disk);
@@ -268,7 +271,7 @@ final class VideoLibrary {
             Entry e = prior == null ? new Entry(UUID.randomUUID().toString()) : prior;
             e.disk = nextDownloadName(movie.name);
             e.name = movie.name; e.source = movie.url; e.bytes = movie.bytes;
-            e.publicDownload = true; e.publicUri = "";
+            e.publicDownload = true; e.publicUri = ""; e.restoredPrivate = false;
             long space = Environment.getExternalStorageDirectory().getUsableSpace();
             if (e.bytes > 0 && space > 0 && space < e.bytes) throw new IOException("本机剩余空间不足。");
             // DownloadManager appends the subpath as an encoded URI path. Encode the filename

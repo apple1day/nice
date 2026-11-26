@@ -57,7 +57,7 @@ final class LegacyDownloadMigration {
                 throw new IOException("旧版影片不完整，已保留原文件。");
             Transaction tx = read(id);
             if (tx == null) tx = begin(old);
-            if (!tx.original.equals(old.disk) || tx.job != old.job)
+            if (!tx.matchesOriginal(old))
                 throw new IOException("影片记录已更改，请重新打开片库。");
 
             boolean published = false;
@@ -83,7 +83,7 @@ final class LegacyDownloadMigration {
 
             synchronized (VideoLibrary.class) {
                 VideoLibrary.Entry latest = library.find(id);
-                if (!needsMigration(latest) || !old.disk.equals(latest.disk) || old.job != latest.job) {
+                if (!needsMigration(latest) || !tx.matchesOriginal(latest)) {
                     discardUnpublished(id, tx);
                     return false;
                 }
@@ -95,6 +95,7 @@ final class LegacyDownloadMigration {
                         throw new IOException("公共影片尚未就绪，已保留原文件。");
                 }
                 latest.publicDownload = true;
+                latest.restoredPrivate = false;
                 latest.publicUri = tx.target.toString();
                 latest.disk = actualName;
                 latest.bytes = length;
@@ -128,7 +129,7 @@ final class LegacyDownloadMigration {
         Transaction tx = read(id);
         VideoLibrary.Entry e = library.find(id);
         if (e == null || !e.publicDownload || !tx.target.toString().equals(e.publicUri)) {
-            if (!needsMigration(e) || !tx.original.equals(e.disk) || tx.job != e.job) discardUnpublished(id, tx);
+            if (!needsMigration(e) || !tx.matchesOriginal(e)) discardUnpublished(id, tx);
             // Uncommitted copies resume in migrate(id).
             return;
         }
@@ -147,6 +148,7 @@ final class LegacyDownloadMigration {
                 // If the published copy changed before cleanup, preserve it and resume from the intact original.
                 if (!source.isFile() || source.length() != current.bytes) throw new IOException("旧版副本大小异常。");
                 current.publicDownload = false;
+                current.restoredPrivate = tx.restoredPrivate;
                 current.publicUri = "";
                 current.disk = tx.original;
                 current.job = tx.job;
@@ -162,10 +164,15 @@ final class LegacyDownloadMigration {
     private static final class Transaction {
         final String original;
         final long job;
+        final boolean restoredPrivate;
         Uri target;
         boolean verified;
-        Transaction(String original, long job, Uri target, boolean verified) {
+        Transaction(String original, long job, boolean restoredPrivate, Uri target, boolean verified) {
             this.original = original; this.job = job; this.target = target; this.verified = verified;
+            this.restoredPrivate = restoredPrivate;
+        }
+        boolean matchesOriginal(VideoLibrary.Entry e) {
+            return original.equals(e.disk) && job == e.job && restoredPrivate == e.restoredPrivate;
         }
         boolean media() { return ContentResolver.SCHEME_CONTENT.equals(target.getScheme()); }
     }
@@ -175,7 +182,7 @@ final class LegacyDownloadMigration {
         if (value == null) return null;
         try {
             JSONObject o = new JSONObject(value);
-            return new Transaction(o.getString("original"), o.getLong("job"),
+            return new Transaction(o.getString("original"), o.getLong("job"), o.optBoolean("restoredPrivate"),
                     Uri.parse(o.getString("target")), o.getBoolean("verified"));
         } catch (JSONException ex) { throw new IOException("迁移记录无效。", ex); }
     }
@@ -183,6 +190,7 @@ final class LegacyDownloadMigration {
     private void write(String id, Transaction tx) throws IOException {
         try {
             String value = new JSONObject().put("original", tx.original).put("job", tx.job)
+                    .put("restoredPrivate", tx.restoredPrivate)
                     .put("target", tx.target.toString()).put("verified", tx.verified).toString();
             if (!journal.edit().putString(id, value).commit()) throw new IOException("无法保存迁移进度。");
         } catch (JSONException ex) { throw new IOException(ex); }
@@ -206,7 +214,7 @@ final class LegacyDownloadMigration {
             if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("无法创建公共下载目录。");
             target = Uri.fromFile(new File(dir, name));
         }
-        Transaction tx = new Transaction(old.disk, old.job, target, false);
+        Transaction tx = new Transaction(old.disk, old.job, old.restoredPrivate, target, false);
         try {
             write(old.id, tx);
         } catch (IOException ex) {
@@ -251,6 +259,7 @@ final class LegacyDownloadMigration {
     private File oldFile(String id, Transaction tx) throws IOException {
         VideoLibrary.Entry old = new VideoLibrary.Entry(id);
         old.disk = tx.original;
+        old.restoredPrivate = tx.restoredPrivate;
         return library.file(old);
     }
 

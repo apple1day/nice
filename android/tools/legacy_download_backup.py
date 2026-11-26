@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 
 PACKAGE = "com.anxiong.nicevideos.vr.preview"
 MOVIES = "/sdcard/Android/data/" + PACKAGE + "/files/Movies"
+STAGING = "files/legacy_download_restore"
 PREFS = ("video_positions.xml", "vr_gestures.xml", "video_library.xml")  # Commit catalog last.
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 MOVIE = re.compile(UUID + r"\.[a-z0-9]{1,10}")
@@ -54,14 +55,20 @@ class Device:
         for probe in (MOVIES,) if restoring else (MOVIES, parent):
             for method in (self.run, self.app):
                 try:
-                    method(f"test -d {probe} && ls -A {probe} >/dev/null",
+                    test = f"test -d {probe} && ls -A {probe} >/dev/null"
+                    if probe == parent:
+                        # A readable parent proves an absent Movies directory only when
+                        # its own directory listing confirms that absence.
+                        test += f" && ! ls -A1 {parent} | grep -Fx Movies >/dev/null"
+                    if restoring:
+                        test += f" && t=$(mktemp {probe}/.nice-write-XXXXXX) && rm \"$t\""
+                    method(test,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except subprocess.CalledProcessError:
                     continue
                 self.external = method
-                return
-        raise ValueError("USB debugging cannot read the app's Movies directory: " + MOVIES
-                         + ". Verify the Android owner profile and keep the original installation.")
+                return True
+        return False
 
     def stop(self, restoring):
         owner = self.run("am get-current-user", stdout=subprocess.PIPE).stdout.strip()
@@ -83,12 +90,12 @@ class Device:
         lines = raw.splitlines()
         return {"bytes": int(lines[0]), "sha256": lines[1].split()[0]}
 
-    def movies(self):
-        parent = MOVIES.rsplit("/", 1)[0]
+    def movies(self, directory=MOVIES):
+        parent = directory.rsplit("/", 1)[0]
         # 'test -d' alone reports false on EACCES too. Require a readable parent
         # before accepting an absent Movies directory as empty.
-        result = self.text(f"if [ -d {MOVIES} ]; then ls -A1 {MOVIES}; "
-                           f"else ls -A {parent} >/dev/null; fi", MOVIES + "/")
+        result = self.text(f"if [ -d {directory} ]; then ls -A1 {directory}; "
+                           f"else ls -A {parent} >/dev/null; fi", directory + "/")
         names = result.splitlines()
         require(all(MOVIE.fullmatch(n) for n in names),
                 "Unexpected files in the old Movies directory. Inspect them before backing up.")
@@ -115,7 +122,7 @@ def bytes_digest(value):
     return {"bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()}
 
 
-def check_catalog(data, movies, restoring=False):
+def check_catalog(data, movies, restoring=False, internal=False):
     require(len(data) < 32 * 1024 * 1024, "Unexpectedly large preferences file.")
     root = ET.fromstring(data)
     require(root.tag == "map", "Invalid SharedPreferences XML.")
@@ -143,6 +150,8 @@ def check_catalog(data, movies, restoring=False):
         if restoring:
             # IDs belong to the previous installation. Never remove or poll those jobs after restore.
             e["job"] = -1
+            if internal and disk in movies:
+                e["restoredPrivate"] = True
             node.text = json.dumps(e, ensure_ascii=False, separators=(",", ":"))
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
@@ -184,7 +193,8 @@ def backup(device, root):
         ensure_dir(root / name)
 
     device.stop(restoring=False)
-    device.select_movies_access(restoring=False)
+    require(device.select_movies_access(restoring=False),
+            "USB debugging cannot read the old Movies directory. Keep the old app installed.")
     names = device.movies()
     info = {"format": FORMAT, "package": PACKAGE, "Movies": {}, "prefs": {}}
     for name in PREFS:
@@ -241,6 +251,11 @@ def validate_backup(root, info, verify_bytes=True):
                 require(file_digest(path) == item, f"Backup checksum mismatch: {name}")
 
 
+def stage_path(directory, name):
+    parent = directory.rsplit("/", 1)[0] if directory in (MOVIES, STAGING) else directory
+    return parent + "/.nice-restore-" + name + ".part"
+
+
 def upload(device, directory, name, expected, source=None, data=None, replace_empty=False):
     path = directory + "/" + name
     current = device.digest(path)
@@ -252,7 +267,7 @@ def upload(device, directory, name, expected, source=None, data=None, replace_em
         require(existing.tag == "map" and len(existing) == 0, f"Device already has settings: {name}")
     # A stable staging file outside Movies survives a lost USB connection without
     # entering the user's catalog or blocking the next restore.
-    temp = (MOVIES.rsplit("/", 1)[0] if directory == MOVIES else directory) + "/.nice-restore-" + name + ".part"
+    temp = stage_path(directory, name)
     try:
         script = f"umask 077; cat > {temp}"
         if source is not None:
@@ -280,12 +295,23 @@ def restore(device, root):
             data = (root / "prefs" / name).read_bytes()
             prefs[name] = check_catalog(data, info["Movies"], True) if name == "video_library.xml" else data
     device.stop(restoring=True)
+    prior_directory = None
     for name in PREFS:
         path = device.pref(name)
         if path:
             require(not path.endswith(".bak"), "Target has an interrupted preferences update. Inspect the app first.")
             current = device.digest(path)
-            if name not in prefs or current != bytes_digest(prefs[name]):
+            allowed = [bytes_digest(prefs[name])] if name in prefs else []
+            if name == "video_library.xml" and name in prefs:
+                original = (root / "prefs" / name).read_bytes()
+                internal_digest = bytes_digest(check_catalog(original, info["Movies"], True, True))
+                if internal_digest != allowed[0]:
+                    if current == internal_digest:
+                        prior_directory = STAGING
+                    elif current == allowed[0]:
+                        prior_directory = MOVIES
+                allowed.append(internal_digest)
+            if current not in allowed:
                 require(current["bytes"] < 4096, "Target already contains app settings.")
                 xml = ET.fromstring(device.app("cat " + path, stdout=subprocess.PIPE).stdout)
                 require(xml.tag == "map" and len(xml) == 0, "Target already contains library records or settings.")
@@ -294,24 +320,34 @@ def restore(device, root):
     device.run("am start -W -n " + PACKAGE + "/com.anxiong.nicevideos.MainActivity "
                "-a com.anxiong.nicevideos.PREPARE_RESTORE", stdout=subprocess.DEVNULL)
     device.run("am force-stop " + PACKAGE)
-    device.select_movies_access(restoring=True)
+    directory = prior_directory or MOVIES
+    if directory == MOVIES and not device.select_movies_access(restoring=True):
+        require(prior_directory is None,
+                "The previously restored Movies directory is inaccessible. Keep both copies and retry.")
+        directory = STAGING
+    if directory == STAGING:
+        device.app("mkdir -p " + directory)
+        if "video_library.xml" in prefs:
+            original = (root / "prefs/video_library.xml").read_bytes()
+            prefs["video_library.xml"] = check_catalog(original, info["Movies"], True, True)
+        print("Using the updated app’s internal migration staging folder.", flush=True)
     device.app("mkdir -p shared_prefs")
-    require(set(device.movies()) <= set(info["Movies"]), "Target contains other videos. Start with a fresh installation.")
+    require(set(device.movies(directory)) <= set(info["Movies"]), "Target contains other videos. Start with a fresh installation.")
     missing_bytes = 0
     for name, expected in info["Movies"].items():
-        current = device.digest(MOVIES + "/" + name)
+        current = device.digest(directory + "/" + name)
         require(current is None or current == expected, f"Different movie exists on target: {name}")
         if current is None:
             # A disconnected run can leave its partial transfer in staging. The
             # bytes will be released when cat truncates that same staging file.
-            stage = MOVIES.rsplit("/", 1)[0] + "/.nice-restore-" + name + ".part"
+            stage = stage_path(directory, name)
             stage_size = int(device.text(f"if [ -f {stage} ]; then stat -c %s {stage}; else echo 0; fi", stage))
             missing_bytes += max(0, expected["bytes"] - stage_size)
-    free = device.text("df -k " + MOVIES, MOVIES + "/").splitlines()[-1].split()
+    free = device.text("df -k " + directory, directory + "/").splitlines()[-1].split()
     require(int(free[-3]) * 1024 >= missing_bytes, "Not enough space to restore the videos.")
     for i, (name, item) in enumerate(info["Movies"].items(), 1):
         print(f"[{i}/{len(info['Movies'])}] Restore {name}", flush=True)
-        upload(device, MOVIES, name, item, source=root / "Movies" / name)
+        upload(device, directory, name, item, source=root / "Movies" / name)
     for name, data in prefs.items():
         upload(device, "shared_prefs", name, bytes_digest(data), data=data, replace_empty=True)
     print("Verified restore complete. Open the updated Nice app to migrate the historical downloads.")

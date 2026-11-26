@@ -59,7 +59,17 @@ jobs:
           target: default
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: cd android && ./gradlew :app:connectedDebugAndroidTest && bash tools/test_legacy_upgrade.sh
+          script: cd android && ./gradlew :app:connectedDebugAndroidTest
+      - name: Verify the published 1.2.0 USB upgrade on Android 15
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          avd-name: nice-upgrade-api35
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: cd android && bash tools/test_legacy_upgrade.sh
       - name: Verify tested artifact and publish test counts
         working-directory: android
         run: |
