@@ -16,9 +16,18 @@ final class PickedVideoFile {
     final class Selection: Identifiable {
         let url: URL
         private let stop: (() -> Void)?
+        private let directoryGrant: Selection?
+        // A descendant of a security-scoped directory inherits its read grant.
+        // Playback and thumbnail work retain this exact grant after navigation.
+        init(_ url: URL, inheriting directoryGrant: Selection) {
+            self.url = url
+            self.directoryGrant = directoryGrant
+            stop = nil
+        }
         init(_ url: URL, startAccess: (URL) -> Bool = { $0.startAccessingSecurityScopedResource() },
              endAccess: @escaping (URL) -> Void = { $0.stopAccessingSecurityScopedResource() }) {
             self.url = url
+            directoryGrant = nil
             // URLs already readable in the sandbox may not require a scope.
             stop = startAccess(url) ? { endAccess(url) } : nil
         }
@@ -118,9 +127,13 @@ final class PickedVideoFile {
         }
     }
 
+    static let supportedExtensions = OfflineMediaPolicy.extensions.union([
+        "mpeg", "mpg", "m2v", "m2ts", "mts", "3gp", "3g2", "ogv", "vob", "asf", "f4v"
+    ])
+
     private static func validateURL(_ url: URL) throws {
         try requireLocalURL(url)
-        guard OfflineMediaPolicy.extensions.contains(url.pathExtension.lowercased()) else {
+        guard supportedExtensions.contains(url.pathExtension.lowercased()) else {
             throw OfflineMediaPolicy.Failure.unsupported
         }
     }

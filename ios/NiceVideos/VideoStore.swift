@@ -330,11 +330,11 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             reconcileFiles(ids: [record.id])
         }
     }
-    func playPickedFile(_ file: PickedVideoFile) throws {
+    func playPickedFile(_ file: PickedVideoFile, startsInVR: Bool = false) throws {
         guard playbackSession == nil && playback == nil else {
             throw ClientError("已有视频正在播放，请先关闭播放器。")
         }
-        presentPlayback(PlaybackRequest(pickedFile: file))
+        presentPlayback(PlaybackRequest(pickedFile: file, startsInVR: startsInVR))
     }
 
     private func presentPlayback(_ request: PlaybackRequest) {

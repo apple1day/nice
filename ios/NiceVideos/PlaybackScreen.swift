@@ -290,6 +290,7 @@ private struct MovieVideoSurface: UIViewRepresentable {
     let standardOutput: MovieOutput
     let camera: VRGestureCamera
     let followHead: Bool
+    let wakeGesture: VRWakeGesture
     let nativeResolution: Bool
 
     @MainActor private func configure(_ view: SBSPlaybackView) {
@@ -297,7 +298,7 @@ private struct MovieVideoSurface: UIViewRepresentable {
         if let renderer = view.renderer, renderer.nativeResolution != nativeResolution {
             renderer.nativeResolution = nativeResolution
         }
-        if case .immersive = mode { camera.connect(to: view.renderer, followHead: followHead) }
+        if case .immersive = mode { camera.connect(to: view.renderer, followHead: followHead, wake: wakeGesture) }
         else { camera.connect(to: nil, followHead: false) }
     }
     func makeCoordinator() -> PlaybackModel { model }
@@ -404,14 +405,26 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     @State private var showsPlaylist = false
     @State private var showsVideoFormats = false
     @State private var showsVRSettings = false
-    @StateObject private var camera = VRGestureCamera()
-    @State private var vrProfile = VRMoviePreferences()
+    @StateObject private var camera: VRGestureCamera
+    @State private var vrProfile: VRMoviePreferences
     @AppStorage("vr.viewer.gyro") private var followHead = false
     @AppStorage("vr.viewer.nativeResolution") private var nativeResolution = false
+    @AppStorage("vr.viewer.wakeGesture") private var wakeGesture: VRWakeGesture = .off
     @AppStorage("vr.viewer.doubleTap") private var doubleTap: VRDoubleTapAction = .recenter
     @AppStorage("vr.viewer.pinch") private var pinchResponse: VRPinchResponse = .regular
-    @State private var displayMode: SBSDisplayMode = .standard
+    @State private var displayMode: SBSDisplayMode
     @State private var outputOverride: MovieOutput?
+
+    init(playlist: PlaylistPlaybackModel, model: PlaybackModel) {
+        self.playlist = playlist
+        self.model = model
+        let request = playlist.current
+        let profile = request.startsInVR ? VRMoviePreferences(key: request.key) : VRMoviePreferences()
+        _vrProfile = State(initialValue: profile)
+        _displayMode = State(initialValue: request.startsInVR ? profile.mode : .standard)
+        _camera = StateObject(wrappedValue: VRGestureCamera(fieldOfView: profile.fieldOfView))
+    }
+
     private var defaultOutput: MovieOutput { MovieOutput.defaultOutput(for: request.pickedFile) }
     private var standardOutput: MovieOutput { outputOverride ?? defaultOutput }
     private var activeOutput: MovieOutput { model.videoOutput ?? standardOutput }
@@ -437,6 +450,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                     Color.black.ignoresSafeArea()
                     MovieVideoSurface(model: model, mode: displayMode, standardOutput: standardOutput,
                                       camera: camera, followHead: isPanorama && followHead && scenePhase == .active && !showsVRSettings,
+                                      wakeGesture: vrProfile.headset && canInteract && !hasMessage ? wakeGesture : .off,
                                       nativeResolution: nativeResolution)
                         .id(request.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -508,6 +522,9 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         .background {
             VRGamepadInput(enabled: immersive && canInteract && !hasMessage, onCommand: gamepadCommand)
                 .frame(width: 0, height: 0).allowsHitTesting(false).accessibilityHidden(true)
+        }
+        .onReceive(camera.controlsRequested) { _ in
+            if immersive && vrProfile.headset && canInteract && !hasMessage { revealControls() }
         }
         .sheet(isPresented: $showsPlaylist) { playlistSheet }
         .sheet(isPresented: $showsVRSettings) { immersiveSettings }
@@ -784,7 +801,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     private var immersiveSettings: some View {
         VRViewerSettingsView(profile: Binding(get: { vrProfile }, set: applyProfile),
                              followHead: $followHead, nativeResolution: $nativeResolution,
-                             doubleTap: $doubleTap, pinchResponse: $pinchResponse,
+                             doubleTap: $doubleTap, pinchResponse: $pinchResponse, wakeGesture: $wakeGesture,
                              sensorAvailable: camera.sensorAvailable, decoder: activeOutput.title,
                              details: model.videoDetails,
                              decoderAction: activeOutput == .system ? "尝试 VLC 解码" :

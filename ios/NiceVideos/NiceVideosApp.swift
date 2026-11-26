@@ -41,7 +41,8 @@ struct NiceVideosApp: App {
             #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("--ui-test-playback") {
                 PlaybackUITestFixtureView()
-            } else if ProcessInfo.processInfo.arguments.contains("--ui-test-file-picker") {
+            } else if ProcessInfo.processInfo.arguments.contains("--ui-test-file-picker") ||
+                        ProcessInfo.processInfo.arguments.contains("--ui-test-vr-folder") {
                 if let store = Self.emptyFilePickerTestStore { NiceVideosRootView(store: store) }
                 else { Text("无法创建文件选择器测试片库") }
             } else if ProcessInfo.processInfo.arguments.contains("--ui-test-moving-video"),

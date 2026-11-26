@@ -29,6 +29,13 @@ struct LibraryRootView: View {
                     .safeAreaInset(edge: .top, spacing: 0) { SigningExpiryBanner() }
             }
                 .tabItem { Label("本地", systemImage: "internaldrive") }
+            NavigationStack {
+                VRFolderTab { file in
+                    do { try store.playPickedFile(file, startsInVR: true) }
+                    catch { store.errorMessage = error.localizedDescription }
+                }
+            }
+                .tabItem { Label("VR", systemImage: "goggles").accessibilityIdentifier("vrFolderTab") }
             NavigationStack { ServerCatalogView() }
                 .tabItem { Label("服务器", systemImage: "server.rack") }
             NavigationStack { TransfersView() }

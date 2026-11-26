@@ -128,7 +128,21 @@ final class MovingMovieUITests: XCTestCase {
         try checkChart("both eyes move in sync", stereo: true, moving: true)
         revealControls(surface)
         formats.tap()
-        app.buttons["退出全景 VR"].tap()
+        try require(app.navigationBars["VR 设置"].waitForExistence(timeout: 5), app.debugDescription)
+        let exitVR = app.buttons["exitPanoramaVR"]
+        // A landscape Form only materializes its visible rows. Scroll inside
+        // the sheet until its exit action is on screen, as a viewer would.
+        for _ in 0..<8 {
+            if exitVR.exists && exitVR.isHittable { break }
+            app.swipeUp()
+        }
+        try require(exitVR.exists && exitVR.isHittable, "VR exit action unavailable: " + app.debugDescription)
+        exitVR.tap()
+        let normal = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in formats.exists && formats.value as? String == "普通播放" },
+            object: nil)
+        try require(XCTWaiter.wait(for: [normal], timeout: 6) == .completed,
+                    "Leaving the VR settings did not restore ordinary playback")
     }
 
     private func launchMovie(_ resource: String, fileExtension: String, samples: String? = nil) throws -> XCUIApplication {

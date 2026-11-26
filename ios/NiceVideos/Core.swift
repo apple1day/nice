@@ -102,6 +102,7 @@ struct PlaybackRequest: Identifiable {
     let title: String
     let url: URL
     let pickedFile: PickedVideoFile?
+    let startsInVR: Bool
     // The visible list captured at the tap, before playback can change watched
     // flags. nil keeps compatibility with standalone callers of this request.
     let playlistIDs: [String]?
@@ -112,11 +113,13 @@ struct PlaybackRequest: Identifiable {
         self.url = url
         self.playlistIDs = playlistIDs
         pickedFile = nil
+        startsInVR = false
     }
 
     // The Files picker already opened and validated this exact file. A provider
     // URL can move later; decoding uses the retained file instead of reopening it.
-    init(pickedFile: PickedVideoFile) {
+    init(pickedFile: PickedVideoFile, startsInVR: Bool = false) {
+        self.startsInVR = startsInVR
         self.pickedFile = pickedFile
         url = pickedFile.url
         title = pickedFile.url.lastPathComponent

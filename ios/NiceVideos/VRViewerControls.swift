@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import simd
 import UIKit
 
@@ -70,18 +71,38 @@ enum VRPinchResponse: String, CaseIterable {
 /// The draw path writes only camera uniforms. It has no access to a player, file or seek state.
 @MainActor final class VRGestureCamera: ObservableObject {
     private weak var renderer: SBSMetalView?
+    let controlsRequested = PassthroughSubject<Void, Never>()
+    private var wakeMode: VRWakeGesture = .off
+    private var wakeDetector = VRHandsFreeDetector()
     private lazy var tracker = VRHeadTracker { [weak self] pose in
-        self?.head = pose
-        self?.draw()
+        self?.receivedHeadPose(pose)
+    }
+
+    private func receivedHeadPose(_ pose: simd_float3x3) {
+        head = pose
+        draw()
+        guard lastGyro, wakeMode != .off else { return }
+        let forward = -pose.columns.2
+        let yaw = atan2(forward.x, -forward.z) * 180 / .pi
+        let pitch = asin(min(1, max(-1, forward.y))) * 180 / .pi
+        if wakeDetector.update(yaw: yaw, pitch: pitch, at: ProcessInfo.processInfo.systemUptime, mode: wakeMode) {
+            controlsRequested.send()
+        }
     }
     private var head = matrix_identity_float3x3
     private var yaw: Float = 0
     private var pitch: Float = 0
     private var lastGyro = false
-    private(set) var fieldOfView: Float = 80
+    private(set) var fieldOfView: Float
+
+    init(fieldOfView: Float = 80) { self.fieldOfView = fieldOfView }
     var sensorAvailable: Bool { tracker.isAvailable }
 
-    func connect(to renderer: SBSMetalView?, followHead: Bool) {
+    func connect(to renderer: SBSMetalView?, followHead: Bool, wake: VRWakeGesture = .off) {
+        if wake != wakeMode || self.renderer !== renderer {
+            wakeMode = wake
+            wakeDetector.reset()
+        }
         if self.renderer !== renderer {
             self.renderer = renderer
             draw()
@@ -89,6 +110,7 @@ enum VRPinchResponse: String, CaseIterable {
         let enabled = renderer != nil && followHead
         if enabled != lastGyro {
             lastGyro = enabled
+            wakeDetector.reset()
             tracker.setEnabled(enabled)
             head = matrix_identity_float3x3
             draw()
@@ -97,6 +119,7 @@ enum VRPinchResponse: String, CaseIterable {
 
     func updateOrientation(_ orientation: UIInterfaceOrientation?) {
         if let orientation, orientation != .unknown, tracker.interfaceOrientation != orientation {
+            wakeDetector.reset()
             tracker.interfaceOrientation = orientation
         }
     }
@@ -105,6 +128,7 @@ enum VRPinchResponse: String, CaseIterable {
         yaw = 0
         pitch = 0
         head = matrix_identity_float3x3
+        wakeDetector.reset()
         tracker.recenter()
         draw()
     }
@@ -214,6 +238,7 @@ enum VRPinchResponse: String, CaseIterable {
     @Binding var nativeResolution: Bool
     @Binding var doubleTap: VRDoubleTapAction
     @Binding var pinchResponse: VRPinchResponse
+    @Binding var wakeGesture: VRWakeGesture
     let sensorAvailable: Bool
     let decoder: String
     let details: String?
@@ -236,6 +261,9 @@ enum VRPinchResponse: String, CaseIterable {
                 if profile.projection != .flat {
                     Section("环顾") {
                         Toggle("陀螺仪跟随", isOn: $followHead).disabled(!sensorAvailable)
+                        if profile.headset && followHead && sensorAvailable {
+                            VRHandsFreeSettingRow(selection: $wakeGesture)
+                        }
                         if !sensorAvailable { Text("当前设备可用手指拖动环顾。").font(.footnote) }
                         Picker("双指缩放幅度", selection: $pinchResponse) {
                             ForEach(VRPinchResponse.allCases, id: \.self) { Text($0.rawValue).tag($0) }
