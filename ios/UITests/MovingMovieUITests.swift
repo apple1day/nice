@@ -115,17 +115,19 @@ final class MovingMovieUITests: XCTestCase {
             throw MotionFailure("\(description): phases=\(phases), RGB=\(last)")
         }
 
-        func tapPanoramaControl(_ button: XCUIElement) throws {
-            // A control can still have an accessibility frame during its
-            // auto-hide animation. Start a fresh visible interval for the tap.
-            let hidden = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"),
-                                                    object: button)
-            try require(XCTWaiter.wait(for: [hidden], timeout: 8) == .completed,
-                        "Panorama toolbar did not hide: " + button.debugDescription)
-            surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.25)).tap()
-            try require(button.waitForExistence(timeout: 3) && button.isHittable,
-                        "Panorama control unavailable: " + button.debugDescription)
-            button.tap()
+        let transport = app.buttons.matching(identifier: "togglePlaybackButton")
+        let pause = transport.matching(NSPredicate(format: "label == %@", "暂停")).firstMatch
+        let play = transport.matching(NSPredicate(format: "label == %@", "播放")).firstMatch
+        func pauseForControls() throws {
+            // Paused playback keeps the toolbar visible. A tap during its fade
+            // can reveal the toolbar instead, so confirm the actual transport state.
+            for _ in 0..<2 {
+                if play.exists && play.isHittable { return }
+                if !pause.exists || !pause.isHittable { revealControls(surface) }
+                if pause.waitForExistence(timeout: 2) && pause.isHittable { pause.tap() }
+                if play.waitForExistence(timeout: 2) && play.isHittable { return }
+            }
+            throw MotionFailure("Could not pause panorama with its transport button: " + app.debugDescription)
         }
 
         try checkChart("single-eye panorama updates", moving: true)
@@ -133,11 +135,14 @@ final class MovingMovieUITests: XCTestCase {
         let to = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.38, dy: 0.5))
         from.press(forDuration: 0.15, thenDragTo: to)
         try checkChart("leftward drag turns right", panned: true)
-        try tapPanoramaControl(app.buttons["vrRecenterButton"])
+        try pauseForControls()
+        app.buttons["vrRecenterButton"].tap()
         try checkChart("recenter shows forward ray")
-        try tapPanoramaControl(app.buttons["vrHeadsetButton"])
+        app.buttons["vrHeadsetButton"].tap()
+        play.tap()
         try checkChart("both eyes move in sync", stereo: true, moving: true)
-        try tapPanoramaControl(formats)
+        try pauseForControls()
+        formats.tap()
         try require(app.navigationBars["VR 设置"].waitForExistence(timeout: 5), app.debugDescription)
         let copy = app.buttons["copyPlaybackDiagnostics"]
         try require(copy.waitForExistence(timeout: 5) && copy.isHittable, "Missing diagnostics action")
