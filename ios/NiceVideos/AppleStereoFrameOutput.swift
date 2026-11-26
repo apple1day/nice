@@ -12,6 +12,7 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     private var afterglowOutput: AfterglowMovieOutput?
     private var output: AVPlayerItemVideoOutput?
     private var displayLink: CADisplayLink?
+    private var cadenceObserver: NSObjectProtocol?
     private var lastDelivery = CACurrentMediaTime()
     private var continuousPull = false
     private var newestDisplayTime: CMTime = .invalid
@@ -33,11 +34,19 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
         super.init()
         attachOutputIfReady()
         let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
-        if afterglowFormat?.highRate8K == true {
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 30, preferred: 30)
+        displayLink = link
+        if afterglowFormat != nil {
+            applyAfterglowCadence()
+            cadenceObserver = NotificationCenter.default.addObserver(
+                forName: UserDefaults.didChangeNotification, object: UserDefaults.standard, queue: .main
+            ) { [weak self] _ in self?.applyAfterglowCadence() }
         }
         link.add(to: .main, forMode: .common)
-        displayLink = link
+    }
+
+    private func applyAfterglowCadence() {
+        let rate: Float = UserDefaults.standard.integer(forKey: AfterglowPreset.frameRateKey) == 60 ? 60 : 30
+        displayLink?.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
     }
 
     private func attachOutputIfReady() {
@@ -141,6 +150,8 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     }
 
     func stop() {
+        if let cadenceObserver { NotificationCenter.default.removeObserver(cadenceObserver) }
+        cadenceObserver = nil
         displayLink?.invalidate()
         displayLink = nil
         handler = nil

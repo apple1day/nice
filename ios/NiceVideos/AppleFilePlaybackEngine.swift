@@ -96,7 +96,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         stereo = nil
         guard let item = preparedItem ?? player.currentItem, let frameHandler else { return }
         let format = afterglow ? AfterglowMovieOutput.Format(source: afterglowSourceSize, sdr: isSDR,
-                                                             fps: frameRate, recovery: recovery) : nil
+                                                             recovery: recovery) : nil
         var first = true
         stereo = AppleStereoFrameOutput(item: item, recovery: recovery, preferBiPlanar: { [weak self] in
             self?.isSDR == true
@@ -204,9 +204,9 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                 let tracks = try await item.asset.loadTracks(withMediaType: .video)
                 for track in tracks {
                     let decodable = try await track.load(.isDecodable)
-                    // Some packed HEVC files report an unsupported track before
-                    // output negotiation. On the explicit Afterglow route try a
-                    // real frame, bounded by the first-picture watchdog.
+                    // On the explicit Afterglow route try the single video
+                    // track even if AVFoundation flags it as unsupported.
+                    // Actual picture delivery is bounded by the startup check.
                     if decodable || (self?.afterglow == true && tracks.count == 1) {
                         let formats = try? await track.load(.formatDescriptions)
                         let rate = try? await track.load(.nominalFrameRate)
@@ -227,7 +227,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                                 if display.width > 0, display.height > 0 { self.afterglowSourceSize = display }
                             }
                             guard AfterglowMovieOutput.Format(source: self.afterglowSourceSize, sdr: self.isSDR,
-                                                               fps: rate, recovery: false) != nil else {
+                                                               recovery: false) != nil else {
                                 self.failure = "Afterglow XR 无法读取该片的视频尺寸。"
                                 self.publish()
                                 return

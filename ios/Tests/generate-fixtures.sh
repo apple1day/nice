@@ -58,6 +58,7 @@ ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$pattern_dir/full8k
 ffmpeg -hide_banner -loglevel error -y -stream_loop 11 -i "$pattern_dir/full8k-cycle.mp4" \
   -f lavfi -i 'anullsrc=sample_rate=48000:channel_layout=mono' -map 0:v:0 -map 1:a:0 \
   -t 12 -c:v copy -tag:v hvc1 -c:a aac -b:a 32k -movflags +faststart stereo8k60-full.mp4
+python3 ../../tools/make_large_mp4_fixture.py stereo8k60-full.mp4 full8k-co64
 # A directional stereo panorama with independent eye colors, video motion and
 # a continuous audible tone. Encode a short GOP once and reuse it in the UI test.
 ffmpeg -hide_banner -loglevel error -y -f lavfi \

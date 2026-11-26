@@ -4,20 +4,18 @@ import XCTest
 @testable import NiceVideos
 
 @MainActor final class AfterglowMovieOutputTests: XCTestCase {
-    func testOutputPreservesPackedGeometryAndBoundsHighRate8K() throws {
+    func testOutputPreservesPackedGeometryAndBounds8KBuffers() throws {
         let source = CGSize(width: 8192, height: 4096)
-        let normal = try XCTUnwrap(AfterglowMovieOutput.Format(source: source, sdr: true, fps: 59.94, recovery: false))
-        let reduced = try XCTUnwrap(AfterglowMovieOutput.Format(source: source, sdr: false, fps: 59.94, recovery: true))
+        let normal = try XCTUnwrap(AfterglowMovieOutput.Format(source: source, sdr: true, recovery: false))
+        let reduced = try XCTUnwrap(AfterglowMovieOutput.Format(source: source, sdr: false, recovery: true))
         XCTAssertEqual(normal.size, CGSize(width: 1920, height: 960))
         XCTAssertEqual(reduced.size, CGSize(width: 1280, height: 640))
-        XCTAssertTrue(normal.highRate8K)
         XCTAssertTrue(normal.biPlanar)
         XCTAssertFalse(reduced.biPlanar)
         let small = CGSize(width: 384, height: 192)
-        let preview = try XCTUnwrap(AfterglowMovieOutput.Format(source: small, sdr: false, fps: 60, recovery: false))
+        let preview = try XCTUnwrap(AfterglowMovieOutput.Format(source: small, sdr: false, recovery: false))
         XCTAssertEqual(preview.size, small)
-        XCTAssertFalse(preview.highRate8K)
-        XCTAssertNil(AfterglowMovieOutput.Format(source: .zero, sdr: true, fps: 24, recovery: false))
+        XCTAssertNil(AfterglowMovieOutput.Format(source: .zero, sdr: true, recovery: false))
     }
 
     func testReplacingInputAndSeekingBeforeMetadataLoadsUsesOnlyNewMovie() async throws {

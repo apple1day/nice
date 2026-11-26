@@ -12,9 +12,8 @@ final class AfterglowMovieOutput {
     struct Format {
         let size: CGSize
         let biPlanar: Bool
-        let highRate8K: Bool
 
-        init?(source: CGSize, sdr: Bool, fps: Float?, recovery: Bool) {
+        init?(source: CGSize, sdr: Bool, recovery: Bool) {
             let longest = max(source.width, source.height)
             guard source.width.isFinite, source.height.isFinite, source.width >= 2,
                   source.height >= 2, longest <= CGFloat(Int32.max) else { return nil }
@@ -23,7 +22,6 @@ final class AfterglowMovieOutput {
             size = CGSize(width: max(2, (source.width * scale / 2).rounded() * 2),
                           height: max(2, (source.height * scale / 2).rounded() * 2))
             biPlanar = sdr
-            highRate8K = longest >= 7680 && (fps ?? 0) >= 48
         }
 
         var description: String { "Afterglow packed \(biPlanar ? "420v" : "BGRA") \(Int(size.width))x\(Int(size.height))" }

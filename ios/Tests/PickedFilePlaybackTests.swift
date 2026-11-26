@@ -7,11 +7,11 @@ import XCTest
 final class PickedFilePlaybackTests: XCTestCase {
     /// The two fixture resources contain only the populated regions of an MP4.
     /// Its faststart movie header indexes A/V samples using 64-bit chunk offsets.
-    private func makeLargeMovie(at url: URL) throws {
+    private func makeLargeMovie(at url: URL, prefix: String = "co64") throws {
         let bundle = Bundle(for: Self.self)
-        let index = try XCTUnwrap(bundle.url(forResource: "co64-index", withExtension: "bin",
+        let index = try XCTUnwrap(bundle.url(forResource: prefix + "-index", withExtension: "bin",
                                              subdirectory: "Fixtures"))
-        let samples = try XCTUnwrap(bundle.url(forResource: "co64-samples", withExtension: "bin",
+        let samples = try XCTUnwrap(bundle.url(forResource: prefix + "-samples", withExtension: "bin",
                                                subdirectory: "Fixtures"))
         try Data(contentsOf: index).write(to: url)
         let file = try FileHandle(forWritingTo: url)
@@ -67,9 +67,19 @@ final class PickedFilePlaybackTests: XCTestCase {
     }
 
     func testAfterglowRendersMovingPicturesInBothEyesFromOffsetsBeyond4GiB() async throws {
+        try await checkPackedPlayback(prefix: "co64", allowVLCFallback: false)
+    }
+
+    func testFull8K60SBSFromOffsetsBeyond4GiBThroughAfterglowEntry() async throws {
+        // Both the source dimensions/cadence and 64-bit offsets are present on
+        // the same input. The simulator can use the normal device fallback.
+        try await checkPackedPlayback(prefix: "full8k-co64", allowVLCFallback: true)
+    }
+
+    private func checkPackedPlayback(prefix: String, allowVLCFallback: Bool) async throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
-        try makeLargeMovie(at: url)
+        try makeLargeMovie(at: url, prefix: prefix)
         defer { try? FileManager.default.removeItem(at: url) }
         let source = try await PickedVideoFile.open(url)
         XCTAssertGreaterThan(source.byteCount, UInt64(UInt32.max))
@@ -120,9 +130,10 @@ final class PickedFilePlaybackTests: XCTestCase {
         var baseline: [[UInt8]]?
         var sampledID: UInt64 = 0
         var seekRequested = false
-        let deadline = Date().addingTimeInterval(20)
+        let deadline = Date().addingTimeInterval(allowVLCFallback ? 40 : 20)
         while Date() < deadline {
-            if state.videoOutput == .afterglow && state.phase == .playing &&
+            let usableRoute = state.videoOutput == .afterglow || (allowVLCFallback && state.videoOutput == .vlcFrames)
+            if usableRoute && state.phase == .playing &&
                 state.seekable && renderer.acceptedFrameID > sampledID {
                 sampledID = renderer.acceptedFrameID
                 if !seekRequested {
