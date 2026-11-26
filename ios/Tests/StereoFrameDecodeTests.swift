@@ -21,7 +21,13 @@ import XCTest
                                      decoderPolicy: VLCDecoderPolicy = .automatic) async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: fixture, withExtension: "mp4", subdirectory: "Fixtures"))
-        let ready = expectation(description: "VLC output contains both moving eyes at the negotiated size")
+        // This tests decoder selection and sustained pixel changes. The Main 10
+        // fixture changes its eye pair every 30 source frames. Software decoding
+        // on a simulator can take well over 15 wall seconds to reach frame 90.
+        let software = decoderPolicy == .software
+        let requiredTransitions = software ? 3 : 2
+        let timeout: TimeInterval = software ? 45 : 15
+        let ready = expectation(description: "VLC delivers \(requiredTransitions) stereo color transitions")
         let diagnostics = PlaybackDiagnostics(bytes: nil, log: { _ in })
         diagnostics.setRoute(.vlcFrames, mode: .immersive(.vr360, .sideBySide, headset: true))
         diagnostics.beginInput(at: startAt)
@@ -29,9 +35,11 @@ import XCTest
         var firstClock: Double?
         var previousPair: Int?
         var transitions = 0
+        var samples = 0
         var finished = false
         let engine = VLCPlaybackEngine(frameHandler: { frame in
             guard !finished else { return }
+            samples += 1
             diagnostics.decodedFrame(frame, pts: nil)
             let width = CVPixelBufferGetWidth(frame), height = CVPixelBufferGetHeight(frame)
             XCTAssertEqual(width, expectedWidth)
@@ -51,7 +59,7 @@ import XCTest
             if let previousPair, pair != previousPair { transitions += 1 }
             previousPair = pair
             if firstClock == nil { firstClock = clock }
-            if transitions >= 2, let firstClock, clock >= max(startAt, firstClock) + 0.4 {
+            if transitions >= requiredTransitions, let firstClock, clock >= max(startAt, firstClock) + 0.4 {
                 finished = true
                 ready.fulfill()
             }
@@ -64,10 +72,12 @@ import XCTest
         defer { engine.stop() }
         try engine.load(fileURL: url, startAt: startAt, paused: false)
         engine.play()
-        await fulfillment(of: [ready], timeout: 15)
+        await fulfillment(of: [ready], timeout: timeout)
         let report = diagnostics.report { "" }
-        XCTAssertTrue(finished, "Eye-pair changes=\(transitions). " + report)
-        if decoderPolicy == .software {
+        let measurements = "Eye-pair changes=\(transitions)/\(requiredTransitions), sampled frames=\(samples), media clock=\(clock)."
+        XCTAssertTrue(finished, measurements + " " + report)
+        if software {
+            print("Forced software HEVC motion: " + measurements)
             XCTAssertTrue(report.contains("decoderPolicy=software observedVideoDecoder=avcodec"), report)
         }
     }

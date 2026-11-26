@@ -34,10 +34,11 @@ final class SBSPlaybackView: UIView {
     private var format: SBSDisplayMode = .standard
     private(set) var standardOutput: MovieOutput?
     private(set) var decoderPolicy: VLCDecoderPolicy = .automatic
-    var effectiveDecoderPolicy: VLCDecoderPolicy {
-        if case .immersive = format { return decoderPolicy }
-        return .automatic
+    var isImmersive: Bool {
+        if case .immersive = format { return true }
+        return false
     }
+    var effectiveDecoderPolicy: VLCDecoderPolicy { isImmersive ? decoderPolicy : .automatic }
     var mode: SBSDisplayMode {
         get { format }
         set { configure(mode: newValue, standardOutput: standardOutput) }
@@ -325,6 +326,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
                                     reducedFrameOutput: reducedVLCFrameOutput,
                                     preferSmallerPanoramaFrames: hostView.map { $0.mode != .standard } ?? false,
                                     decoderPolicy: hostView?.effectiveDecoderPolicy ?? .automatic)
+        vlc.monitorsImmersiveFrameRate = hostView?.isImmersive == true
         vlc.diagnostics = diagnostics
         observe(vlc)
     }
@@ -339,6 +341,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         diagnostics.setRoute(next, mode: host.mode)
         if next == currentOutput, !needsNewDecoder, let session {
             if let vlc = session as? VLCPlaybackEngine, next == .vlcFrames {
+                vlc.monitorsImmersiveFrameRate = host.isImmersive
                 vlc.preferSmallerPanoramaFrames = host.mode != .standard
                 if reopenOversizedPanorama(vlc, host: host) { return }
             }

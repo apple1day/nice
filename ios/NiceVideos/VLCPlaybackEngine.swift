@@ -162,11 +162,65 @@ struct VLCFrameProgress {
     }
 }
 
+// VLC can decode every submitted picture without reporting losses even when
+// real presentation throughput is far below the source rate. Measure images
+// delivered to the App against both the foreground and movie clocks.
+struct VLCImmersiveFrameRateWatch {
+    private struct Sample {
+        let host: TimeInterval
+        let media: Double
+        let delivered: UInt64
+        let formatSetups: UInt64
+    }
+
+    private var previous: Sample?
+    private var window: Sample?
+    private var previousSlowRate: Double?
+    private(set) var slowRate: Double?
+
+    mutating func reset() { self = Self() }
+
+    mutating func sample(host: TimeInterval, media: Double, delivered: UInt64, formatSetups: UInt64,
+                         nominalFPS: Double, active: Bool) {
+        guard active, nominalFPS.isFinite, nominalFPS >= 48, host.isFinite, media.isFinite,
+              delivered > 0, formatSetups > 0 else { reset(); return }
+        let current = Sample(host: host, media: media, delivered: delivered, formatSetups: formatSetups)
+        defer { previous = current }
+        guard let previous, let window, host > previous.host, host - previous.host <= 3.5,
+              media >= previous.media, media - previous.media <= host - previous.host + 1.25,
+              delivered >= previous.delivered, formatSetups == previous.formatSetups else {
+            reset()
+            self.window = current
+            return
+        }
+
+        // Two separate five-second windows must both advance at approximately
+        // playback speed. A startup delay, a held picture, or a burst following
+        // a seek cannot by itself qualify as continuous slow output.
+        let time = host - window.host
+        guard time >= 5 else { return }
+        self.window = current
+        let mediaTime = media - window.media
+        let fps = Double(delivered - window.delivered) / time
+        guard mediaTime >= 0.8 * time, mediaTime <= time + 1.25, fps > 0, fps < 8 else {
+            previousSlowRate = nil
+            slowRate = nil
+            return
+        }
+        slowRate = previousSlowRate.map { ($0 + fps) / 2 }
+        previousSlowRate = fps
+    }
+}
+
 final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDelegate {
     weak var diagnostics: PlaybackDiagnostics?
     private var lastStatsTime = -Double.infinity
     private var frameProgress = VLCFrameProgress()
     private var frameLossWatch = VLCFrameLossWatch()
+    private var deliveryRate = VLCImmersiveFrameRateWatch()
+    var monitorsImmersiveFrameRate = false {
+        didSet { if !monitorsImmersiveFrameRate { deliveryRate.reset() } }
+    }
     private var lossTimer: DispatchSourceTimer?
     private var minimumLoss = VLCFrameLossWatch.Pattern.none
     private let reducedFrameOutput: Bool
@@ -270,7 +324,14 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
             nativeLifetime = lifetime
         }
         player?.delegate = self
+        if frameHandler != nil {
+            NotificationCenter.default.addObserver(self, selector: #selector(discardFrameRateEvidence),
+                name: UIApplication.willResignActiveNotification, object: nil)
+        }
     }
+
+    @objc private func discardFrameRateEvidence() { deliveryRate.reset() }
+
     func attach(to view: UIView) {
         guard !stopped, frameDelivery == nil, let player else { return }
         nativeLifetime?.keepAlive(view)
@@ -285,6 +346,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         if preferSmallerPanoramaFrames { nativeLifetime?.resource?.observeVideoDecoderForNewInput() }
         frameProgress.reset()
         frameLossWatch.reset()
+        deliveryRate.reset()
         callbackLock.withLock { seekGate.clear() }
         seekFailureUntil = -.infinity
         minimumLoss = .none
@@ -374,6 +436,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         stopLossTimer()
         frameProgress.reset()
         frameLossWatch.reset()
+        deliveryRate.reset()
         minimumLoss = .none
         if loaded && !stopped { player?.pause() }
     }
@@ -394,6 +457,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     private func startSeek(_ seconds: Double, verifyingReopen: Bool) {
         frameProgress.reset()
         frameLossWatch.reset()
+        deliveryRate.reset()
         minimumLoss = .none
         seekFailureUntil = -.infinity
         callbackLock.withLock {
@@ -547,8 +611,16 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
             minimumLoss = .none
         }
         var retryWithSmallerFrames = false
-        if (now - lastStatsTime >= 1 || sampleEnd) && (monitorLoss || diagnostics != nil) {
+        let rateEligible = monitorsImmersiveFrameRate && appState == .active && activelyPlaying
+        let preserveRateAtEnd = monitorsImmersiveFrameRate && appState == .active && phase == .ended &&
+            continuousPlaybackRequested && !awaitingSeek && pausedPreviewDeadline == nil
+        if !rateEligible && !preserveRateAtEnd { deliveryRate.reset() }
+        if (now - lastStatsTime >= 1 || sampleEnd) && (monitorLoss || rateEligible || diagnostics != nil) {
             lastStatsTime = now
+            if !preserveRateAtEnd, let stats {
+                deliveryRate.sample(host: now, media: rawSeconds, delivered: stats.delivered,
+                                    formatSetups: stats.formatSetups, nominalFPS: nominalFrameRate, active: rateEligible)
+            }
             let native = nativeLifetime?.resource?.videoStatistics
             if monitorLoss, let stats, let native {
                 let stalled = frameLossWatch.needsSmallerOutput(.init(
@@ -573,6 +645,9 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
                     let module = nativeLifetime?.resource?.observedVideoDecoder ?? "unreported"
                     status += " observedVideoDecoder=\(module)"
                 }
+                if let fps = deliveryRate.slowRate {
+                    status += String(format: " slowDeliveredFPS=%.1f", fps)
+                }
                 if let stats {
                     status += " offered=\(stats.offered) delivered=\(stats.delivered) coalesced=\(stats.coalesced) bufferMisses=\(stats.bufferMisses)"
                     status += " formatSetups=\(stats.formatSetups) staleSource=\(stats.staleSource)"
@@ -587,6 +662,8 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         if minimumLoss != .none {
             let symptom = minimumLoss == .frozen ? "播放时间前进时，画面输出停住并持续丢帧。" : "播放时间前进时，出帧过慢并持续丢帧。"
             warning = "VLC 已降至 1280 像素。" + symptom + "可打开已有的兼容副本，或返回「VR → 制作兼容副本」。"
+        } else if let fps = deliveryRate.slowRate {
+            warning = String(format: "全景画面持续出帧缓慢，近期每秒约 %.1f 帧，片源为 %.1f fps。可打开兼容副本，或返回「VR → 制作兼容副本」。", fps, nominalFrameRate)
         } else if let stats, frameProgress.stalled(frames: stats.delivered, media: rawSeconds, host: now,
                 playing: activelyPlaying) {
             warning = "播放时间在前进，VLC 已有 12 秒没有送出新画面。请复制播放诊断，或退出 VR 对比普通播放。"
@@ -602,7 +679,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
             videoDetails: videoDetails,
             retryVLCWithSmallerFrames: retryWithSmallerFrames,
             reopenVLCAtSeek: reopenAt,
-            suggestsCompatibleCopy: minimumLoss != .none && phase != .failed
+            suggestsCompatibleCopy: (minimumLoss != .none || deliveryRate.slowRate != nil) && phase != .failed
         )
     }
     deinit { stop() }

@@ -2,6 +2,57 @@ import XCTest
 @testable import NiceVideos
 
 final class VLCFrameLossWatchTests: XCTestCase {
+    func testSlowDeliveredFramesWithAProgressingClockWarnEvenWithoutAnyNativeLoss() {
+        var rate = VLCImmersiveFrameRateWatch()
+        var loss = VLCFrameLossWatch()
+        for second in 0...10 {
+            // Both sets of counters are typical of forced software HEVC:
+            // three to five offered and delivered pictures per second, zero lost.
+            let delivered = UInt64(1 + min(second, 5) * 3 + max(0, second - 5) * 5)
+            let counters = sample(second, frames: delivered, displayed: Int32(delivered), lost: 0)
+            XCTAssertFalse(loss.needsSmallerOutput(counters, nominalFrameRate: 59.94))
+            rate.sample(host: counters.host, media: counters.clock, delivered: counters.delivered,
+                        formatSetups: counters.formatSetups, nominalFPS: 59.94, active: true)
+            if second < 10 { XCTAssertNil(rate.slowRate) }
+        }
+        XCTAssertEqual(rate.slowRate, 4.0)
+        for second in 11...15 {
+            rate.sample(host: Double(second), media: Double(second), delivered: UInt64(41 + (second - 10) * 30),
+                        formatSetups: 1, nominalFPS: 59.94, active: true)
+        }
+        XCTAssertNil(rate.slowRate, "Normal delivery clears the copy suggestion")
+    }
+
+    func testHighRateSourceAndContinuousMovingDeliveryAreRequiredForSlowPictureSuggestion() {
+        for (sourceFPS, actualFPS, clockRate) in [(24.0, 4, 1.0), (0.0, 4, 1.0), (60.0, 8, 1.0),
+                                                    (60.0, 30, 1.0), (60.0, 0, 1.0), (60.0, 4, 0.0)] {
+            var watch = VLCImmersiveFrameRateWatch()
+            for i in 0...15 {
+                watch.sample(host: Double(i), media: Double(i) * clockRate, delivered: UInt64(10 + i * actualFPS),
+                             formatSetups: 1, nominalFPS: sourceFPS, active: true)
+                XCTAssertNil(watch.slowRate)
+            }
+        }
+    }
+
+    func testSlowDeliveryCannotSpanAnInterruptionSeekOrRenegotiation() {
+        for discontinuity in ["inactive", "forward seek", "reverse seek", "missed samples", "format", "counters"] {
+            var watch = VLCImmersiveFrameRateWatch()
+            for i in 0...7 {
+                watch.sample(host: Double(i), media: 40 + Double(i), delivered: UInt64(90 + i * 4),
+                             formatSetups: 1, nominalFPS: 60, active: true)
+            }
+            for i in 8...14 {
+                let host = Double(i) + (discontinuity == "missed samples" ? 5 : 0)
+                let media = Double(i) + (discontinuity == "forward seek" ? 300 : (discontinuity == "reverse seek" ? 0 : 40))
+                let count = UInt64(i * 4 + (discontinuity == "counters" ? 0 : 90))
+                watch.sample(host: host, media: media, delivered: count, formatSetups: discontinuity == "format" ? 2 : 1,
+                             nominalFPS: 60, active: !(discontinuity == "inactive" && i == 8))
+                XCTAssertNil(watch.slowRate, discontinuity)
+            }
+        }
+    }
+
     private func sample(_ second: Int, clock: Double? = nil, frames: UInt64 = 1,
                         displayed: Int32 = 1, lost: Int32? = nil,
                         misses: UInt64 = 0, stale: UInt64 = 0) -> VLCFrameLossWatch.Sample {
