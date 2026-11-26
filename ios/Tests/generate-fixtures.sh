@@ -30,6 +30,15 @@ ffmpeg -hide_banner -loglevel error -y -stream_loop 89 -i "$pattern_dir/cycle.mp
   -f lavfi -i 'anullsrc=sample_rate=48000:channel_layout=mono' -map 0:v:0 -map 1:a:0 \
   -t 180 -c:v copy -tag:v hvc1 -c:a aac -b:a 32k -movflags +faststart "$pattern_dir/indexed.mp4"
 python3 ../../tools/make_large_mp4_fixture.py "$pattern_dir/indexed.mp4" ../../UITests/moving4k
+# Eight seconds at the reported coded width with one 360° image per eye.
+# Encode a two-second red/blue → green/yellow cycle and repeat the encoded GOPs.
+ffmpeg -hide_banner -loglevel error -y -f lavfi \
+  -i "color=red:size=512x128:rate=24,drawbox=x=256:w=256:h=128:c=blue:t=fill,drawbox=x=0:w=256:h=128:c=lime:t=fill:enable='gte(t,1)',drawbox=x=256:w=256:h=128:c=yellow:t=fill:enable='gte(t,1)',scale=8192:2048:flags=neighbor" \
+  -t 2 -c:v libx265 -preset ultrafast -pix_fmt yuv420p -tag:v hvc1 \
+  -x265-params 'pools=2:frame-threads=2:keyint=24:min-keyint=24:scenecut=0:log-level=error' "$pattern_dir/eyes8k.mp4"
+ffmpeg -hide_banner -loglevel error -y -stream_loop 3 -i "$pattern_dir/eyes8k.mp4" \
+  -f lavfi -i 'sine=frequency=440:sample_rate=48000' -map 0:v:0 -map 1:a:0 \
+  -t 8 -c:v copy -tag:v hvc1 -c:a aac -movflags +faststart stereo8k-replay.mp4
 # A directional stereo panorama with independent eye colors, video motion and
 # a continuous audible tone. Encode a short GOP once and reuse it in the UI test.
 ffmpeg -hide_banner -loglevel error -y -f lavfi \
