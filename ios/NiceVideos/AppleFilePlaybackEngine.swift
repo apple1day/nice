@@ -17,7 +17,8 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private let afterglow: Bool
     private var preparingItem: AVPlayerItem?
     private var afterglowSourceSize = CGSize.zero
-    private var firstFrameDeadline: DispatchWorkItem?
+    private var firstPictureWatch = AfterglowFirstPictureWatch()
+    private var firstPictureTimer: DispatchSourceTimer?
     private var surface: AppleVideoSurface?
     private var loader: PickedAssetResourceLoader?
     private var frameHandler: ((CVPixelBuffer) -> Void)?
@@ -111,9 +112,11 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             if self.afterglow && (self.seeking || self.pendingSeek != nil) { return }
             self.diagnostics?.decodedFrame(buffer, pts: pts)
             frameHandler(buffer)
+            if self.afterglow && !self.firstPictureWatch.delivered {
+                self.firstPictureWatch.receivedPicture()
+                self.stopFirstPictureTimer()
+            }
             if firstInSequence {
-                self.firstFrameDeadline?.cancel()
-                self.firstFrameDeadline = nil
                 DispatchQueue.main.async { [weak self] in self?.publish() }
             }
         }
@@ -180,6 +183,10 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             [weak self] _ in self?.publish()
         }
         let center = NotificationCenter.default
+        if afterglow {
+            notifications.append(center.addObserver(forName: UIApplication.willResignActiveNotification,
+                object: nil, queue: .main) { [weak self] _ in self?.firstPictureWatch.suspend() })
+        }
         for name in [NSNotification.Name.AVPlayerItemDidPlayToEndTime, .AVPlayerItemFailedToPlayToEndTime, .AVPlayerItemPlaybackStalled] {
             notifications.append(center.addObserver(forName: name, object: item, queue: .main) { [weak self, weak item] note in
                 guard let self, let item, self.player.currentItem === item else { return }
@@ -231,6 +238,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                                 self.publish()
                                 return
                             }
+                            self.firstPictureWatch.classifyTrack(decodable: decodable)
                             self.diagnostics?.event("Afterglow: packed movie output; trackDecodable=\(decodable)")
                             self.installStereoOutput(on: item)
                             self.player.replaceCurrentItem(with: item)
@@ -304,14 +312,13 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     func play(waitForPausedFrame: Bool) {
         guard !stopped, player.currentItem != nil || preparingItem != nil else { return }
         wantsPlayback = !waitForPausedFrame
-        checkAfterglowStartup()
+        updateFirstPictureTimer()
         applyIntent()
     }
 
     func pause() {
         wantsPlayback = false
-        firstFrameDeadline?.cancel()
-        firstFrameDeadline = nil
+        stopFirstPictureTimer()
         player.pause()
         frameWatch.interrupt()
         stallCheck?.cancel()
@@ -319,9 +326,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
 
     func seek(to seconds: Double) {
         guard seconds.isFinite, !stopped, player.currentItem != nil || preparingItem != nil else { return }
-        firstFrameDeadline?.cancel()
-        firstFrameDeadline = nil
-        checkAfterglowStartup()
+        firstPictureWatch.seek()
         pendingSeek = max(0, seconds)
         seekGeneration += 1
         seeking = false
@@ -379,29 +384,50 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: check)
     }
 
-    // An item can also wait with a stationary audio clock. Bound startup for
-    // the explicit XR route even in that case. Reset on a new seek/pause/input.
-    private func checkAfterglowStartup() {
-        guard afterglow, frameHandler != nil, firstFrameDeadline == nil, wantsPlayback,
-              !stopped, !ended, failure == nil, stereo?.hasVideoFrame != true,
-              visibleInForeground, let item = player.currentItem ?? preparingItem else { return }
-        let work = DispatchWorkItem { [weak self, weak item] in
-            guard let self, let item else { return }
-            self.firstFrameDeadline = nil
-            guard self.player.currentItem === item || self.preparingItem === item,
-                  self.frameHandler != nil, self.wantsPlayback, !self.stopped, !self.ended,
-                  self.failure == nil, self.visibleInForeground, self.stereo?.hasVideoFrame != true else { return }
-            self.diagnostics?.event("Afterglow: no first picture within 15s; requesting decoder fallback")
-            self.failure = "Afterglow XR 等待首帧超时。"
-            self.publish()
+    private func stopFirstPictureTimer() {
+        firstPictureTimer?.cancel()
+        firstPictureTimer = nil
+        firstPictureWatch.suspend()
+    }
+
+    private func updateFirstPictureTimer() {
+        guard afterglow else { return }
+        guard frameHandler != nil, wantsPlayback, !stopped, !ended, failure == nil,
+              !firstPictureWatch.delivered, let item = player.currentItem ?? preparingItem else {
+            if firstPictureTimer != nil { stopFirstPictureTimer() }
+            return
         }
-        firstFrameDeadline = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: work)
+        guard firstPictureTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(500), leeway: .milliseconds(40))
+        timer.setEventHandler { [weak self, weak item] in
+            guard let self, let item, self.player.currentItem === item || self.preparingItem === item,
+                  !self.stopped, !self.ended, self.failure == nil else { return }
+            let clock = self.pendingSeek ?? item.currentTime().seconds
+            let active = self.wantsPlayback && self.frameHandler != nil &&
+                self.visibleInForeground && self.expectsVideo(at: clock)
+            let playing = self.player.timeControlStatus == .playing && !self.seeking && self.pendingSeek == nil
+            if let reason = self.firstPictureWatch.sample(at: ProcessInfo.processInfo.systemUptime,
+                                                         active: active, playing: playing) {
+                self.stopFirstPictureTimer()
+                self.diagnostics?.event("Afterglow: no first picture (\(reason.rawValue)); requesting decoder fallback")
+                self.failure = "Afterglow XR 未能解出首帧，正在尝试兼容播放。"
+                self.publish()
+            }
+        }
+        firstPictureTimer = timer
+        timer.resume()
+    }
+
+    private func expectsVideo(at clock: Double) -> Bool {
+        guard let range = videoTimeRange, range.isValid, range.duration.isNumeric,
+              range.duration.seconds > 0, clock.isFinite else { return true }
+        return clock >= range.start.seconds && clock < range.end.seconds
     }
 
     private func publish() {
         guard !stopped, let item = player.currentItem ?? preparingItem else { return }
-        checkAfterglowStartup()
+        updateFirstPictureTimer()
         let duration = item.duration.seconds
         let clock = item.currentTime().seconds
         let projected = stereo != nil
@@ -412,10 +438,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             stereo?.setContinuousPull(active, paused: !wantsPlayback)
             let ready = surface?.videoLayer.isReadyForDisplay ?? false
             let hasImage = stereo?.hasVideoFrame ?? ready
-            let wantsFramesAtClock = videoTimeRange.map { range in
-                !range.isValid || !range.duration.isNumeric || range.duration.seconds <= 0 ||
-                    (clock >= range.start.seconds && clock < range.end.seconds)
-            } ?? true
+            let wantsFramesAtClock = expectsVideo(at: clock)
             let action = frameWatch.sample(clock: clock, expectingVideo: active && wantsFramesAtClock,
                                            projected: projected, hasImage: hasImage,
                                            sequence: stereo?.frameSequence ?? 0, fps: frameRate)
@@ -461,8 +484,8 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     }
 
     private func retireItem() {
-        firstFrameDeadline?.cancel()
-        firstFrameDeadline = nil
+        stopFirstPictureTimer()
+        firstPictureWatch = AfterglowFirstPictureWatch()
         preparingItem = nil
         afterglowSourceSize = .zero
         observations.removeAll()

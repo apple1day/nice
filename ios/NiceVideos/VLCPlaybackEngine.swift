@@ -153,6 +153,8 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         return durationSeconds(player) - clock > 2
     }
     private var videoDetails: String?
+    private var nominalFrameRate = 0.0
+    private var continuousPlaybackRequested = false
     private var nextTrackCheck = -Double.infinity
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private static var lifetimeAssociationKey: UInt8 = 0
@@ -220,6 +222,8 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         stopLossTimer()
         lastStatsTime = -.infinity
         videoDetails = nil
+        nominalFrameRate = 0
+        continuousPlaybackRequested = false
         nextTrackCheck = -.infinity
         var options: [String] = []
         if seconds.isFinite && seconds > 0 { options.append(":start-time=\(seconds)") }
@@ -269,6 +273,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     func play() { play(waitForPausedFrame: false) }
     func play(waitForPausedFrame: Bool) {
         guard loaded && !stopped else { return }
+        continuousPlaybackRequested = !waitForPausedFrame
         needsPausedFrame = waitForPausedFrame
         pausedPreviewDeadline = waitForPausedFrame ? ProcessInfo.processInfo.systemUptime + 10 : nil
         player?.play()
@@ -296,6 +301,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     }
 
     func pause() {
+        continuousPlaybackRequested = false
         stopLossTimer()
         frameProgress.reset()
         frameLossWatch.reset()
@@ -400,7 +406,8 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
             return PlaybackSnapshot(phase: .failed, error: message)
         }
         let phase: PlaybackPhase
-        switch player.state {
+        let nativeState = player.state
+        switch nativeState {
         case .playing: phase = .playing
         case .paused: phase = .paused
         case .ended: phase = .ended
@@ -427,12 +434,17 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
 
         if videoDetails == nil, phase == .playing || phase == .paused, now >= nextTrackCheck {
             nextTrackCheck = now + 2
-            videoDetails = nativeLifetime?.resource?.videoTrackDescription
+            videoDetails = nativeLifetime?.resource?.videoTrackDescription(frameRate: &nominalFrameRate)
         }
         let stats = frameDelivery?.frameStats
         let duration = durationSeconds(player)
-        let activelyPlaying = player.state == .playing && !awaitingSeek && pausedPreviewDeadline == nil &&
-            MainActor.assumeIsolated { UIApplication.shared.applicationState == .active }
+        // VLCKit may still report buffering while isPlaying and the clock both
+        // advance. The displayed phase and the loss monitor must agree. A
+        // foreground-inactive transition alone cannot provide loss evidence.
+        let appState = MainActor.assumeIsolated { UIApplication.shared.applicationState }
+        let gate = VLCFrameLossWatch.Gate(requested: continuousPlaybackRequested, preview: pausedPreviewDeadline != nil,
+                                          seeking: awaitingSeek, playing: phase == .playing, background: appState == .background)
+        let activelyPlaying = gate == .open
         // Keep the reason in a copyable report even if no output arrives.
         let recoveryState = VLCFrameLossWatch.State(
             active: activelyPlaying, seekable: player.isSeekable, remaining: duration - rawSeconds,
@@ -451,9 +463,12 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
                 let stalled = frameLossWatch.needsSmallerOutput(.init(
                     clock: rawSeconds, host: now, decoded: native.decoded, displayed: native.displayed,
                     lost: native.lost, offered: stats.offered, delivered: stats.delivered,
-                    bufferMisses: stats.bufferMisses, staleSource: stats.staleSource, formatSetups: stats.formatSetups))
+                    bufferMisses: stats.bufferMisses, staleSource: stats.staleSource, formatSetups: stats.formatSetups),
+                    nominalFrameRate: preferSmallerPanoramaFrames ? nominalFrameRate : 0)
                 retryWithSmallerFrames = canReduce && stalled
-                stalledAtMinimum = reducedFrameOutput && stalled
+                // A repeated native timestamp can defer a reopen. Keep a confirmed
+                // warning stable until new samples clear the underlying pattern.
+                stalledAtMinimum = reducedFrameOutput && frameLossWatch.pattern != .none
             }
             if let diagnostics {
                 var status = "stats=unavailable"
@@ -464,7 +479,8 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
                     status += " offered=\(stats.offered) delivered=\(stats.delivered) coalesced=\(stats.coalesced) bufferMisses=\(stats.bufferMisses)"
                     status += " formatSetups=\(stats.formatSetups) staleSource=\(stats.staleSource)"
                     status += " vmemCap=\(stats.negotiatedLimit) recovery=\(stalledAtMinimum ? "minimum-stalled" : recoveryState.rawValue)"
-                    status += " watchMediaSec=\(Int(frameLossWatch.observedMediaSeconds))"
+                    status += " gate=\(gate.rawValue) vlcState=\(nativeState.rawValue) appState=\(appState.rawValue)"
+                    status += " lossPattern=\(frameLossWatch.pattern.rawValue) watchMediaSec=\(Int(frameLossWatch.observedMediaSeconds))"
                 }
                 MainActor.assumeIsolated { diagnostics.vlcStatus(status) }
             }

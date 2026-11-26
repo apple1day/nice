@@ -94,6 +94,34 @@ final class SBSMovieTests: XCTestCase {
         XCTAssertEqual(rgb(cleared, x: 32, y: 32), [0, 0, 0])
     }
 
+    @MainActor
+    func testCaptureLabelsRetainedSourceAndMeasuresBothEyesOnTheSameFrame() async throws {
+        guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
+        let renderer = SBSMetalView(frame: CGRect(x: 0, y: 0, width: 160, height: 80))
+        renderer.mode = .immersive(.vr360, .sideBySide, headset: true)
+        renderer.layoutIfNeeded()
+        let origin = PlaybackFrameOrigin(route: .vlcFrames, loadID: 2)
+        let frame = try splitFrame(width: 32, height: 16, left: SIMD3(repeating: 255), right: .zero)
+        renderer.display(frame, origin: origin)
+        let current = await renderer.captureBrightness(current: origin)
+        XCTAssertTrue(current.contains("probeRoute=vlcFrames probeLoadID=2 matchesCurrentInput=yes"), current)
+        XCTAssertTrue(current.contains("inputLuma={L:255/255/255,R:0/0/0}"), current)
+        XCTAssertTrue(current.contains("offscreenViewportLuma={L:255/255/255,R:0/0/0}"), current)
+        let later = await renderer.captureBrightness(current: PlaybackFrameOrigin(route: .afterglow, loadID: 3))
+        XCTAssertTrue(later.contains("probeLoadID=2 matchesCurrentInput=no"), later)
+        renderer.clear()
+        let empty = await renderer.captureBrightness(current: origin)
+        XCTAssertEqual(empty, "pixelProbe=no-accepted-frame")
+    }
+
+    func testProbeSeparatesTopAndBottomPicturesAtOddDimensions() {
+        let eyes = FrameProbeLayout(mode: .immersive(.vr360, .topBottom, headset: false), projected: false)
+        let stats = eyes.summary(width: 21, height: 19) { _, y in y < 9 ? 0 : (y == 9 ? 99 : 178) }
+        XCTAssertEqual(stats, "L:0/0/0,R:178/178/178")
+        let output = FrameProbeLayout(mode: .immersive(.vr360, .topBottom, headset: false), projected: true)
+        XCTAssertEqual(output.summary(width: 21, height: 19) { _, _ in 21 }, "full:21/21/21")
+    }
+
     private func splitFrame(width: Int, height: Int, left: SIMD3<UInt8>, right: SIMD3<UInt8>) throws -> CVPixelBuffer {
         let attrs: [String: Any] = [
             kCVPixelBufferMetalCompatibilityKey as String: true,

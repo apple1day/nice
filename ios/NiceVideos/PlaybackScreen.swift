@@ -20,6 +20,7 @@ final class PlaybackModel: ObservableObject {
     private var started = false
     private var pauseRequested = false
     private var closed = false
+    private var copyingDiagnostics = false
     private var reportedPlaybackEnd = false
     private var pendingPlaybackEnd: UUID?
     private var rearmPlaybackEndOnPlaying = false
@@ -150,8 +151,11 @@ final class PlaybackModel: ObservableObject {
         }
         savePosition()
     }
-    @MainActor func copyPlaybackDiagnostics() -> Bool {
-        guard let report = (engine as? PlaybackDiagnosticReporting)?.playbackDiagnosticReport() else { return false }
+    @MainActor func copyPlaybackDiagnostics() async -> Bool {
+        guard !closed, !copyingDiagnostics, let reporting = engine as? PlaybackDiagnosticReporting else { return false }
+        copyingDiagnostics = true
+        defer { copyingDiagnostics = false }
+        guard let report = await reporting.capturePlaybackDiagnosticReport(), !closed else { return false }
         UIPasteboard.general.string = report
         UIAccessibility.post(notification: .announcement, argument: "播放诊断已复制")
         return true
@@ -819,7 +823,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                 Button("切换到系统播放器") { selectOutput(.system) }
             }
             Button("复制播放诊断") {
-                if model.copyPlaybackDiagnostics() { diagnosticCopyNotice = UUID() }
+                Task { if await model.copyPlaybackDiagnostics() { diagnosticCopyNotice = UUID() } }
             }
             Button("取消", role: .cancel) {}
         } message: {

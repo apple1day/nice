@@ -26,6 +26,9 @@ final class WatchedPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReport
     @MainActor func playbackDiagnosticReport() -> String? {
         (base as? PlaybackDiagnosticReporting)?.playbackDiagnosticReport()
     }
+    @MainActor func capturePlaybackDiagnosticReport() async -> String? {
+        await (base as? PlaybackDiagnosticReporting)?.capturePlaybackDiagnosticReport()
+    }
     @MainActor func retrySystemOutput() {
         (base as? SystemOutputRetrying)?.retrySystemOutput()
     }

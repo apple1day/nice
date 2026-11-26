@@ -173,6 +173,13 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         diagnostics.report { rendererStatus }
     }
 
+    @MainActor func capturePlaybackDiagnosticReport() async -> String? {
+        let report = diagnostics.report { rendererStatus }
+        guard let renderer = hostView?.renderer else { return report + "\npixelProbe=no-renderer" }
+        let probe = await renderer.captureBrightness(current: diagnostics.frameOrigin)
+        return report + "\n" + probe
+    }
+
     func attach(to view: UIView) {
         guard !stopped else { return }
         guard let host = view as? SBSPlaybackView else {
@@ -199,12 +206,15 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             guard let self, !self.stopped, self.session === newSession else { return }
             self.diagnostics.observe(snapshot) { MainActor.assumeIsolated { self.rendererStatus } }
             if let output = self.currentOutput, output.usesAVPlayer, snapshot.phase == .failed, let host = self.hostView {
-                self.diagnostics.event("fallback \(output) -> VLC (system session reported failure)")
                 self.failedAppleOutput = output
-                // The failing input may be the first event, before it has a
-                // usable timestamp. Preserve the requested seek in that case.
+                // A scrub while an output opens wins, including a seek to zero.
+                // Otherwise keep the AV clock (or its active seek target). An
+                // opening failure with no usable clock retains the launch time.
                 if let seek = self.pendingSeek { self.seconds = seek }
-                else if snapshot.seconds.isFinite, snapshot.seconds > 0 { self.seconds = snapshot.seconds }
+                else if snapshot.seconds.isFinite, snapshot.seconds > 0 || snapshot.duration > 0 {
+                    self.seconds = max(0, snapshot.seconds)
+                }
+                self.diagnostics.event("fallback \(output) -> VLC at \(self.seconds)s")
                 MainActor.assumeIsolated { self.reconcileOutput(host) }
                 return
             }
@@ -214,7 +224,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
                 MainActor.assumeIsolated {
                     self.seconds = snapshot.seconds
                     self.reducedVLCFrameOutput = true
-                    self.diagnostics.event("VLC: late pictures without new frames; reopening at \(self.seconds)s, maximum frame edge 1280")
+                    self.diagnostics.event("VLC: sustained video loss; reopening at \(self.seconds)s, maximum frame edge 1280")
                     self.retireSession()
                     self.installVLCFrameSession()
                     self.reopenAfterOutputChange(host)
@@ -277,7 +287,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if self.currentOutput == .vlcFrames { self.diagnostics.decodedFrame(pixelBuffer, pts: nil) }
-                self.hostView?.renderer?.display(pixelBuffer)
+                self.hostView?.renderer?.display(pixelBuffer, origin: self.diagnostics.frameOrigin)
             }
         }
     }

@@ -49,7 +49,7 @@ typedef struct {
 
 @interface NICEVLCNativeReference : NSObject
 @property (nonatomic, readonly) int64_t lengthMilliseconds;
-@property (nonatomic, readonly, nullable) NSString *videoTrackDescription;
+- (nullable NSString *)videoTrackDescriptionWithFrameRate:(double *)rate NS_SWIFT_NAME(videoTrackDescription(frameRate:));
 // Unavailable counters are -1.
 @property (nonatomic, readonly) NICEVLCVideoStats videoStatistics;
 - (BOOL)loadFileWithByteCount:(uint64_t)byteCount

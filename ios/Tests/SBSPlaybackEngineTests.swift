@@ -60,6 +60,51 @@ final class SBSPlaybackEngineTests: XCTestCase {
         XCTAssertTrue(capture().contains("loadID=2"), capture())
     }
 
+    func testAfterglowFailureReturnsToVLCAtTheLatestSeekWithoutRetrying() async throws {
+        // VideoLAN accepts this Matroska payload; AVFoundation cannot open it.
+        let source = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "offline", withExtension: "mkv", subdirectory: "Fixtures"))
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
+        try FileManager.default.copyItem(at: source, to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        let mode = SBSDisplayMode.immersive(.vr360, .sideBySide, headset: true)
+        host.configure(mode: mode, standardOutput: .vlcFrames)
+        let engine = SBSPlaybackEngine()
+        defer { engine.stop(); window.isHidden = true }
+        var snapshot = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { snapshot = $0 }
+        engine.attach(to: host)
+        try engine.load(fileURL: file)
+        engine.play()
+        func waitFor(_ predicate: () -> Bool) async throws -> Bool {
+            let end = Date().addingTimeInterval(12)
+            while Date() < end && !predicate() { try await Task.sleep(nanoseconds: 40_000_000) }
+            return predicate()
+        }
+        let started = try await waitFor { snapshot.phase == .playing && snapshot.hasVideo }
+        XCTAssertTrue(started)
+        guard started else { return }
+        let renderer = try XCTUnwrap(host.renderer)
+        let firstFrame = renderer.acceptedFrameID
+        host.configure(mode: mode, standardOutput: .afterglow)
+        engine.seek(to: 0.75)
+        engine.seek(to: 1.50)
+        let restored = try await waitFor {
+            engine.currentOutput == .vlcFrames && snapshot.videoOutput == .vlcFrames &&
+                snapshot.hasVideo && snapshot.phase == .playing && snapshot.seconds >= 1.45 &&
+                renderer.acceptedFrameID > firstFrame
+        }
+        let report = engine.playbackDiagnosticReport() ?? ""
+        XCTAssertTrue(restored, report)
+        XCTAssertTrue(report.contains("open loadID=3 start=1.50"), report)
+        XCTAssertEqual(report.components(separatedBy: "fallback afterglow -> VLC").count - 1, 1, report)
+    }
+
     func testPausedMKVReopensAtItsPositionAndResumesAfterLeavingVR() async throws {
         let file = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "offline", withExtension: "mkv", subdirectory: "Fixtures"))

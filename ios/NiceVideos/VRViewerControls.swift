@@ -252,7 +252,7 @@ enum VRPinchResponse: String, CaseIterable {
     let details: String?
     @State private var didCopyDiagnostics = false
     let decoderAction: String?
-    let onCopyDiagnostics: () -> Bool
+    let onCopyDiagnostics: () async -> Bool
     let onDecoderChange: () -> Void
     let usesAfterglowPreset: Bool
     let onOpenAfterglow: () -> Void
@@ -263,7 +263,7 @@ enum VRPinchResponse: String, CaseIterable {
             Form {
                 Section {
                     Button {
-                        didCopyDiagnostics = onCopyDiagnostics()
+                        Task { didCopyDiagnostics = await onCopyDiagnostics() }
                     } label: {
                         Label(didCopyDiagnostics ? "已复制播放诊断" : "复制播放诊断", systemImage: "doc.on.doc")
                     }

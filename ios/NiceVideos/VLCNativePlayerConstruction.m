@@ -82,7 +82,8 @@
 
 - (int64_t)lengthMilliseconds { return libvlc_media_player_get_length(_player); }
 
-- (NSString *)videoTrackDescription {
+- (NSString *)videoTrackDescriptionWithFrameRate:(double *)rate {
+    *rate = 0;
     libvlc_media_t *media = libvlc_media_player_get_media(_player);
     if (!media) { return nil; }
     libvlc_media_track_t **tracks = NULL;
@@ -108,7 +109,8 @@
             const char *codec = libvlc_media_get_codec_description(libvlc_track_video, selected->i_codec);
             if (codec && *codec) { [details appendFormat:@" · %s", codec]; }
             if (video->i_frame_rate_num && video->i_frame_rate_den) {
-                [details appendFormat:@" · %.2f fps", (double)video->i_frame_rate_num / video->i_frame_rate_den];
+                *rate = (double)video->i_frame_rate_num / video->i_frame_rate_den;
+                [details appendFormat:@" · %.2f fps", *rate];
             }
             if (selected->i_bitrate) { [details appendFormat:@" · %.2f Mb/s", selected->i_bitrate / 1e6]; }
             result = details;

@@ -5,6 +5,11 @@ import OSLog
 
 protocol PlaybackDiagnosticReporting: AnyObject {
     @MainActor func playbackDiagnosticReport() -> String?
+    @MainActor func capturePlaybackDiagnosticReport() async -> String?
+}
+
+extension PlaybackDiagnosticReporting {
+    @MainActor func capturePlaybackDiagnosticReport() async -> String? { playbackDiagnosticReport() }
 }
 
 /// A bounded trace for one movie. Only app-generated labels and numerical media
@@ -70,6 +75,10 @@ final class PlaybackDiagnostics {
             lastSample = nil
             record("output \(route) mode=\(mode)", at: now())
         }
+    }
+
+    var frameOrigin: PlaybackFrameOrigin? {
+        lock.withLock { route.map { PlaybackFrameOrigin(route: $0, loadID: loadID) } }
     }
 
     func setFileByteCount(_ bytes: UInt64?) {

@@ -45,6 +45,57 @@ final class VLCFrameLossWatchTests: XCTestCase {
         }
     }
 
+    func testFivePresentedFramesPerSecondWithContinuingNativeLossRequestsOneReduction() {
+        var watch = VLCFrameLossWatch()
+        // Consecutive captures from the 1.3.5(16) phone report; Metal kept
+        // presenting frames while VLC lost roughly twice as many as it showed.
+        func observed(_ host: Double, _ clock: Double, _ decoded: Int32, _ displayed: Int32,
+                      _ lost: Int32, _ offered: UInt64, _ delivered: UInt64) -> VLCFrameLossWatch.Sample {
+            .init(clock: clock, host: host, decoded: decoded, displayed: displayed, lost: lost,
+                  offered: offered, delivered: delivered, bufferMisses: 0, staleSource: 0, formatSetups: 1)
+        }
+        let rows = [observed(7.30, 4.86, 125, 24, 57, 25, 25),
+                    observed(12.54, 10.10, 233, 53, 111, 54, 54),
+                    observed(17.80, 15.36, 323, 77, 156, 78, 77)]
+        XCTAssertFalse(watch.needsSmallerOutput(rows[0], nominalFrameRate: 59.94))
+        XCTAssertFalse(watch.needsSmallerOutput(rows[1], nominalFrameRate: 59.94))
+        XCTAssertTrue(watch.needsSmallerOutput(rows[2], nominalFrameRate: 59.94))
+        XCTAssertEqual(watch.pattern, .sparse)
+        let alreadyAtMinimum = VLCFrameLossWatch.State(active: true, seekable: true, remaining: 90,
+                                                       outputEdge: 1280, reducedLimit: 1280, alreadyReduced: true)
+        XCTAssertEqual(alreadyAtMinimum, .minimum)
+    }
+
+    func testLowCadenceNeedsKnownFastSourceNativeLossAndTwoConsecutiveWindows() {
+        for fps in [0.0, 5.0, 59.94] {
+            var watch = VLCFrameLossWatch()
+            for t in 0...12 {
+                // The 60-fps track loses pictures only in a single 3 s burst.
+                let lost = fps > 50 ? Int32(min(t, 3) * 12) : Int32(t * 12)
+                XCTAssertFalse(watch.needsSmallerOutput(sample(t, frames: UInt64(t * 5),
+                    displayed: Int32(t * 5), lost: lost), nominalFrameRate: fps))
+            }
+        }
+        var healthy = VLCFrameLossWatch(), paused = VLCFrameLossWatch()
+        for t in 0...12 {
+            XCTAssertFalse(healthy.needsSmallerOutput(sample(t, frames: UInt64(t * 24),
+                displayed: Int32(t * 24), lost: Int32(t * 30)), nominalFrameRate: 60))
+            if t.isMultiple(of: 4) { paused.reset() }
+            XCTAssertFalse(paused.needsSmallerOutput(sample(t, frames: UInt64(t * 5),
+                displayed: Int32(t * 5), lost: Int32(t * 12)), nominalFrameRate: 60))
+        }
+    }
+
+    func testEffectivePlaybackIntentAndVisibilityGateNativeLossEvidence() {
+        typealias Gate = VLCFrameLossWatch.Gate
+        XCTAssertEqual(Gate(requested: true, preview: false, seeking: false, playing: true, background: false), .open)
+        XCTAssertEqual(Gate(requested: false, preview: false, seeking: false, playing: true, background: false), .paused)
+        XCTAssertEqual(Gate(requested: true, preview: false, seeking: true, playing: true, background: false), .seek)
+        XCTAssertEqual(Gate(requested: true, preview: true, seeking: false, playing: true, background: false), .preview)
+        XCTAssertEqual(Gate(requested: true, preview: false, seeking: false, playing: false, background: false), .notPlaying)
+        XCTAssertEqual(Gate(requested: true, preview: false, seeking: false, playing: true, background: true), .background)
+    }
+
     func testLongUnobservedGapAndCounterResetDoNotTriggerRecovery() {
         var gap = VLCFrameLossWatch(), restarted = VLCFrameLossWatch()
         XCTAssertFalse(gap.needsSmallerOutput(sample(10)))

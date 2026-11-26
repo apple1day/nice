@@ -175,6 +175,7 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     private var vertexBuffer: MTLBuffer?
     private var geometry: SBSMovieGeometry?
     private var frameToDraw: MetalMovieFrame?
+    private var frameOrigin: PlaybackFrameOrigin?
     private let gpuProgress = GPUProgress()
     private(set) var receivedFrameID: UInt64 = 0
     private(set) var acceptedFrameID: UInt64 = 0
@@ -270,10 +271,11 @@ final class SBSMetalView: UIView, MTKViewDelegate {
 
     func clear() {
         frameToDraw = nil
+        frameOrigin = nil
         requestDraw()
     }
 
-    func display(_ pixelBuffer: CVPixelBuffer) {
+    func display(_ pixelBuffer: CVPixelBuffer, origin: PlaybackFrameOrigin? = nil) {
         receivedFrameID &+= 1
         receivedWidth = CVPixelBufferGetWidth(pixelBuffer)
         receivedHeight = CVPixelBufferGetHeight(pixelBuffer)
@@ -286,6 +288,7 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         do {
             let frame = try MetalMovieFrame(id: receivedFrameID, buffer: pixelBuffer, device: device, cache: textureCache)
             frameToDraw = frame
+            frameOrigin = origin
             acceptedFrameID = frame.id
             lastCacheResult = frame.cacheResult
             if frame.copiedToGPU { cpuUploads += 1 }
@@ -416,6 +419,53 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         command.present(drawable)
         needsDraw = false
         command.commit()
+    }
+
+    // Taken only when the user copies diagnostics. Never read the drawable:
+    // it stays framebuffer-only. Re-render the *same* accepted frame, camera
+    // and shader to a tiny target at the current viewport's aspect ratio.
+    func captureBrightness(current: PlaybackFrameOrigin?) async -> String {
+        guard let frame = frameToDraw else { return "pixelProbe=no-accepted-frame" }
+        let source = frameOrigin.map { "\($0.route) probeLoadID=\($0.loadID)" } ?? "unknown"
+        let matches = frameOrigin == nil || current == nil ? "unknown" : (frameOrigin == current ? "yes" : "no")
+        let header = "pixelProbe frameID=\(frame.id) probeRoute=\(source) matchesCurrentInput=\(matches) luma8=min/mean/max"
+        let input = FrameProbeLayout(mode: mode, projected: false)
+        let viewport = FrameProbeLayout(mode: mode, projected: true)
+        let size = metalView.drawableSize
+        let render = makeProbeRender(size: size)
+        let buffer = frame.pixelBuffer
+        let sourceBrightness = Task.detached(priority: .utility) { input.input(buffer) }
+        var projected = "unavailable"
+        if let (command, texture) = render {
+            projected = await withCheckedContinuation { continuation in
+                command.addCompletedHandler { completed in
+                    let result = completed.status == .completed ? viewport.projection(texture) : "unavailable(gpu)"
+                    continuation.resume(returning: result)
+                }
+                command.commit()
+            }
+        }
+        let inputResult = await sourceBrightness.value
+        return header + " inputLuma={\(inputResult)} offscreenViewportLuma={\(projected)}"
+    }
+
+    private func makeProbeRender(size: CGSize) -> (MTLCommandBuffer, MTLTexture)? {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
+              let device = metalView.device, let command = queue?.makeCommandBuffer() else { return nil }
+        let scale = min(1, 64 / max(size.width, size.height))
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+            width: max(2, Int((size.width * scale).rounded())),
+            height: max(2, Int((size.height * scale).rounded())), mipmapped: false)
+        descriptor.storageMode = .shared
+        descriptor.usage = .renderTarget
+        guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = texture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+        guard encodeMovie(pass: pass, command: command) else { return nil }
+        return (command, texture)
     }
 
     // The view and offscreen render tests use the same render pass.
