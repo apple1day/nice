@@ -72,24 +72,32 @@ final class VRFolderLibraryUITests: XCTestCase {
         child.tap()
         let surface = control("playbackSurfaceToggle")
         XCTAssertTrue(surface.waitForExistence(timeout: 12), app.debugDescription)
-        // The caller never opened a VR menu. These controls exist only after
-        // the player has already entered immersive viewing.
-        let headset = app.buttons["vrHeadsetButton"]
-        func revealIfNeeded(_ target: XCUIElement) {
-            if !target.isHittable {
-                surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.38)).tap()
-            }
+        // The controls auto-hide after four seconds of playing. Renew their
+        // deadline using the transport's empty margin, then pause the real
+        // player before inspecting the HUD. Pausing keeps controls visible.
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.95)).tap()
+        let toggle = app.buttons["togglePlaybackButton"]
+        func waitFor(_ message: String, timeout: TimeInterval = 8, _ condition: @escaping () -> Bool) {
+            if condition() { return }
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in condition() }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: timeout), .completed, message)
         }
-        revealIfNeeded(headset)
-        let shown = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in headset.isHittable }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [shown], timeout: 5), .completed, app.debugDescription)
+        waitFor("Player did not expose an enabled pause control") {
+            toggle.exists && toggle.label == "暂停" && toggle.isEnabled && toggle.isHittable
+        }
+        toggle.tap()
+        waitFor("The real movie did not pause") { toggle.exists && toggle.label == "播放" && toggle.isHittable }
+        // No mode menu was opened: the folder row directly entered immersive viewing.
+        XCTAssertTrue(app.buttons["vrHeadsetButton"].isHittable)
         XCTAssertEqual(app.buttons["videoFormatButton"].value as? String, "180° 全景")
         let close = app.buttons["closeFullscreenPlayer"]
-        revealIfNeeded(close)
-        XCTAssertTrue(close.waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(close.isHittable)
         close.tap()
-        XCTAssertTrue(child.waitForExistence(timeout: 8))
-        control("vrFolderBackButton").tap()
+        let back = control("vrFolderBackButton")
+        waitFor("Player cover was not dismissed over the child's folder", timeout: 12) {
+            !surface.exists && back.exists && back.isHittable && child.exists && child.isHittable
+        }
+        back.tap()
         XCTAssertTrue(rootMovie.waitForExistence(timeout: 8))
 
         // Launch without a test URL: a previously stored bookmark is now the
