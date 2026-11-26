@@ -144,6 +144,14 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     var nativeResolution = false {
         didSet { if oldValue != nativeResolution { updateDrawableSize(); requestDraw() } }
     }
+    // Used by the embedded XR viewer. The regular viewer keeps its existing 1920/native choice.
+    var renderScalePercent: Int? {
+        didSet { if oldValue != renderScalePercent { updateDrawableSize(); requestDraw() } }
+    }
+    var targetFrameRate: Int {
+        get { metalView.preferredFramesPerSecond }
+        set { metalView.preferredFramesPerSecond = newValue == 30 ? 30 : 60 }
+    }
     private var cameraToWorld = matrix_identity_float3x3
     private var shortSideFOV: Float = 80
 
@@ -187,7 +195,7 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         let fourCC = bytes.allSatisfy { (32..<127).contains($0) } ? String(decoding: bytes, as: UTF8.self) : "unknown"
         return "metal recvID=\(receivedFrameID) acceptID=\(acceptedFrameID) submitID=\(submittedFrameID) " +
             gpuProgress.summary + " input=\(receivedWidth)x\(receivedHeight):\(fourCC) target=\(Int(size.width))x\(Int(size.height))" +
-            " visible=\(canPresent) paused=\(metalView.isPaused) rejected=\(rejected) cpuUpload=\(cpuUploads)" +
+            " drawFPS=\(targetFrameRate) visible=\(canPresent) paused=\(metalView.isPaused) rejected=\(rejected) cpuUpload=\(cpuUploads)" +
             " noDrawable=\(noDrawable) gpuBusy=\(gpuBusy) textureCV=\(lastCacheResult) mapError=\(lastMapError)"
     }
 
@@ -343,7 +351,10 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         let width = bounds.width * scale, height = bounds.height * scale
         guard width > 0, height > 0 else { return }
         var factor: CGFloat = 1
-        if case .immersive = mode, !nativeResolution { factor = min(1, 1920 / max(width, height)) }
+        if case .immersive = mode {
+            if let renderScalePercent { factor = CGFloat(min(100, max(50, renderScalePercent))) / 100 }
+            else if !nativeResolution { factor = min(1, 1920 / max(width, height)) }
+        }
         let size = CGSize(width: max(1, (width * factor).rounded()), height: max(1, (height * factor).rounded()))
         if metalView.drawableSize != size { metalView.drawableSize = size }
     }

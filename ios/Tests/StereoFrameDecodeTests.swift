@@ -4,15 +4,24 @@ import XCTest
 
 @MainActor final class StereoFrameDecodeTests: XCTestCase {
     func testReducedOutputResumes8KSourceWithSmallerStereoBuffers() async throws {
+        try await checkMovingPanorama("stereo8k-replay", width: 1280, height: 320, startAt: 2, reduced: true)
+    }
+
+    func testFullHeight8K60PanoramaNegotiatesSmallerFramesAndChangesBothEyes() async throws {
+        try await checkMovingPanorama("stereo8k60-full", width: 1600, height: 800, startAt: 0, reduced: false)
+    }
+
+    private func checkMovingPanorama(_ fixture: String, width expectedWidth: Int, height expectedHeight: Int,
+                                     startAt: Double, reduced: Bool) async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
-            forResource: "stereo8k-replay", withExtension: "mp4", subdirectory: "Fixtures"))
-        let ready = expectation(description: "Resumed VLC output contains both eyes at the reduced size")
+            forResource: fixture, withExtension: "mp4", subdirectory: "Fixtures"))
+        let ready = expectation(description: "VLC output contains both moving eyes at the negotiated size")
         var colors = Set<Int>()
         let engine = VLCPlaybackEngine(frameHandler: { frame in
             guard colors.count < 2 else { return }
             let width = CVPixelBufferGetWidth(frame), height = CVPixelBufferGetHeight(frame)
-            XCTAssertEqual(width, 1280)
-            XCTAssertEqual(height, 320)
+            XCTAssertEqual(width, expectedWidth)
+            XCTAssertEqual(height, expectedHeight)
             guard CVPixelBufferLockBaseAddress(frame, .readOnly) == kCVReturnSuccess else { return }
             defer { CVPixelBufferUnlockBaseAddress(frame, .readOnly) }
             guard let base = CVPixelBufferGetBaseAddress(frame) else { return }
@@ -22,9 +31,9 @@ import XCTest
             if row[left + 2] > 180 && row[left + 1] < 70 && row[right] > 180 { colors.insert(0) }
             if row[left + 1] > 180 && row[left + 2] < 70 && row[right + 2] > 180 && row[right + 1] > 180 { colors.insert(1) }
             if colors.count == 2 { ready.fulfill() }
-        }, reducedFrameOutput: true)
+        }, reducedFrameOutput: reduced, preferSmallerPanoramaFrames: true)
         defer { engine.stop() }
-        try engine.load(fileURL: url, startAt: 2, paused: false)
+        try engine.load(fileURL: url, startAt: startAt, paused: false)
         engine.play()
         await fulfillment(of: [ready], timeout: 15)
     }

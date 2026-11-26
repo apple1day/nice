@@ -29,6 +29,9 @@ final class WatchedPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReport
     @MainActor func retrySystemOutput() {
         (base as? SystemOutputRetrying)?.retrySystemOutput()
     }
+    @MainActor func retryAfterglowOutput() {
+        (base as? SystemOutputRetrying)?.retryAfterglowOutput()
+    }
     func attach(to view: UIView) { if !stopped { base.attach(to: view) } }
     func load(fileURL: URL) throws { try base.load(fileURL: fileURL) }
     func play() { guard !stopped else { return }; allowed = true; base.play() }

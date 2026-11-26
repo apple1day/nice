@@ -94,8 +94,14 @@ private struct OfflineLibraryContent: View {
                     }
                 }
                 .contextMenu {
-                    if !selection.isSelecting && row.record.pendingDeletionOrder != nil {
-                        Button("撤销待删除") { store.unmarkForDeletion(row.id) }
+                    if !selection.isSelecting {
+                        Button("用 Afterglow XR 播放", systemImage: "eyeglasses") {
+                            preparingFile = nil
+                            store.playLocal(row.record, playlistIDs: library.visibleRows.map(\.id), startMode: .afterglow)
+                        }
+                        if row.record.pendingDeletionOrder != nil {
+                            Button("撤销待删除") { store.unmarkForDeletion(row.id) }
+                        }
                     }
                 }
             }

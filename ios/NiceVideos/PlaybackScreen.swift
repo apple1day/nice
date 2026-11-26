@@ -163,6 +163,7 @@ final class PlaybackModel: ObservableObject {
             phase = .opening
         }
         if output == .system { (engine as? SystemOutputRetrying)?.retrySystemOutput() }
+        if output == .afterglow { (engine as? SystemOutputRetrying)?.retryAfterglowOutput() }
     }
 
     private func receive(_ snapshot: PlaybackSnapshot) {
@@ -299,11 +300,15 @@ private struct MovieVideoSurface: UIViewRepresentable {
     let followHead: Bool
     let wakeGesture: VRWakeGesture
     let nativeResolution: Bool
+    let renderScalePercent: Int?
+    let targetFrameRate: Int
 
     @MainActor private func configure(_ view: SBSPlaybackView) {
         view.configure(mode: mode, standardOutput: standardOutput)
-        if let renderer = view.renderer, renderer.nativeResolution != nativeResolution {
-            renderer.nativeResolution = nativeResolution
+        if let renderer = view.renderer {
+            if renderer.nativeResolution != nativeResolution { renderer.nativeResolution = nativeResolution }
+            if renderer.renderScalePercent != renderScalePercent { renderer.renderScalePercent = renderScalePercent }
+            if renderer.targetFrameRate != targetFrameRate { renderer.targetFrameRate = targetFrameRate }
         }
         if case .immersive = mode { camera.connect(to: view.renderer, followHead: followHead, wake: wakeGesture) }
         else { camera.connect(to: nil, followHead: false) }
@@ -420,6 +425,10 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     @AppStorage("vr.viewer.wakeGesture") private var wakeGesture: VRWakeGesture = .off
     @AppStorage("vr.viewer.doubleTap") private var doubleTap: VRDoubleTapAction = .recenter
     @AppStorage("vr.viewer.pinch") private var pinchResponse: VRPinchResponse = .regular
+    @AppStorage(AfterglowPreset.gyroKey) private var afterglowGyro = true
+    @AppStorage(AfterglowPreset.renderScaleKey) private var afterglowRenderScale = 75
+    @AppStorage(AfterglowPreset.frameRateKey) private var afterglowFrameRate = 30
+    @State private var afterglowViewing: Bool
     @State private var displayMode: SBSDisplayMode
     @State private var outputOverride: MovieOutput?
 
@@ -427,9 +436,17 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         self.playlist = playlist
         self.model = model
         let request = playlist.current
-        let profile = request.startsInVR ? VRMoviePreferences(key: request.key) : VRMoviePreferences()
+        let afterglow = request.startMode == .afterglow
+        let profile: VRMoviePreferences
+        switch request.startMode {
+        case .afterglow: profile = AfterglowPreset.load()
+        case .panorama: profile = VRMoviePreferences(key: request.key)
+        case .standard: profile = VRMoviePreferences()
+        }
+        _afterglowViewing = State(initialValue: afterglow)
+        _outputOverride = State(initialValue: afterglow ? .afterglow : nil)
         _vrProfile = State(initialValue: profile)
-        _displayMode = State(initialValue: request.startsInVR ? profile.mode : .standard)
+        _displayMode = State(initialValue: request.startMode == .standard ? .standard : profile.mode)
         _camera = StateObject(wrappedValue: VRGestureCamera(fieldOfView: profile.fieldOfView))
     }
 
@@ -461,9 +478,11 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                 ZStack {
                     Color.black.ignoresSafeArea()
                     MovieVideoSurface(model: model, mode: displayMode, standardOutput: standardOutput,
-                                      camera: camera, followHead: isPanorama && followHead && scenePhase == .active && !showsVRSettings,
+                                      camera: camera, followHead: isPanorama && (afterglowViewing ? afterglowGyro : followHead) && scenePhase == .active && !showsVRSettings,
                                       wakeGesture: vrProfile.headset && canInteract && !hasMessage ? wakeGesture : .off,
-                                      nativeResolution: nativeResolution)
+                                      nativeResolution: nativeResolution,
+                                      renderScalePercent: afterglowViewing ? afterglowRenderScale : nil,
+                                      targetFrameRate: afterglowViewing ? afterglowFrameRate : 60)
                         .id(request.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .ignoresSafeArea(.container, edges: isFullscreen ? .all : [])
@@ -475,7 +494,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                                               response: pinchResponse, onTap: toggleControls, onDoubleTap: doubleTapped,
                                               onZoomEnd: { fov in
                                 vrProfile.fieldOfView = fov
-                                vrProfile.save(key: request.key)
+                                saveCurrentProfile()
                             })
                         } else {
                             Rectangle().fill(Color.clear).contentShape(Rectangle())
@@ -741,6 +760,14 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     }
     private func toggleFullscreen() {
         if controls.isFullscreen || displayMode == .standard { controls.toggleFullscreen(at: now) }
+        leavePanorama()
+    }
+
+    private func leavePanorama() {
+        if afterglowViewing {
+            afterglowViewing = false
+            outputOverride = nil
+        }
         displayMode = .standard
     }
 
@@ -763,6 +790,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         .accessibilityValue(immersive ? vrProfile.projection.label : (displayMode == .standard ? "普通播放" : (displayMode == .half ? "半宽 SBS" : "全宽 SBS")))
         .accessibilityIdentifier("videoFormatButton")
         .confirmationDialog("视频显示方式", isPresented: $showsVideoFormats, titleVisibility: .visible) {
+            Button("用 Afterglow XR 播放") { enterAfterglow() }
             Button("进入全景 VR") { enterPanorama() }
             Button("半宽 SBS（Half SBS）") { displayMode = .half }
             Button("全宽 SBS（Full SBS）") { displayMode = .full }
@@ -790,8 +818,14 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             Text(["当前解码：\(activeOutput.title)。", model.videoDetails, "每只眼的画面被横向压缩时选半宽，保持原比例时选全宽。"].compactMap { $0 }.joined(separator: "\n"))
         }
     }
+    private func enterAfterglow() {
+        afterglowViewing = true
+        selectOutput(.afterglow)
+        enterPanorama()
+    }
+
     private func enterPanorama() {
-        vrProfile = VRMoviePreferences(key: request.key)
+        vrProfile = afterglowViewing ? AfterglowPreset.load() : VRMoviePreferences(key: request.key)
         camera.recenter()
         camera.setFOV(vrProfile.fieldOfView)
         displayMode = vrProfile.mode
@@ -802,7 +836,12 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         if next.projection != vrProfile.projection { camera.recenter() }
         vrProfile = next
         displayMode = next.mode
-        next.save(key: request.key)
+        saveCurrentProfile()
+    }
+
+    private func saveCurrentProfile() {
+        if afterglowViewing { AfterglowPreset.save(vrProfile) }
+        else { vrProfile.save(key: request.key) }
     }
 
     private func doubleTapped() {
@@ -826,16 +865,23 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     }
 
     private var immersiveSettings: some View {
-        VRViewerSettingsView(profile: Binding(get: { vrProfile }, set: applyProfile),
-                             followHead: $followHead, nativeResolution: $nativeResolution,
+        let appleActive = activeOutput == .system || activeOutput == .afterglow
+        let retryOutput: MovieOutput = afterglowViewing ? .afterglow : .system
+        let retryTitle = afterglowViewing ? "重试 Afterglow XR" : "恢复系统解码"
+        let fallback = outputOverride == .afterglow && activeOutput == .vlcFrames
+        return VRViewerSettingsView(profile: Binding(get: { vrProfile }, set: applyProfile),
+                             followHead: afterglowViewing ? $afterglowGyro : $followHead, nativeResolution: $nativeResolution,
                              doubleTap: $doubleTap, pinchResponse: $pinchResponse, wakeGesture: $wakeGesture,
                              sensorAvailable: camera.sensorAvailable, decoder: activeOutput.title,
-                             details: model.videoDetails,
-                             decoderAction: activeOutput == .system ? "尝试 VLC 解码" :
-                                (defaultOutput == .system ? "恢复系统解码" : nil),
+                             details: [fallback ? "Afterglow XR 已回退到 VLC。" : nil, model.videoDetails]
+                                .compactMap { $0 }.joined(separator: " "),
+                             decoderAction: appleActive ? "尝试 VLC 解码" :
+                                (afterglowViewing || defaultOutput == .system ? retryTitle : nil),
                              onCopyDiagnostics: model.copyPlaybackDiagnostics,
-                             onDecoderChange: { selectOutput(activeOutput == .system ? .vlcFrames : .system) },
-                             onExit: { displayMode = .standard; revealControls() })
+                             onDecoderChange: { selectOutput(appleActive ? .vlcFrames : retryOutput) },
+                             usesAfterglowPreset: afterglowViewing,
+                             onOpenAfterglow: afterglowViewing ? nil : enterAfterglow,
+                             onExit: { leavePanorama(); revealControls() })
     }
 
     private var transportFavoriteButton: some View {

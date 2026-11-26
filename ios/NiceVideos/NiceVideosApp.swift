@@ -100,7 +100,7 @@ struct NiceVideosApp: App {
                         profile.save(key: key)
                         UserDefaults.standard.set(143.0, forKey: "position." + key)
                     }
-                    try store.playPickedFile(file, startsInVR: resume360)
+                    try store.playPickedFile(file, startMode: resume360 ? .panorama : .standard)
                 } catch { store.errorMessage = error.localizedDescription }
             }
     }

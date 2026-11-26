@@ -8,6 +8,8 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     private var onAttach: (() -> Void)?
     private let preferBiPlanar: () -> Bool
     private let recovery: Bool
+    private let afterglowFormat: AfterglowMovieOutput.Format?
+    private var afterglowOutput: AfterglowMovieOutput?
     private var output: AVPlayerItemVideoOutput?
     private var displayLink: CADisplayLink?
     private var lastDelivery = CACurrentMediaTime()
@@ -20,21 +22,32 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     var isParked: Bool { displayLink?.isPaused == true }
 
     init(item: AVPlayerItem, recovery: Bool, preferBiPlanar: @escaping () -> Bool,
+         afterglowFormat: AfterglowMovieOutput.Format? = nil,
          onAttach: @escaping () -> Void = {}, handler: @escaping (CVPixelBuffer, Double?) -> Void) {
         self.item = item
         self.preferBiPlanar = preferBiPlanar
+        self.afterglowFormat = afterglowFormat
         self.recovery = recovery
         self.handler = handler
         self.onAttach = onAttach
         super.init()
         attachOutputIfReady()
         let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        if afterglowFormat?.highRate8K == true {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 30, preferred: 30)
+        }
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
 
     private func attachOutputIfReady() {
         guard output == nil, let item else { return }
+        if let format = afterglowFormat {
+            let next = AfterglowMovieOutput(item: item, format: format)
+            afterglowOutput = next
+            attach(next.output, description: format.description)
+            return
+        }
         let size = item.presentationSize
         guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
         let longest = max(size.width, size.height)
@@ -55,10 +68,14 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
         ]
         let next = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
-        next.setDelegate(self, queue: .main)
         item.add(next)
+        attach(next, description: "\(biPlanar ? "420v" : "BGRA") \(width)x\(height)")
+    }
+
+    private func attach(_ next: AVPlayerItemVideoOutput, description: String) {
+        next.setDelegate(self, queue: .main)
         output = next
-        requestDescription = "\(biPlanar ? "420v" : "BGRA") \(width)x\(height)"
+        requestDescription = description
         onAttach?()
         onAttach = nil
     }
@@ -69,11 +86,7 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
         attachOutputIfReady()
         guard let output else { return }
         let hostTime = link.targetTimestamp
-        let scheduled = output.itemTime(forHostTime: hostTime)
-        let time = scheduled.isNumeric ? scheduled : (item?.currentTime() ?? .invalid)
-        var displayTime = CMTime.invalid
-        if time.isNumeric, (!hasVideoFrame || output.hasNewPixelBuffer(forItemTime: time)),
-           let frame = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) {
+        if let (frame, displayTime) = frame(for: hostTime, output: output) {
             lastDelivery = hostTime
             hasVideoFrame = true
             // If the converter repeatedly returns the same PTS, the decoder
@@ -84,11 +97,21 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
             }
             handler(frame, displayTime.isNumeric ? displayTime.seconds : nil)
         } else if hasVideoFrame && !continuousPull && hostTime - lastDelivery > 0.5 {
-            // Only park in a quiescent state. A delayed decoded frame while
-            // the audio clock is running must not put the only consumer to sleep.
+            // Park only when playback is quiescent. A delayed frame while the
+            // audio clock runs must not put the consumer to sleep.
             output.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.05)
             link.isPaused = true
         }
+    }
+
+    private func frame(for hostTime: CFTimeInterval, output: AVPlayerItemVideoOutput) -> (CVPixelBuffer, CMTime)? {
+        if let afterglowOutput { return afterglowOutput.frame(at: hostTime, allowFirst: !hasVideoFrame) }
+        let scheduled = output.itemTime(forHostTime: hostTime)
+        let time = scheduled.isNumeric ? scheduled : (item?.currentTime() ?? .invalid)
+        var displayTime = CMTime.invalid
+        guard time.isNumeric, !hasVideoFrame || output.hasNewPixelBuffer(forItemTime: time),
+              let frame = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) else { return nil }
+        return (frame, displayTime)
     }
 
     func outputMediaDataWillChange(_ sender: AVPlayerItemOutput) {
@@ -127,6 +150,7 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
             if let item, item.outputs.contains(where: { $0 === output }) { item.remove(output) }
         }
         output = nil
+        afterglowOutput = nil
         item = nil
     }
 }

@@ -22,6 +22,7 @@ typedef struct {
     uint64_t formatSetups;
     uint64_t staleSource;
     unsigned outputLongEdge;
+    unsigned negotiatedLimit;
 } NICEVLCFrameStats;
 
 typedef struct {
@@ -38,6 +39,7 @@ typedef struct {
 @property (atomic, readonly) NICEVLCFrameStats frameStats;
 // Set before load; sampled only when VLC negotiates a new output.
 @property (atomic) unsigned maximumLongEdge;
+@property (atomic) BOOL preferSmallerPanoramaFrames;
 // Called on the main queue when retiring playback, before VLC stops asynchronously.
 - (void)invalidate;
 - (instancetype)init NS_UNAVAILABLE;

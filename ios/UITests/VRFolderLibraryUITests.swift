@@ -115,6 +115,47 @@ final class VRFolderLibraryUITests: XCTestCase {
         XCTAssertTrue(subfolder.exists)
     }
 
+    func testAfterglowPresetAppliesBeforeFolderMovieAndSurvivesRelaunch() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "panorama-chart", withExtension: "mp4"))
+        app.launchArguments = ["--ui-test-vr-folder"]
+        app.launchEnvironment["NICE_VR_FOLDER_TEST_ID"] = UUID().uuidString
+        app.launchEnvironment["NICE_VR_FOLDER_MOVIE"] = try (Data(contentsOf: url) as NSData)
+            .compressed(using: .zlib).base64EncodedString()
+        func control(_ identifier: String) -> XCUIElement {
+            app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+        }
+        func openTab() {
+            app.launch()
+            let tab = app.tabBars.buttons["VR"]
+            XCTAssertTrue(tab.waitForExistence(timeout: 10))
+            tab.tap()
+        }
+        openTab()
+        defer { app.terminate() }
+        XCTAssertTrue(control("afterglowOpenVideo").exists)
+        control("afterglowOpenSettings").tap()
+        let headset = control("vrHeadsetToggle")
+        XCTAssertTrue(headset.waitForExistence(timeout: 6))
+        if headset.value as? String == "1" { headset.tap() }
+        XCTAssertEqual(headset.value as? String, "0")
+        XCTAssertTrue(control("afterglowFrameRate").exists)
+        control("afterglowSettingsDone").tap()
+        app.terminate()
+        openTab()
+        control("vrChooseFolderButton").tap()
+        let play = control("afterglowEntry-Panorama Demo.mp4")
+        XCTAssertTrue(play.waitForExistence(timeout: 12))
+        play.tap()
+        let format = control("videoFormatButton")
+        XCTAssertTrue(format.waitForExistence(timeout: 12), app.debugDescription)
+        XCTAssertEqual(format.value as? String, "360° 全景")
+        XCTAssertEqual(control("vrHeadsetButton").label, "切换双眼眼镜")
+        format.tap()
+        XCTAssertTrue(app.staticTexts["Afterglow XR"].waitForExistence(timeout: 8), app.debugDescription)
+    }
+
     private func attachVRScreen(_ name: String) {
         let attachment = XCTAttachment(data: XCUIScreen.main.screenshot().pngRepresentation, uniformTypeIdentifier: "public.png")
         attachment.name = name

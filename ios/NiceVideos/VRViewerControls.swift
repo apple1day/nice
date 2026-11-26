@@ -4,7 +4,7 @@ import simd
 import UIKit
 
 /// Projection belongs to the movie; gesture and output preferences belong to the viewer.
-struct VRMoviePreferences {
+struct VRMoviePreferences: Equatable {
     var projection = VRProjection.vr180
     var eyes = VREyeLayout.sideBySide
     var headset = false
@@ -14,16 +14,24 @@ struct VRMoviePreferences {
 
     init() {}
     init(key: String, defaults: UserDefaults = .standard) {
-        guard let values = defaults.dictionary(forKey: "vr.movie." + key) else { return }
+        self.init(values: defaults.dictionary(forKey: "vr.movie." + key))
+    }
+
+    init(values: [String: Any]?, fallback: Self = Self()) {
+        self = fallback
+        guard let values else { return }
         if let value = values["projection"] as? Int, let saved = VRProjection(rawValue: value) { projection = saved }
         if let value = values["eyes"] as? Int, let saved = VREyeLayout(rawValue: value) { eyes = saved }
-        headset = values["headset"] as? Bool ?? false
+        headset = values["headset"] as? Bool ?? headset
         if let fov = values["fov"] as? Double, fov.isFinite { fieldOfView = Float(min(110, max(45, fov))) }
     }
 
+    var values: [String: Any] {
+        ["projection": projection.rawValue, "eyes": eyes.rawValue, "headset": headset, "fov": Double(fieldOfView)]
+    }
+
     func save(key: String, defaults: UserDefaults = .standard) {
-        defaults.set(["projection": projection.rawValue, "eyes": eyes.rawValue,
-                      "headset": headset, "fov": Double(fieldOfView)] as [String: Any], forKey: "vr.movie." + key)
+        defaults.set(values, forKey: "vr.movie." + key)
     }
 }
 
@@ -246,6 +254,8 @@ enum VRPinchResponse: String, CaseIterable {
     let decoderAction: String?
     let onCopyDiagnostics: () -> Bool
     let onDecoderChange: () -> Void
+    let usesAfterglowPreset: Bool
+    let onOpenAfterglow: (() -> Void)?
     let onExit: () -> Void
 
     var body: some View {
@@ -259,15 +269,7 @@ enum VRPinchResponse: String, CaseIterable {
                     }
                     .accessibilityIdentifier("copyPlaybackDiagnostics")
                 }
-                Section("当前影片") {
-                    Picker("投影", selection: $profile.projection) {
-                        ForEach(VRProjection.allCases, id: \.self) { Text($0.label).tag($0) }
-                    }.accessibilityIdentifier("vrProjectionPicker")
-                    Picker("片源排布", selection: $profile.eyes) {
-                        ForEach(VREyeLayout.allCases, id: \.self) { Text($0.label).tag($0) }
-                    }.accessibilityIdentifier("vrEyeLayoutPicker")
-                    Toggle("双眼眼镜", isOn: $profile.headset)
-                }
+                Section("当前影片") { VRProjectionFields(profile: $profile) }
                 if profile.projection != .flat {
                     Section("环顾") {
                         Toggle("陀螺仪跟随", isOn: $followHead).disabled(!sensorAvailable)
@@ -284,15 +286,22 @@ enum VRPinchResponse: String, CaseIterable {
                     Picker("画面双击", selection: $doubleTap) {
                         ForEach(VRDoubleTapAction.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                     }
-                    Picker("VR 渲染清晰度", selection: $nativeResolution) {
-                        Text("流畅（最长边 1920）").tag(false)
-                        Text("屏幕原生").tag(true)
+                    if usesAfterglowPreset {
+                        AfterglowRenderFields()
+                    } else {
+                        Picker("VR 渲染清晰度", selection: $nativeResolution) {
+                            Text("流畅（最长边 1920）").tag(false)
+                            Text("屏幕原生").tag(true)
+                        }
                     }
                 }
                 Section("片源信息") {
                     LabeledContent("当前解码", value: decoder)
                     if let details { Text(details).font(.footnote) }
                     if let decoderAction { Button(decoderAction) { onDecoderChange(); dismiss() } }
+                    if let onOpenAfterglow {
+                        Button("用 Afterglow XR 播放") { onOpenAfterglow(); dismiss() }
+                    }
                 }
                 Button("退出全景 VR") { onExit(); dismiss() }
                     .accessibilityIdentifier("exitPanoramaVR")
@@ -301,5 +310,19 @@ enum VRPinchResponse: String, CaseIterable {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
         }
+    }
+}
+
+struct VRProjectionFields: View {
+    @Binding var profile: VRMoviePreferences
+    var body: some View {
+        Picker("投影", selection: $profile.projection) {
+            ForEach(VRProjection.allCases, id: \.self) { Text($0.label).tag($0) }
+        }.accessibilityIdentifier("vrProjectionPicker")
+        Picker("片源排布", selection: $profile.eyes) {
+            ForEach(VREyeLayout.allCases, id: \.self) { Text($0.label).tag($0) }
+        }.accessibilityIdentifier("vrEyeLayoutPicker")
+        Toggle("双眼眼镜", isOn: $profile.headset)
+            .accessibilityIdentifier("vrHeadsetToggle")
     }
 }

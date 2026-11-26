@@ -29,6 +29,45 @@ final class VLCFrameLossWatchTests: XCTestCase {
         }
     }
 
+    func testSparseAndRepeatedClockSamplesStillRecognizeNativeLoss() {
+        var watch = VLCFrameLossWatch()
+        XCTAssertFalse(watch.needsSmallerOutput(sample(35, clock: 818, lost: 25)))
+        XCTAssertFalse(watch.needsSmallerOutput(sample(36, clock: 818, lost: 40)))
+        XCTAssertTrue(watch.needsSmallerOutput(sample(40, clock: 823, lost: 190)))
+        XCTAssertEqual(watch.observedMediaSeconds, 5)
+    }
+
+    func testBeforeFirstOutputRequiresFormatStableCountersAndIncreasingLoss() {
+        var lostBeforeDisplay = VLCFrameLossWatch(), noLoss = VLCFrameLossWatch()
+        for second in 1...5 {
+            XCTAssertEqual(lostBeforeDisplay.needsSmallerOutput(sample(second, frames: 0, displayed: 0)), second == 5)
+            XCTAssertFalse(noLoss.needsSmallerOutput(sample(second, frames: 0, displayed: 0, lost: 0)))
+        }
+    }
+
+    func testLongUnobservedGapAndCounterResetDoNotTriggerRecovery() {
+        var gap = VLCFrameLossWatch(), restarted = VLCFrameLossWatch()
+        XCTAssertFalse(gap.needsSmallerOutput(sample(10)))
+        XCTAssertFalse(gap.needsSmallerOutput(sample(20)))
+        XCTAssertFalse(restarted.needsSmallerOutput(sample(10, lost: 200)))
+        XCTAssertFalse(restarted.needsSmallerOutput(sample(15, lost: 40)))
+    }
+
+    func testMinimumCapAndIneligibleInputsAreDistinguishedInDiagnostics() {
+        func state(_ edge: UInt32, remaining: Double = 20, active: Bool = true, seekable: Bool = true,
+                   reduced: Bool = false) -> VLCFrameLossWatch.State {
+            .init(active: active, seekable: seekable, remaining: remaining, outputEdge: edge,
+                  reducedLimit: 1280, alreadyReduced: reduced)
+        }
+        XCTAssertEqual(state(0), .awaitingFormat)
+        XCTAssertEqual(state(1600), .monitoring)
+        XCTAssertEqual(state(1280), .smallOutput)
+        XCTAssertEqual(state(1280, reduced: true), .minimum)
+        XCTAssertEqual(state(1600, remaining: 0), .nearEnd)
+        XCTAssertEqual(state(1600, active: false), .inactive)
+        XCTAssertEqual(state(1600, seekable: false), .unseekable)
+    }
+
     func testSeekAndPauseDiscardEarlierLossEvidence() {
         var watch = VLCFrameLossWatch()
         for second in 1...4 {

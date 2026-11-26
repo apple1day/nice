@@ -124,8 +124,14 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     private var lastStatsTime = -Double.infinity
     private var frameProgress = VLCFrameProgress()
     private var frameLossWatch = VLCFrameLossWatch()
+    private var lossTimer: DispatchSourceTimer?
+    private var stalledAtMinimum = false
     private let reducedFrameOutput: Bool
     static let reducedLongEdge: UInt32 = 1280
+    var preferSmallerPanoramaFrames: Bool {
+        get { frameDelivery?.preferSmallerPanoramaFrames ?? false }
+        set { frameDelivery?.preferSmallerPanoramaFrames = newValue }
+    }
     private var videoDetails: String?
     private var nextTrackCheck = -Double.infinity
     var onUpdate: ((PlaybackSnapshot) -> Void)?
@@ -152,12 +158,13 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     override convenience init() { self.init(frameHandler: nil) }
 
     init(frameHandler: ((CVPixelBuffer) -> Void)?, pickedFile: PickedVideoFile? = nil,
-         reducedFrameOutput: Bool = false) {
+         reducedFrameOutput: Bool = false, preferSmallerPanoramaFrames: Bool = false) {
         self.pickedFile = pickedFile
         self.reducedFrameOutput = reducedFrameOutput
         let construction = NICEVLCPlayerConstruction(options: ["--no-video-title-show", "--no-metadata-network-access"],
                                                      frameHandler: frameHandler)
         frameDelivery = construction?.frameDelivery
+        construction?.frameDelivery?.preferSmallerPanoramaFrames = preferSmallerPanoramaFrames
         if reducedFrameOutput { construction?.frameDelivery?.maximumLongEdge = Self.reducedLongEdge }
         playerResource = BackgroundPlaybackResource(construction?.player)
         super.init()
@@ -185,6 +192,8 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         guard let player else { throw ClientError("播放器初始化失败，请关闭后重新打开视频。") }
         frameProgress.reset()
         frameLossWatch.reset()
+        stalledAtMinimum = false
+        stopLossTimer()
         lastStatsTime = -.infinity
         videoDetails = nil
         nextTrackCheck = -.infinity
@@ -239,11 +248,34 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         needsPausedFrame = waitForPausedFrame
         pausedPreviewDeadline = waitForPausedFrame ? ProcessInfo.processInfo.systemUptime + 10 : nil
         player?.play()
+        if !waitForPausedFrame { startLossTimer() }
         if waitForPausedFrame { scheduleTimePublish(after: 0.1) }
     }
+    // VLCKit clock callbacks can be delayed or repeated while a stressed vout
+    // drops frames. Probe only the memory-frame path and only between playback
+    // and pause/stop. Ordinary native playback keeps its event-driven updates.
+    private func startLossTimer() {
+        guard frameDelivery != nil, lossTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            guard let self, ProcessInfo.processInfo.systemUptime - self.lastStatsTime >= 1 else { return }
+            self.publishNow()
+        }
+        lossTimer = timer
+        timer.resume()
+    }
+
+    private func stopLossTimer() {
+        lossTimer?.cancel()
+        lossTimer = nil
+    }
+
     func pause() {
+        stopLossTimer()
         frameProgress.reset()
         frameLossWatch.reset()
+        stalledAtMinimum = false
         if loaded && !stopped { player?.pause() }
     }
     func seek(to seconds: Double) {
@@ -258,6 +290,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
 
         frameProgress.reset()
         frameLossWatch.reset()
+        stalledAtMinimum = false
         callbackLock.lock()
         seekGate.begin(target: seconds, now: ProcessInfo.processInfo.systemUptime)
         callbackLock.unlock()
@@ -271,6 +304,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     func stop() {
         guard !stopped else { return }
         stopped = true
+        stopLossTimer()
         frameDelivery?.invalidate()
         player?.delegate = nil
         onUpdate = nil
@@ -313,6 +347,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
 
     private func publishNow() {
         guard !stopped, let snapshot = makeSnapshot() else { return }
+        if snapshot.phase == .ended || snapshot.phase == .failed { stopLossTimer() }
         if let deadline = pausedPreviewDeadline {
             // Paused inputs do not emit clock ticks. VLCKit 3.x does not
             // forward vout/seekable readiness as a delegate callback either.
@@ -363,18 +398,27 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         let duration = durationSeconds(player)
         let activelyPlaying = player.state == .playing && !awaitingSeek && pausedPreviewDeadline == nil &&
             MainActor.assumeIsolated { UIApplication.shared.applicationState == .active }
-        let canReduce = activelyPlaying && !reducedFrameOutput && player.isSeekable && duration - rawSeconds > 2 &&
-            (stats?.outputLongEdge ?? 0) > Self.reducedLongEdge
-        if !canReduce { frameLossWatch.reset() }
+        // Keep the reason in a copyable report even if no output arrives.
+        let recoveryState = VLCFrameLossWatch.State(
+            active: activelyPlaying, seekable: player.isSeekable, remaining: duration - rawSeconds,
+            outputEdge: stats?.outputLongEdge ?? 0, reducedLimit: Self.reducedLongEdge, alreadyReduced: reducedFrameOutput)
+        let canReduce = recoveryState == .monitoring
+        let monitorLoss = canReduce || recoveryState == .minimum
+        if !monitorLoss {
+            frameLossWatch.reset()
+            stalledAtMinimum = false
+        }
         var retryWithSmallerFrames = false
-        if now - lastStatsTime >= 1 && (canReduce || diagnostics != nil) {
+        if now - lastStatsTime >= 1 && (monitorLoss || diagnostics != nil) {
             lastStatsTime = now
             let native = nativeLifetime?.resource?.videoStatistics
-            if canReduce, let stats, let native {
-                retryWithSmallerFrames = frameLossWatch.needsSmallerOutput(.init(
+            if monitorLoss, let stats, let native {
+                let stalled = frameLossWatch.needsSmallerOutput(.init(
                     clock: rawSeconds, host: now, decoded: native.decoded, displayed: native.displayed,
                     lost: native.lost, offered: stats.offered, delivered: stats.delivered,
                     bufferMisses: stats.bufferMisses, staleSource: stats.staleSource, formatSetups: stats.formatSetups))
+                retryWithSmallerFrames = canReduce && stalled
+                stalledAtMinimum = reducedFrameOutput && stalled
             }
             if let diagnostics {
                 var status = "stats=unavailable"
@@ -384,13 +428,16 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
                 if let stats {
                     status += " offered=\(stats.offered) delivered=\(stats.delivered) coalesced=\(stats.coalesced) bufferMisses=\(stats.bufferMisses)"
                     status += " formatSetups=\(stats.formatSetups) staleSource=\(stats.staleSource)"
-                    status += " vmemCap=\(frameDelivery?.maximumLongEdge ?? 0)"
+                    status += " vmemCap=\(stats.negotiatedLimit) recovery=\(stalledAtMinimum ? "minimum-stalled" : recoveryState.rawValue)"
+                    status += " watchMediaSec=\(Int(frameLossWatch.observedMediaSeconds))"
                 }
                 MainActor.assumeIsolated { diagnostics.vlcStatus(status) }
             }
         }
         var warning: String?
-        if let stats, frameProgress.stalled(frames: stats.delivered, media: rawSeconds, host: now,
+        if stalledAtMinimum {
+            warning = "VLC 已把输出降至 1280 像素，但仍在丢帧。可使用较低分辨率或帧率的片源。"
+        } else if let stats, frameProgress.stalled(frames: stats.delivered, media: rawSeconds, host: now,
                 playing: activelyPlaying) {
             warning = "播放时间在前进，VLC 已有 12 秒没有送出新画面。请复制播放诊断，或退出 VR 对比普通播放。"
         }

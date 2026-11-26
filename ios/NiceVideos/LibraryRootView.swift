@@ -30,8 +30,8 @@ struct LibraryRootView: View {
             }
                 .tabItem { Label("本地", systemImage: "internaldrive") }
             NavigationStack {
-                VRFolderTab { file in
-                    do { try store.playPickedFile(file, startsInVR: true) }
+                VRFolderTab { file, startMode in
+                    do { try store.playPickedFile(file, startMode: startMode) }
                     catch { store.errorMessage = error.localizedDescription }
                 }
             }

@@ -1,7 +1,9 @@
 import UIKit
 
 enum MovieOutput: Equatable {
-    case system, vlcNative, vlcFrames
+    case system, afterglow, vlcNative, vlcFrames
+
+    var usesAVPlayer: Bool { self == .system || self == .afterglow }
 
     static func defaultOutput(for url: URL, pickedFile: PickedVideoFile?) -> Self {
         switch url.pathExtension.lowercased() {
@@ -13,6 +15,7 @@ enum MovieOutput: Equatable {
     var title: String {
         switch self {
         case .system: return "系统播放器"
+        case .afterglow: return "Afterglow XR"
         case .vlcNative: return "VLC 原生显示"
         case .vlcFrames: return "VLC 兼容显示"
         }
@@ -54,7 +57,7 @@ final class SBSPlaybackView: UIView {
             renderer = nil
         }
         renderer?.mode = mode
-        drawableView.isHidden = renderer != nil && standardOutput != .system
+        drawableView.isHidden = renderer != nil && standardOutput?.usesAVPlayer != true
         onOutputChange?()
     }
 
@@ -134,6 +137,7 @@ extension AppleFilePlaybackEngine: SwitchableVideoEngine {}
 
 protocol SystemOutputRetrying: AnyObject {
     @MainActor func retrySystemOutput()
+    @MainActor func retryAfterglowOutput()
 }
 
 final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting, SystemOutputRetrying {
@@ -142,7 +146,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     private var session: SwitchableVideoEngine?
     private weak var hostView: SBSPlaybackView?
     private(set) var currentOutput: MovieOutput?
-    private var systemFailed = false
+    private var failedAppleOutput: MovieOutput?
     private var reducedVLCFrameOutput = false
     private var systemStereo = false
     private let pickedFile: PickedVideoFile?
@@ -194,9 +198,9 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         newSession.onUpdate = { [weak self, weak newSession] snapshot in
             guard let self, !self.stopped, self.session === newSession else { return }
             self.diagnostics.observe(snapshot) { MainActor.assumeIsolated { self.rendererStatus } }
-            if self.currentOutput == .system, snapshot.phase == .failed, let host = self.hostView {
-                self.diagnostics.event("fallback system -> VLC (system session reported failure)")
-                self.systemFailed = true
+            if let output = self.currentOutput, output.usesAVPlayer, snapshot.phase == .failed, let host = self.hostView {
+                self.diagnostics.event("fallback \(output) -> VLC (system session reported failure)")
+                self.failedAppleOutput = output
                 // The failing input may be the first event, before it has a
                 // usable timestamp. Preserve the requested seek in that case.
                 if let seek = self.pendingSeek { self.seconds = seek }
@@ -278,7 +282,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
 
     @MainActor private func installVLCFrameSession() {
         let vlc = VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile,
-                                    reducedFrameOutput: reducedVLCFrameOutput)
+                                    reducedFrameOutput: reducedVLCFrameOutput,
+                                    preferSmallerPanoramaFrames: hostView.map { $0.mode != .standard } ?? false)
         vlc.diagnostics = diagnostics
         observe(vlc)
     }
@@ -286,10 +291,13 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     @MainActor private func reconcileOutput(_ host: SBSPlaybackView, attaching: Bool = false) {
         // A bare playback surface can be attached before the local URL is known.
         guard let output = host.standardOutput else { return }
-        let system = output == .system && !systemFailed
-        let next: MovieOutput = system ? .system : (host.renderer == nil ? .vlcNative : .vlcFrames)
+        let useRequestedOutput = output.usesAVPlayer && failedAppleOutput != output
+        let next: MovieOutput = useRequestedOutput ? output : (host.renderer == nil ? .vlcNative : .vlcFrames)
         diagnostics.setRoute(next, mode: host.mode)
         if next == currentOutput, let session {
+            if let vlc = session as? VLCPlaybackEngine, next == .vlcFrames {
+                vlc.preferSmallerPanoramaFrames = host.mode != .standard
+            }
             if attaching && next != .vlcFrames { session.attach(to: host.drawableView) }
             if let apple = session as? AppleFilePlaybackEngine {
                 configureSystemStereo(apple, host: host)
@@ -298,10 +306,11 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         }
         if phase == .failed { phase = .opening }
         retireSession()
+        host.renderer?.clear()
         currentOutput = next
         systemStereo = false
-        if next == .system {
-            let apple = AppleFilePlaybackEngine(pickedFile: pickedFile)
+        if next.usesAVPlayer {
+            let apple = AppleFilePlaybackEngine(pickedFile: pickedFile, afterglow: next == .afterglow)
             apple.diagnostics = diagnostics
             observe(apple)
             apple.attach(to: host.drawableView)
@@ -323,8 +332,17 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     }
 
     @MainActor func retrySystemOutput() {
-        systemFailed = false
-        if let hostView { reconcileOutput(hostView) }
+        retry(.system)
+    }
+
+    @MainActor func retryAfterglowOutput() {
+        retry(.afterglow)
+    }
+
+    @MainActor private func retry(_ output: MovieOutput) {
+        guard failedAppleOutput == output else { return }
+        failedAppleOutput = nil
+        if let hostView, hostView.standardOutput == output { reconcileOutput(hostView) }
     }
 
     @MainActor private func reopenAfterOutputChange(_ host: SBSPlaybackView) {
@@ -340,8 +358,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             try session.load(fileURL: file, startAt: seconds, paused: openingPaused)
             if resume { session.play(waitForPausedFrame: openingPaused) }
         } catch {
-            if currentOutput == .system {
-                systemFailed = true
+            if let output = currentOutput, output.usesAVPlayer {
+                failedAppleOutput = output
                 reconcileOutput(host)
                 return
             }
@@ -392,8 +410,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             diagnostics.beginInput(at: 0, differentFile: differentFile)
             try player.load(fileURL: fileURL)
         } catch {
-            guard currentOutput == .system, let hostView else { throw error }
-            systemFailed = true
+            guard let output = currentOutput, output.usesAVPlayer, let hostView else { throw error }
+            failedAppleOutput = output
             MainActor.assumeIsolated { reconcileOutput(hostView) }
         }
     }

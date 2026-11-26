@@ -316,25 +316,25 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         }
         playLocal(record)
     }
-    func playLocal(_ record: DownloadRecord, playlistIDs: [String]? = nil) {
+    func playLocal(_ record: DownloadRecord, playlistIDs: [String]? = nil, startMode: PlaybackStartMode = .standard) {
         guard playbackSession == nil && playback == nil else { return }
         do {
             // Freeze the caller's search/filter order before the player opens.
             // Legacy callers still get the complete local library in list order.
             let ids = playlistIDs ?? LocalLibraryOrder.newestFirst(completedCache,
                 completedAt: { $0.downloadedAt }).map(\.id)
-            let request = try localPlaybackRequest(for: record.id, playlistIDs: ids)
+            let request = try localPlaybackRequest(for: record.id, playlistIDs: ids, startMode: startMode)
             presentPlayback(request)
         } catch {
             errorMessage = error.localizedDescription
             reconcileFiles(ids: [record.id])
         }
     }
-    func playPickedFile(_ file: PickedVideoFile, startsInVR: Bool = false) throws {
+    func playPickedFile(_ file: PickedVideoFile, startMode: PlaybackStartMode = .standard) throws {
         guard playbackSession == nil && playback == nil else {
             throw ClientError("已有视频正在播放，请先关闭播放器。")
         }
-        presentPlayback(PlaybackRequest(pickedFile: file, startsInVR: startsInVR))
+        presentPlayback(PlaybackRequest(pickedFile: file, startMode: startMode))
     }
 
     private func presentPlayback(_ request: PlaybackRequest) {
@@ -345,12 +345,13 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
 
     // Compatibility accessor: metadata only; opening a target still validates it.
     var localPlaylistRecords: [DownloadRecord] { completedCache }
-    func localPlaybackRequest(for id: String, playlistIDs: [String]? = nil) throws -> PlaybackRequest {
+    func localPlaybackRequest(for id: String, playlistIDs: [String]? = nil,
+                              startMode: PlaybackStartMode = .standard) throws -> PlaybackRequest {
         guard let record = recordsByID[id],
               record.state == .complete, let file = disk?.verifiedFile(for: record) else {
             throw ClientError("本地文件缺失或下载未完成，请重新下载。")
         }
-        return try PlaybackRequest(key: record.id, title: record.video.name, url: file, playlistIDs: playlistIDs)
+        return try PlaybackRequest(key: record.id, title: record.video.name, url: file, playlistIDs: playlistIDs, startMode: startMode)
     }
     func transitionPlayback(from old: PlaybackRequest, to next: PlaybackRequest,
                             stopCurrent: () -> Void) throws {

@@ -39,6 +39,25 @@ ffmpeg -hide_banner -loglevel error -y -f lavfi \
 ffmpeg -hide_banner -loglevel error -y -stream_loop 3 -i "$pattern_dir/eyes8k.mp4" \
   -f lavfi -i 'sine=frequency=440:sample_rate=48000' -map 0:v:0 -map 1:a:0 \
   -t 8 -c:v copy -tag:v hvc1 -c:a aac -movflags +faststart stereo8k-replay.mp4
+# Full-height 8K at 60000/1001, matching the dimensions and time base of the
+# field report. Encode just six frames per color pair, then repeat closed GOPs.
+for pair in red-blue lime-yellow; do
+  left="${pair%-*}"
+  right="${pair#*-}"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi \
+    -i "color=$left:s=256x128:r=60000/1001,drawbox=x=128:y=0:w=128:h=128:c=$right:t=fill,scale=8192:4096:flags=neighbor" \
+    -frames:v 6 -c:v libx265 -preset ultrafast -pix_fmt yuv420p -tag:v hvc1 \
+    -x265-params 'pools=1:frame-threads=1:bframes=0:ref=1:keyint=6:log-level=error' "$pattern_dir/$pair.mp4"
+  for _ in {1..5}; do
+    echo "file '$pair.mp4'"
+    echo "duration 0.100100"
+  done >> "$pattern_dir/full8k.txt"
+done
+ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$pattern_dir/full8k.txt" \
+  -c copy -tag:v hvc1 "$pattern_dir/full8k-cycle.mp4"
+ffmpeg -hide_banner -loglevel error -y -stream_loop 11 -i "$pattern_dir/full8k-cycle.mp4" \
+  -f lavfi -i 'anullsrc=sample_rate=48000:channel_layout=mono' -map 0:v:0 -map 1:a:0 \
+  -t 12 -c:v copy -tag:v hvc1 -c:a aac -b:a 32k -movflags +faststart stereo8k60-full.mp4
 # A directional stereo panorama with independent eye colors, video motion and
 # a continuous audible tone. Encode a short GOP once and reuse it in the UI test.
 ffmpeg -hide_banner -loglevel error -y -f lavfi \

@@ -96,30 +96,35 @@ struct DownloadManifest: Codable {
     var records: [DownloadRecord]
 }
 
+enum PlaybackStartMode {
+    case standard, panorama, afterglow
+}
+
 struct PlaybackRequest: Identifiable {
     let id = UUID()
     let key: String
     let title: String
     let url: URL
     let pickedFile: PickedVideoFile?
-    let startsInVR: Bool
+    let startMode: PlaybackStartMode
     // The visible list captured at the tap, before playback can change watched
     // flags. nil keeps compatibility with standalone callers of this request.
     let playlistIDs: [String]?
-    init(key: String, title: String, url: URL, playlistIDs: [String]? = nil) throws {
+    init(key: String, title: String, url: URL, playlistIDs: [String]? = nil,
+         startMode: PlaybackStartMode = .standard) throws {
         try OfflineMediaPolicy.validateLocalFile(url)
         self.key = key
         self.title = title
         self.url = url
         self.playlistIDs = playlistIDs
         pickedFile = nil
-        startsInVR = false
+        self.startMode = startMode
     }
 
     // The Files picker already opened and validated this exact file. A provider
     // URL can move later; decoding uses the retained file instead of reopening it.
-    init(pickedFile: PickedVideoFile, startsInVR: Bool = false) {
-        self.startsInVR = startsInVR
+    init(pickedFile: PickedVideoFile, startMode: PlaybackStartMode = .standard) {
+        self.startMode = startMode
         self.pickedFile = pickedFile
         url = pickedFile.url
         title = pickedFile.url.lastPathComponent

@@ -14,6 +14,10 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     weak var diagnostics: PlaybackDiagnostics?
     private let pickedFile: PickedVideoFile?
     private let player = AVPlayer()
+    private let afterglow: Bool
+    private var preparingItem: AVPlayerItem?
+    private var afterglowSourceSize = CGSize.zero
+    private var firstFrameDeadline: DispatchWorkItem?
     private var surface: AppleVideoSurface?
     private var loader: PickedAssetResourceLoader?
     private var frameHandler: ((CVPixelBuffer) -> Void)?
@@ -38,7 +42,10 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private var trackDetails: String?
     private var reportedPlaybackStalls = 0
 
-    init(pickedFile: PickedVideoFile? = nil) { self.pickedFile = pickedFile }
+    init(pickedFile: PickedVideoFile? = nil, afterglow: Bool = false) {
+        self.pickedFile = pickedFile
+        self.afterglow = afterglow
+    }
 
     func attach(to view: UIView) {
         guard !stopped else { return }
@@ -53,7 +60,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                 view.addSubview(video)
             }
             surface = video
-            video.videoLayer.player = player
+            video.videoLayer.player = afterglow && frameHandler != nil ? nil : player
             displayObservation = video.videoLayer.observe(\.isReadyForDisplay, options: [.new]) { [weak self] _, _ in
                 DispatchQueue.main.async { self?.publish() }
             }
@@ -68,6 +75,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         // Keep the native display alive under the opaque stereo view. A ready
         // layer can be uncovered without an extra seek or decoder restart.
         let needsPreroll = MainActor.assumeIsolated {
+            if afterglow { surface?.videoLayer.player = handler == nil ? player : nil }
             installStereoOutput()
             guard returningToLayer, let old = surface, let host = old.superview,
                   !old.videoLayer.isReadyForDisplay else { return false }
@@ -83,14 +91,16 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         if needsPreroll, let item = player.currentItem { preroll(item) }
     }
 
-    @MainActor private func installStereoOutput(recovery: Bool = false) {
+    @MainActor private func installStereoOutput(on preparedItem: AVPlayerItem? = nil, recovery: Bool = false) {
         stereo?.stop()
         stereo = nil
-        guard let item = player.currentItem, let frameHandler else { return }
+        guard let item = preparedItem ?? player.currentItem, let frameHandler else { return }
+        let format = afterglow ? AfterglowMovieOutput.Format(source: afterglowSourceSize, sdr: isSDR,
+                                                             fps: frameRate, recovery: recovery) : nil
         var first = true
         stereo = AppleStereoFrameOutput(item: item, recovery: recovery, preferBiPlanar: { [weak self] in
             self?.isSDR == true
-        }, onAttach: { [weak self, weak item] in
+        }, afterglowFormat: format, onAttach: { [weak self, weak item] in
             // Item size, and hence the stereo output, can become available
             // several event turns after the user paused. Preroll it after attach.
             DispatchQueue.main.async {
@@ -102,6 +112,8 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             self.diagnostics?.decodedFrame(buffer, pts: pts)
             frameHandler(buffer)
             if first {
+                self.firstFrameDeadline?.cancel()
+                self.firstFrameDeadline = nil
                 first = false
                 DispatchQueue.main.async { [weak self] in self?.publish() }
             }
@@ -144,8 +156,15 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         wantsPlayback = false
         pendingSeek = seconds.isFinite && seconds > 0 ? seconds : nil
         let item = AVPlayerItem(asset: asset)
-        player.replaceCurrentItem(with: item)
-        MainActor.assumeIsolated { installStereoOutput() }
+        if afterglow {
+            // Afterglow attaches its packed output before handing the item to AVPlayer.
+            // Read the local video geometry first so an 8K BGRA surface is never
+            // requested by default while waiting for AVPlayerItem.presentationSize.
+            preparingItem = item
+        } else {
+            player.replaceCurrentItem(with: item)
+            MainActor.assumeIsolated { installStereoOutput() }
+        }
         observations = [
             item.observe(\.status, options: [.initial, .new]) { [weak self, weak item] _, _ in
                 DispatchQueue.main.async {
@@ -182,27 +201,55 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         trackCheck = Task { @MainActor [weak self, weak item] in
             guard let item else { return }
             do {
-                for track in try await item.asset.loadTracks(withMediaType: .video) {
-                    if try await track.load(.isDecodable) {
+                let tracks = try await item.asset.loadTracks(withMediaType: .video)
+                for track in tracks {
+                    let decodable = try await track.load(.isDecodable)
+                    // Some packed HEVC files report an unsupported track before
+                    // output negotiation. On the explicit Afterglow route try a
+                    // real frame, bounded by the first-picture watchdog.
+                    if decodable || (self?.afterglow == true && tracks.count == 1) {
                         let formats = try? await track.load(.formatDescriptions)
                         let rate = try? await track.load(.nominalFrameRate)
                         let range = try? await track.load(.timeRange)
                         let bitRate = try? await track.load(.estimatedDataRate)
-                        guard !Task.isCancelled, let self, self.player.currentItem === item else { return }
+                        let size = try? await track.load(.naturalSize)
+                        guard !Task.isCancelled, let self,
+                              self.player.currentItem === item || self.preparingItem === item else { return }
                         self.frameRate = rate
                         self.videoTimeRange = range
                         self.isSDR = Self.supportsSDRConversion(formats?.first)
                         self.trackDetails = Self.videoDescription(format: formats?.first, rate: rate, bitRate: bitRate)
+                        if self.preparingItem === item {
+                            self.afterglowSourceSize = size ?? .zero
+                            if let format = formats?.first {
+                                let display = CMVideoFormatDescriptionGetPresentationDimensions(format,
+                                    usePixelAspectRatio: true, useCleanAperture: true)
+                                if display.width > 0, display.height > 0 { self.afterglowSourceSize = display }
+                            }
+                            guard AfterglowMovieOutput.Format(source: self.afterglowSourceSize, sdr: self.isSDR,
+                                                               fps: rate, recovery: false) != nil else {
+                                self.failure = "Afterglow XR 无法读取该片的视频尺寸。"
+                                self.publish()
+                                return
+                            }
+                            self.diagnostics?.event("Afterglow: packed movie output; trackDecodable=\(decodable)")
+                            self.installStereoOutput(on: item)
+                            self.player.replaceCurrentItem(with: item)
+                            self.preparingItem = nil
+                            self.applyIntent()
+                        }
                         self.publish()
                         return
                     }
                 }
-                guard !Task.isCancelled, let self, self.player.currentItem === item else { return }
+                guard !Task.isCancelled, let self,
+                      self.player.currentItem === item || self.preparingItem === item else { return }
                 self.diagnostics?.event("AV: no decodable video track")
                 self.failure = "系统播放器没有找到可解码的视频轨道。"
                 self.publish()
             } catch {
-                guard !Task.isCancelled, let self, self.player.currentItem === item else { return }
+                guard !Task.isCancelled, let self,
+                      self.player.currentItem === item || self.preparingItem === item else { return }
                 self.failure = error.localizedDescription
                 self.publish()
             }
@@ -256,20 +303,26 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     func play() { play(waitForPausedFrame: false) }
 
     func play(waitForPausedFrame: Bool) {
-        guard !stopped, player.currentItem != nil else { return }
+        guard !stopped, player.currentItem != nil || preparingItem != nil else { return }
         wantsPlayback = !waitForPausedFrame
+        checkAfterglowStartup()
         applyIntent()
     }
 
     func pause() {
         wantsPlayback = false
+        firstFrameDeadline?.cancel()
+        firstFrameDeadline = nil
         player.pause()
         frameWatch.interrupt()
         stallCheck?.cancel()
     }
 
     func seek(to seconds: Double) {
-        guard seconds.isFinite, !stopped, player.currentItem != nil else { return }
+        guard seconds.isFinite, !stopped, player.currentItem != nil || preparingItem != nil else { return }
+        firstFrameDeadline?.cancel()
+        firstFrameDeadline = nil
+        checkAfterglowStartup()
         pendingSeek = max(0, seconds)
         seekGeneration += 1
         seeking = false
@@ -327,8 +380,29 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: check)
     }
 
+    // An item can also wait with a stationary audio clock. Bound startup for
+    // the explicit XR route even in that case. Reset on a new seek/pause/input.
+    private func checkAfterglowStartup() {
+        guard afterglow, frameHandler != nil, firstFrameDeadline == nil, wantsPlayback,
+              !stopped, !ended, failure == nil, stereo?.hasVideoFrame != true,
+              visibleInForeground, let item = player.currentItem ?? preparingItem else { return }
+        let work = DispatchWorkItem { [weak self, weak item] in
+            guard let self, let item else { return }
+            self.firstFrameDeadline = nil
+            guard self.player.currentItem === item || self.preparingItem === item,
+                  self.frameHandler != nil, self.wantsPlayback, !self.stopped, !self.ended,
+                  self.failure == nil, self.visibleInForeground, self.stereo?.hasVideoFrame != true else { return }
+            self.diagnostics?.event("Afterglow: no first picture within 15s; requesting decoder fallback")
+            self.failure = "Afterglow XR 等待首帧超时。"
+            self.publish()
+        }
+        firstFrameDeadline = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: work)
+    }
+
     private func publish() {
-        guard !stopped, let item = player.currentItem else { return }
+        guard !stopped, let item = player.currentItem ?? preparingItem else { return }
+        checkAfterglowStartup()
         let duration = item.duration.seconds
         let clock = item.currentTime().seconds
         let projected = stereo != nil
@@ -388,6 +462,10 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     }
 
     private func retireItem() {
+        firstFrameDeadline?.cancel()
+        firstFrameDeadline = nil
+        preparingItem = nil
+        afterglowSourceSize = .zero
         observations.removeAll()
         notifications.forEach { NotificationCenter.default.removeObserver($0) }
         notifications.removeAll()

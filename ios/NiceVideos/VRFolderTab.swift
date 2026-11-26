@@ -6,16 +6,18 @@ import UIKit
 
 @MainActor struct VRFolderTab: View {
     @StateObject private var library: VRFolderLibrary
-    let onPlay: (PickedVideoFile) -> Void
+    let onPlay: (PickedVideoFile, PlaybackStartMode) -> Void
 
     @State private var picker: PickerTarget?
+    @State private var showsAfterglowSettings = false
+    @State private var pendingVideo: (PickedVideoFile.Selection, PlaybackStartMode)?
     @State private var restored = false
     @State private var pendingRemoval: VRFolderRoot?
     @State private var openTask: Task<Void, Never>?
     @State private var openingID: String?
     @State private var playbackError: String?
 
-    init(onPlay: @escaping (PickedVideoFile) -> Void) {
+    init(onPlay: @escaping (PickedVideoFile, PlaybackStartMode) -> Void) {
         self.onPlay = onPlay
         #if DEBUG
         _library = StateObject(wrappedValue: VRFolderLibrary(defaults: VRFolderUITestFixture.isolatedDefaults ?? .standard))
@@ -27,11 +29,11 @@ import UIKit
     private static let background = Color(red: 0.045, green: 0.047, blue: 0.058)
     private static let panel = Color(red: 0.095, green: 0.100, blue: 0.117)
     private enum PickerTarget: Identifiable {
-        case folder(UUID?), video
+        case folder(UUID?), video(PlaybackStartMode)
         var id: String {
             switch self {
             case .folder(let id): return "folder-" + (id?.uuidString ?? "new")
-            case .video: return "video"
+            case .video(let mode): return mode == .afterglow ? "afterglowVideo" : "video"
             }
         }
     }
@@ -39,6 +41,7 @@ import UIKit
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
+                afterglowActions
                 if library.currentRoot == nil { sources }
                 if library.currentRoot != nil { folderHeader }
                 if let message = library.errorMessage {
@@ -70,20 +73,26 @@ import UIKit
                 ToolbarItem(placement: .topBarTrailing) { folderMenu(root) }
             }
         }
-        .sheet(item: $picker) { target in
+        .sheet(item: $picker, onDismiss: {
+            if let (selection, mode) = pendingVideo {
+                pendingVideo = nil
+                open(selection, id: UUID().uuidString, startMode: mode)
+            }
+        }) { target in
             switch target {
             case .folder(let prior):
                 VRDirectoryPicker { url in
                     if let url { library.authorize(url, replacing: prior) }
                     picker = nil
                 }
-            case .video:
+            case .video(let mode):
                 VideoDocumentPicker { selection in
+                    if let selection { pendingVideo = (selection, mode) }
                     picker = nil
-                    if let selection { open(selection, id: UUID().uuidString) }
                 }
             }
         }
+        .sheet(isPresented: $showsAfterglowSettings) { AfterglowPresetView() }
         .alert("无法打开视频", isPresented: Binding(get: { playbackError != nil },
                                                set: { if !$0 { playbackError = nil } })) {
             Button("好", role: .cancel) {}
@@ -104,13 +113,36 @@ import UIKit
         .onDisappear { cancelOpen() }
     }
 
+    private var afterglowActions: some View {
+        HStack(spacing: 8) {
+            Button {
+                cancelOpen()
+                picker = .video(.afterglow)
+            } label: {
+                Label("Afterglow XR 播放", systemImage: "eyeglasses")
+                    .font(.headline).frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityHint("选择一个视频并按预设直接播放")
+            .accessibilityIdentifier("afterglowOpenVideo")
+            Button { showsAfterglowSettings = true } label: {
+                Label("预设", systemImage: "slider.horizontal.3").frame(minHeight: 44)
+            }
+            .accessibilityLabel("Afterglow XR 播放预设")
+            .accessibilityIdentifier("afterglowOpenSettings")
+        }
+        .buttonStyle(.plain).padding(.horizontal, 16)
+        .background(Self.panel, in: RoundedRectangle(cornerRadius: 14))
+        .padding(.top, 12)
+    }
+
     private var sources: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 10) {
                 sourceCard("选择文件夹", detail: "浏览文件夹里的影片", icon: "folder.fill",
                            color: .cyan, id: "vrChooseFolderButton") { chooseFolder() }
                 sourceCard("打开视频", detail: "从「文件」直接播放", icon: "play.rectangle.fill",
-                           color: .mint, id: "vrOpenVideoButton") { cancelOpen(); picker = .video }
+                           color: .mint, id: "vrOpenVideoButton") { cancelOpen(); picker = .video(.panorama) }
             }
             if !library.roots.isEmpty {
                 Text("我的文件夹").font(.title3.bold()).padding(.top, 12)
@@ -186,12 +218,19 @@ import UIKit
                                    description: Text("可以从上一级选择其他文件夹。"))
         } else {
             ForEach(library.entries) { entry in
-                VRFolderEntryRow(entry: entry, isOpening: openingID == entry.id,
-                                 lease: { try? library.selection(for: entry) }) {
-                    if entry.isDirectory { cancelOpen(); library.enter(entry) }
-                    else {
-                        do { open(try library.selection(for: entry), id: entry.id) }
-                        catch { playbackError = error.localizedDescription }
+                HStack(spacing: 4) {
+                    VRFolderEntryRow(entry: entry, isOpening: openingID == entry.id,
+                                     lease: { try? library.selection(for: entry) }) {
+                        if entry.isDirectory { cancelOpen(); library.enter(entry) }
+                        else { play(entry, startMode: .panorama) }
+                    }
+                    if !entry.isDirectory {
+                        Button { play(entry, startMode: .afterglow) } label: {
+                            Image(systemName: "eyeglasses").frame(width: 44, height: 48)
+                        }
+                        .buttonStyle(.plain).foregroundStyle(.mint)
+                        .accessibilityLabel("用 Afterglow XR 播放 " + entry.name)
+                        .accessibilityIdentifier("afterglowEntry-" + entry.name)
                     }
                 }
                 Divider().overlay(.white.opacity(0.09))
@@ -230,7 +269,12 @@ import UIKit
         picker = .folder(prior)
     }
 
-    private func open(_ selection: PickedVideoFile.Selection, id: String) {
+    private func play(_ entry: VRFolderEntry, startMode: PlaybackStartMode) {
+        do { open(try library.selection(for: entry), id: entry.id, startMode: startMode) }
+        catch { playbackError = error.localizedDescription }
+    }
+
+    private func open(_ selection: PickedVideoFile.Selection, id: String, startMode: PlaybackStartMode) {
         cancelOpen()
         openingID = id
         openTask = Task { @MainActor in
@@ -239,7 +283,7 @@ import UIKit
                 try Task.checkCancellation()
                 openingID = nil
                 openTask = nil
-                onPlay(file)
+                onPlay(file, startMode)
             } catch {
                 guard !Task.isCancelled else { return }
                 openingID = nil

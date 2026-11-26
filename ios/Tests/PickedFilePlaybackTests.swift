@@ -1,3 +1,4 @@
+import Metal
 import UIKit
 import XCTest
 @testable import NiceVideos
@@ -63,6 +64,81 @@ final class PickedFilePlaybackTests: XCTestCase {
         await fulfillment(of: [playing], timeout: 15)
         XCTAssertEqual(engine.currentOutput, .vlcNative)
         XCTAssertTrue(errors.isEmpty, "System failure escaped before fallback: \(errors)")
+    }
+
+    func testAfterglowRendersMovingPicturesInBothEyesFromOffsetsBeyond4GiB() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
+        try makeLargeMovie(at: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let source = try await PickedVideoFile.open(url)
+        XCTAssertGreaterThan(source.byteCount, UInt64(UInt32.max))
+        // File providers may replace the URL after it is opened. The player must
+        // continue to read the original (sparse) document through its descriptor.
+        try Data("replacement".utf8).write(to: url, options: .atomic)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        host.configure(mode: .immersive(.vr360, .sideBySide, headset: true), standardOutput: .afterglow)
+        let engine = SBSPlaybackEngine(pickedFile: source)
+        defer { engine.stop(); window.isHidden = true }
+        var state = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { state = $0 }
+        engine.attach(to: host)
+        try engine.load(fileURL: url)
+        engine.play()
+        let renderer = try XCTUnwrap(host.renderer)
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 64, height: 32,
+                                                                   mipmapped: false)
+        descriptor.storageMode = .shared
+        descriptor.usage = .renderTarget
+        let target = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        func eyePixels() throws -> [[UInt8]] {
+            let command = try XCTUnwrap(queue.makeCommandBuffer())
+            XCTAssertTrue(renderer.encodeMovie(pass: pass, command: command))
+            command.commit()
+            command.waitUntilCompleted()
+            XCTAssertEqual(command.status, .completed)
+            return [0, 32].map { x in
+                var bytes = [UInt8](repeating: 0, count: 32 * 32 * 4)
+                bytes.withUnsafeMutableBytes {
+                    target.getBytes($0.baseAddress!, bytesPerRow: 32 * 4,
+                                    from: MTLRegionMake2D(x, 0, 32, 32), mipmapLevel: 0)
+                }
+                return bytes
+            }
+        }
+        var baseline: [[UInt8]]?
+        var sampledID: UInt64 = 0
+        var seekRequested = false
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            if state.videoOutput == .afterglow && state.phase == .playing &&
+                state.seekable && renderer.acceptedFrameID > sampledID {
+                sampledID = renderer.acceptedFrameID
+                if !seekRequested {
+                    seekRequested = true
+                    engine.seek(to: 5)
+                } else if state.seconds > 5.15 {
+                    let pixels = try eyePixels()
+                    if let baseline, pixels[0] != baseline[0], pixels[1] != baseline[1],
+                       pixels[0] != pixels[1] { return }
+                    if baseline == nil { baseline = pixels }
+                }
+            }
+            try await Task.sleep(nanoseconds: 80_000_000)
+        }
+        XCTFail("No moving Afterglow picture in both eye viewports after seeking: " +
+                (engine.playbackDiagnosticReport() ?? ""))
     }
 
     func testPickedMovieBeyond4GiBPlaysAndSeeksAfterItsProviderReplacesThePath() async throws {

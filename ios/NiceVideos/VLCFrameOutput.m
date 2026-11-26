@@ -13,7 +13,7 @@
 - (instancetype)initWithHandler:(NICEVLCFrameHandler)handler;
 - (void)enqueue:(CVPixelBufferRef)frame forMedia:(id<NICEVLCTrackSource>)media;
 - (void)recordBufferMissForMedia:(id<NICEVLCTrackSource>)media;
-- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge;
+- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge limit:(unsigned)limit;
 @end
 
 @implementation NICEVLCFrameDelivery {
@@ -60,11 +60,12 @@
     }
 }
 
-- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge {
+- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge limit:(unsigned)limit {
     @synchronized (self) {
         if (_handler && media == _sourceMedia) {
             _frameStats.formatSetups++;
             _frameStats.outputLongEdge = longEdge;
+            _frameStats.negotiatedLimit = limit;
         }
     }
 }
@@ -267,7 +268,15 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         id<NICEVLCTrackSource> source = delivery.sourceMedia;
         NICEFrameGeometry geometry = NICEVisibleGeometry(source, *width, *height);
         // Bound the CPU color conversion and IOSurface allocations for 4K/8K sources.
-        const double scale = MIN(1.0, (double)delivery.maximumLongEdge / MAX(geometry.width, geometry.height));
+        unsigned limit = delivery.maximumLongEdge;
+        if (delivery.preferSmallerPanoramaFrames &&
+            MAX(geometry.width, geometry.height) >= 7680 && MIN(geometry.width, geometry.height) >= 3840) {
+            // A full-height 8K panorama has twice as many source pixels as the
+            // 8192x2048 SBS profile. Bound vmem's scale/conversion cost from the
+            // first callback. An explicit recovery session can request less.
+            limit = MIN(limit, 1600u);
+        }
+        const double scale = MIN(1.0, (double)limit / MAX(geometry.width, geometry.height));
         *width = geometry.width = (unsigned)MAX(1.0, round(geometry.width * scale));
         *height = geometry.height = (unsigned)MAX(1.0, round(geometry.height * scale));
         NICEVLCFrameFormat *format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry source:source delivery:delivery];
@@ -276,7 +285,7 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         pitches[0] = (unsigned)format.pitch;
         lines[0] = *height;
         *opaque = (void *)CFBridgingRetain(format);
-        [delivery recordFormatSetupForMedia:source longEdge:MAX(*width, *height)];
+        [delivery recordFormatSetupForMedia:source longEdge:MAX(*width, *height) limit:limit];
         return 1;
     }
 }
