@@ -87,5 +87,8 @@ final class MetalMovieFrameTests: XCTestCase {
         // Offscreen draw success must never count as actual screen presentation.
         XCTAssertEqual(view.presentedFrameID, 0)
         XCTAssertTrue(view.frameDiagnostics.contains("input=32x16:420v"))
+        #if targetEnvironment(simulator)
+        XCTAssertTrue(view.frameDiagnostics.contains("presentID=NA presentAgeSec=NA presentation=unavailable-on-simulator"))
+        #endif
     }
 }

@@ -124,8 +124,13 @@ final class SBSMetalView: UIView, MTKViewDelegate {
 
         var summary: String {
             lock.withLock {
+                #if targetEnvironment(simulator)
+                let presentation = "presentID=NA presentAgeSec=NA presentation=unavailable-on-simulator"
+                #else
                 let age = presentationTime > 0 ? String(format: "%.2f", max(0, CACurrentMediaTime() - presentationTime)) : "NA"
-                return "completeID=\(completedID) presentID=\(presentedID) presentAgeSec=\(age) gpuFailures=\(failures) gpuError=\(lastError)"
+                let presentation = "presentID=\(presentedID) presentAgeSec=\(age)"
+                #endif
+                return "completeID=\(completedID) \(presentation) gpuFailures=\(failures) gpuError=\(lastError)"
             }
         }
     }
@@ -392,9 +397,11 @@ final class SBSMetalView: UIView, MTKViewDelegate {
                 }
             }
         }
+        #if !targetEnvironment(simulator)
         drawable.addPresentedHandler { [gpuProgress] shown in
             gpuProgress.presented(id: id, time: shown.presentedTime)
         }
+        #endif
         command.present(drawable)
         needsDraw = false
         command.commit()
