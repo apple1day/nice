@@ -22,6 +22,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.UUID;
 import org.json.JSONObject;
 import org.junit.Test;
@@ -122,13 +124,17 @@ public final class LegacyDownloadMigrationTest {
         fail("Missing enabled UI control: " + label);
     }
 
-    private boolean exportedFileExists(Uri document) throws IOException {
-        try (InputStream in = app.getContentResolver().openInputStream(document)) {
-            return in != null;
-        } catch (java.io.FileNotFoundException | SecurityException notReady) {
-            // DocumentsUI may still be returning the grant or the export may still be copying.
-            return false;
+    private Set<String> exportNames(Uri tree) {
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+        Set<String> names = new HashSet<>();
+        try (Cursor c = app.getContentResolver().query(children,
+                new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
+            assertNotNull(c);
+            while (c.moveToNext()) names.add(c.getString(0));
+        } catch (SecurityException waitingForGrant) {
+            // The picker may still be returning its URI grant to MainActivity.
         }
+        return names;
     }
 
     @Test public void bulkExportToSystemSelectedFolderKeepsBothSourcesAndReusesVerifiedCopy() throws Exception {
@@ -180,21 +186,19 @@ public final class LegacyDownloadMigrationTest {
                 Uri copied = DocumentsContract.buildDocumentUriUsingTree(tree, folderId + "/" + copy);
                 Uri copiedPublic = DocumentsContract.buildDocumentUriUsingTree(tree, folderId + "/" + publicName);
                 long timeout = SystemClock.elapsedRealtime() + 15000;
-                while ((!exportedFileExists(copied) || !exportedFileExists(copiedPublic)) &&
-                        SystemClock.elapsedRealtime() < timeout)
+                Set<String> files = exportNames(tree);
+                while (!(files.contains(copy) && files.contains(publicName)) && SystemClock.elapsedRealtime() < timeout) {
                     SystemClock.sleep(100);
+                    files = exportNames(tree);
+                }
+                assertTrue("Expected both exports in " + files, files.contains(copy) && files.contains(publicName));
                 assertBytes(occupied, "new".getBytes(StandardCharsets.UTF_8));
                 assertBytes(copied, original);
                 assertBytes(copiedPublic, modern);
                 MovieExporter.Result repeated = new MovieExporter(library).export(old.id, tree);
                 assertTrue(repeated.existing);
                 assertEquals(copy, repeated.name);
-                Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, folderId);
-                try (Cursor files = app.getContentResolver().query(children,
-                        new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
-                    assertNotNull(files);
-                    assertEquals(3, files.getCount());
-                }
+                assertEquals(3, exportNames(tree).size());
                 assertBytes(library.uri(publicEntry), modern);
                 assertArrayEquals(original, Files.readAllBytes(library.file(old).toPath()));
                 assertEquals(oldRecord, library.prefs.getString("movie." + old.id, null));

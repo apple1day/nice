@@ -37,6 +37,7 @@ jobs:
         working-directory: android
         run: ./gradlew --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest
       - name: Verify the installable APK
+        id: verify_apk
         working-directory: android
         run: |
           set -euo pipefail
@@ -60,7 +61,8 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: cd android && ./gradlew :app:connectedDebugAndroidTest
-      - name: Verify the published 1.2.0 USB upgrade on Android 15
+      - name: Verify exports and upgrades from the published 1.2.0 APK on Android 15
+        if: ${{ !cancelled() && steps.verify_apk.outcome == 'success' }}
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
