@@ -38,17 +38,25 @@ final class SBSPlaybackEngineTests: XCTestCase {
         XCTAssertTrue(paused)
         let before = latest.seconds
         host.mode = .immersive(.vr360, .sideBySide, headset: true)
-        let resized = try await waitFor {
-            latest.phase == .paused && capture().contains("loadID=2") && capture().contains("buffer=1600x800")
-        }
-        XCTAssertTrue(resized, engine.playbackDiagnosticReport() ?? "")
-        XCTAssertEqual(latest.seconds, before, accuracy: 0.5)
+        let renderer = try XCTUnwrap(host.renderer)
+        let pausedFrame = renderer.acceptedFrameID
+        XCTAssertGreaterThan(pausedFrame, 0)
+        let pausedReport = capture()
+        XCTAssertTrue(pausedReport.contains("loadID=1") && pausedReport.contains("buffer=2560x1280"), pausedReport)
+        XCTAssertEqual(latest.phase, .paused)
+        XCTAssertEqual(latest.seconds, before, accuracy: 0.15)
         host.mode = .immersive(.vr180, .sideBySide, headset: false)
         host.mode = .immersive(.vr360, .sideBySide, headset: true)
-        XCTAssertTrue(capture().contains("loadID=2"), capture())
+        XCTAssertTrue(capture().contains("loadID=1"), capture())
         engine.play()
-        let resumed = try await waitFor { latest.phase == .playing && latest.seconds > before + 0.3 }
-        XCTAssertTrue(resumed, capture())
+        let resized = try await waitFor {
+            guard latest.phase == .playing, latest.seconds > before + 0.3,
+                  renderer.acceptedFrameID >= pausedFrame + 2 else { return false }
+            let report = capture()
+            return report.contains("loadID=2") && report.contains("buffer=1600x800")
+        }
+        XCTAssertTrue(resized, engine.playbackDiagnosticReport() ?? "")
+        host.mode = .immersive(.vr180, .sideBySide, headset: true)
         XCTAssertTrue(capture().contains("loadID=2"), capture())
     }
 

@@ -327,12 +327,16 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     }
 
     @MainActor private func reopenOversizedPanorama(_ vlc: VLCPlaybackEngine, host: SBSPlaybackView) -> Bool {
-        guard currentOutput == .vlcFrames, host.mode != .standard, hasStarted,
+        // A paused VLC input can negotiate its format while producing no
+        // picture. Reproject its current frame immediately and defer the
+        // quality change until play() explicitly resumes this same position.
+        guard currentOutput == .vlcFrames, host.mode != .standard, hasStarted, wantsPlayback,
               phase == .playing || phase == .paused, !awaitingOutput, !openingPaused,
               pendingSeek == nil, vlc.needsPanoramaRenegotiation() else { return false }
         diagnostics.event("VLC: resizing existing full-height 8K output for panorama at \(seconds)s")
         retireSession()
-        host.renderer?.clear()
+        // Same movie and position: keep the existing texture visible until
+        // the first smaller frame is delivered by the replacement session.
         installVLCFrameSession()
         reopenAfterOutputChange(host)
         return true
@@ -435,6 +439,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         guard !stopped, file != nil else { return }
         wantsPlayback = true
         hasStarted = true
+        if let vlc = session as? VLCPlaybackEngine, let host = hostView,
+           MainActor.assumeIsolated({ reopenOversizedPanorama(vlc, host: host) }) { return }
         session?.play()
     }
 
