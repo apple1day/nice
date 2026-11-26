@@ -28,8 +28,10 @@ final class AfterglowMovieOutput {
     }
 
     let output: AVPlayerItemVideoOutput
+    private weak var item: AVPlayerItem?
 
     init(item: AVPlayerItem, format: Format) {
+        self.item = item
         let attributes: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: format.biPlanar
                 ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA,
@@ -45,7 +47,9 @@ final class AfterglowMovieOutput {
     /// Pull only the latest picture for this display time, as in VideoPlayer.frame(at:).
     /// The optional first-frame pull also supports a paused seek to the start.
     func frame(at hostTime: CFTimeInterval, allowFirst: Bool) -> (CVPixelBuffer, CMTime)? {
-        let itemTime = output.itemTime(forHostTime: hostTime)
+        let scheduled = output.itemTime(forHostTime: hostTime)
+        // A paused or newly flushed output may have no host-to-item mapping yet.
+        let itemTime = scheduled.isNumeric ? scheduled : (item?.currentTime() ?? .invalid)
         guard itemTime.isNumeric, allowFirst || output.hasNewPixelBuffer(forItemTime: itemTime) else { return nil }
         var pts = CMTime.invalid
         guard let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &pts) else { return nil }

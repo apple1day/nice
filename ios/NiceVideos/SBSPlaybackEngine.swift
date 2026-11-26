@@ -256,6 +256,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             }
             self.seconds = visible.seconds
             self.phase = visible.phase
+            if let vlc = newSession as? VLCPlaybackEngine, let host = self.hostView,
+               MainActor.assumeIsolated({ self.reopenOversizedPanorama(vlc, host: host) }) { return }
             self.onUpdate?(visible)
         }
     }
@@ -297,6 +299,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         if next == currentOutput, let session {
             if let vlc = session as? VLCPlaybackEngine, next == .vlcFrames {
                 vlc.preferSmallerPanoramaFrames = host.mode != .standard
+                if reopenOversizedPanorama(vlc, host: host) { return }
             }
             if attaching && next != .vlcFrames { session.attach(to: host.drawableView) }
             if let apple = session as? AppleFilePlaybackEngine {
@@ -321,6 +324,18 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             nativeSession().attach(to: host.drawableView)
         }
         reopenAfterOutputChange(host)
+    }
+
+    @MainActor private func reopenOversizedPanorama(_ vlc: VLCPlaybackEngine, host: SBSPlaybackView) -> Bool {
+        guard currentOutput == .vlcFrames, host.mode != .standard, hasStarted,
+              phase == .playing || phase == .paused, !awaitingOutput, !openingPaused,
+              pendingSeek == nil, vlc.needsPanoramaRenegotiation() else { return false }
+        diagnostics.event("VLC: resizing existing full-height 8K output for panorama at \(seconds)s")
+        retireSession()
+        host.renderer?.clear()
+        installVLCFrameSession()
+        reopenAfterOutputChange(host)
+        return true
     }
 
     @MainActor private func configureSystemStereo(_ apple: AppleFilePlaybackEngine, host: SBSPlaybackView) {

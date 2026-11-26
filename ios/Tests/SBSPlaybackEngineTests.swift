@@ -4,6 +4,54 @@ import UIKit
 
 @MainActor
 final class SBSPlaybackEngineTests: XCTestCase {
+    func testRunningVLCMemoryOutputRenegotiatesFullHeight8KOnlyWhenEnteringPanorama() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "stereo8k60-full", withExtension: "mp4", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        host.configure(mode: .standard, standardOutput: .vlcFrames)
+        let engine = SBSPlaybackEngine()
+        var latest = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { latest = $0 }
+        defer { engine.stop(); window.isHidden = true }
+        engine.attach(to: host)
+        try engine.load(fileURL: file)
+        engine.play()
+
+        func waitFor(_ predicate: () -> Bool) async throws -> Bool {
+            let deadline = Date().addingTimeInterval(15)
+            while !predicate() && Date() < deadline { try await Task.sleep(nanoseconds: 80_000_000) }
+            return predicate()
+        }
+        func capture() -> String { engine.playbackDiagnosticReport()?.components(separatedBy: "\n").last ?? "" }
+        let ordinary = try await waitFor {
+            latest.seekable && latest.seconds > 0.25 && capture().contains("buffer=2560x1280")
+        }
+        XCTAssertTrue(ordinary, capture())
+        guard ordinary else { return }
+        engine.pause()
+        let paused = try await waitFor { latest.phase == .paused }
+        XCTAssertTrue(paused)
+        let before = latest.seconds
+        host.mode = .immersive(.vr360, .sideBySide, headset: true)
+        let resized = try await waitFor {
+            latest.phase == .paused && capture().contains("loadID=2") && capture().contains("buffer=1600x800")
+        }
+        XCTAssertTrue(resized, engine.playbackDiagnosticReport() ?? "")
+        XCTAssertEqual(latest.seconds, before, accuracy: 0.5)
+        host.mode = .immersive(.vr180, .sideBySide, headset: false)
+        host.mode = .immersive(.vr360, .sideBySide, headset: true)
+        XCTAssertTrue(capture().contains("loadID=2"), capture())
+        engine.play()
+        let resumed = try await waitFor { latest.phase == .playing && latest.seconds > before + 0.3 }
+        XCTAssertTrue(resumed, capture())
+        XCTAssertTrue(capture().contains("loadID=2"), capture())
+    }
+
     func testPausedMKVReopensAtItsPositionAndResumesAfterLeavingVR() async throws {
         let file = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "offline", withExtension: "mkv", subdirectory: "Fixtures"))

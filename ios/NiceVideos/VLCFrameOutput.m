@@ -13,7 +13,8 @@
 - (instancetype)initWithHandler:(NICEVLCFrameHandler)handler;
 - (void)enqueue:(CVPixelBufferRef)frame forMedia:(id<NICEVLCTrackSource>)media;
 - (void)recordBufferMissForMedia:(id<NICEVLCTrackSource>)media;
-- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge limit:(unsigned)limit;
+- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge limit:(unsigned)limit
+                  panoramaLimit:(unsigned)panoramaLimit;
 @end
 
 @implementation NICEVLCFrameDelivery {
@@ -60,12 +61,14 @@
     }
 }
 
-- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge limit:(unsigned)limit {
+- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge limit:(unsigned)limit
+                  panoramaLimit:(unsigned)panoramaLimit {
     @synchronized (self) {
         if (_handler && media == _sourceMedia) {
             _frameStats.formatSetups++;
             _frameStats.outputLongEdge = longEdge;
             _frameStats.negotiatedLimit = limit;
+            _frameStats.panoramaLimit = panoramaLimit;
         }
     }
 }
@@ -268,14 +271,12 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         id<NICEVLCTrackSource> source = delivery.sourceMedia;
         NICEFrameGeometry geometry = NICEVisibleGeometry(source, *width, *height);
         // Bound the CPU color conversion and IOSurface allocations for 4K/8K sources.
-        unsigned limit = delivery.maximumLongEdge;
-        if (delivery.preferSmallerPanoramaFrames &&
-            MAX(geometry.width, geometry.height) >= 7680 && MIN(geometry.width, geometry.height) >= 3840) {
-            // A full-height 8K panorama has twice as many source pixels as the
-            // 8192x2048 SBS profile. Bound vmem's scale/conversion cost from the
-            // first callback. An explicit recovery session can request less.
-            limit = MIN(limit, 1600u);
-        }
+        // Compute the panorama cap even in standard mode. The same VLC vout
+        // can survive a projection change without negotiating another format.
+        unsigned normalLimit = delivery.maximumLongEdge;
+        BOOL fullHeight8K = MAX(geometry.width, geometry.height) >= 7680 && MIN(geometry.width, geometry.height) >= 3840;
+        unsigned panoramaLimit = fullHeight8K ? MIN(normalLimit, 1600u) : normalLimit;
+        unsigned limit = delivery.preferSmallerPanoramaFrames ? panoramaLimit : normalLimit;
         const double scale = MIN(1.0, (double)limit / MAX(geometry.width, geometry.height));
         *width = geometry.width = (unsigned)MAX(1.0, round(geometry.width * scale));
         *height = geometry.height = (unsigned)MAX(1.0, round(geometry.height * scale));
@@ -285,7 +286,7 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         pitches[0] = (unsigned)format.pitch;
         lines[0] = *height;
         *opaque = (void *)CFBridgingRetain(format);
-        [delivery recordFormatSetupForMedia:source longEdge:MAX(*width, *height) limit:limit];
+        [delivery recordFormatSetupForMedia:source longEdge:MAX(*width, *height) limit:limit panoramaLimit:panoramaLimit];
         return 1;
     }
 }

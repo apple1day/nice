@@ -128,9 +128,29 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     private var stalledAtMinimum = false
     private let reducedFrameOutput: Bool
     static let reducedLongEdge: UInt32 = 1280
+    private var checkExistingPanoramaFormat = false
     var preferSmallerPanoramaFrames: Bool {
         get { frameDelivery?.preferSmallerPanoramaFrames ?? false }
-        set { frameDelivery?.preferSmallerPanoramaFrames = newValue }
+        set {
+            guard newValue != preferSmallerPanoramaFrames else { return }
+            checkExistingPanoramaFormat = newValue
+            frameDelivery?.preferSmallerPanoramaFrames = newValue
+        }
+    }
+
+    // Limit a corrective reopen to a transition on an already running vmem
+    // session. A fresh player negotiates the desired format before its first frame.
+    func needsPanoramaRenegotiation() -> Bool {
+        guard checkExistingPanoramaFormat, let stats = frameDelivery?.frameStats, stats.formatSetups > 0 else { return false }
+        if stats.outputLongEdge <= stats.panoramaLimit {
+            checkExistingPanoramaFormat = false
+            return false
+        }
+        guard let player, player.isSeekable,
+              player.state == .playing || player.state == .paused,
+              callbackLock.withLock({ seekGate.target == nil && unconfirmedSeek == nil }) else { return false }
+        let clock = max(0, Double(player.time.intValue) / 1000)
+        return durationSeconds(player) - clock > 2
     }
     private var videoDetails: String?
     private var nextTrackCheck = -Double.infinity
@@ -154,6 +174,9 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     private let callbackLock = NSLock()
     private var timePublishScheduled = false
     private var seekGate = SeekFeedbackGate()
+    // The UI's feedback timeout can elapse before a slow native seek lands.
+    // Do not replace its decoder for a quality adjustment during that gap.
+    private var unconfirmedSeek: (target: Double, host: TimeInterval)?
 
     override convenience init() { self.init(frameHandler: nil) }
 
@@ -192,6 +215,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         guard let player else { throw ClientError("播放器初始化失败，请关闭后重新打开视频。") }
         frameProgress.reset()
         frameLossWatch.reset()
+        callbackLock.withLock { unconfirmedSeek = nil }
         stalledAtMinimum = false
         stopLossTimer()
         lastStatsTime = -.infinity
@@ -292,7 +316,9 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         frameLossWatch.reset()
         stalledAtMinimum = false
         callbackLock.lock()
-        seekGate.begin(target: seconds, now: ProcessInfo.processInfo.systemUptime)
+        let now = ProcessInfo.processInfo.systemUptime
+        seekGate.begin(target: seconds, now: now)
+        unconfirmedSeek = (seconds, now)
         callbackLock.unlock()
 
         // Fractional seeking avoids the Int32 millisecond limit for long media.
@@ -387,7 +413,16 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         let now = ProcessInfo.processInfo.systemUptime
         callbackLock.lock()
         let displayedSeconds = seekGate.displayedSeconds(raw: rawSeconds, now: now)
-        let awaitingSeek = seekGate.target != nil
+        if let seek = unconfirmedSeek {
+            // A busy decoder may publish its first post-seek tick several
+            // seconds into the requested interval. Paused seeks should land at
+            // the actual requested position.
+            let elapsed = phase == .playing ? max(0, now - seek.host) : 0
+            if rawSeconds >= seek.target - 1, rawSeconds <= seek.target + elapsed + 1 {
+                unconfirmedSeek = nil
+            }
+        }
+        let awaitingSeek = seekGate.target != nil || unconfirmedSeek != nil
         callbackLock.unlock()
 
         if videoDetails == nil, phase == .playing || phase == .paused, now >= nextTrackCheck {

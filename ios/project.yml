@@ -10,7 +10,7 @@ settings:
     TARGETED_DEVICE_FAMILY: "1,2"
     CODE_SIGN_STYLE: Automatic
     MARKETING_VERSION: "1.3.5"
-    CURRENT_PROJECT_VERSION: "14"
+    CURRENT_PROJECT_VERSION: "15"
 targets:
   NiceVideos:
     type: application

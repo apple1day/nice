@@ -23,6 +23,8 @@ typedef struct {
     uint64_t staleSource;
     unsigned outputLongEdge;
     unsigned negotiatedLimit;
+    // The cap this same source would negotiate when switching into a panorama.
+    unsigned panoramaLimit;
 } NICEVLCFrameStats;
 
 typedef struct {

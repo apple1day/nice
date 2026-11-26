@@ -4,7 +4,7 @@ import UIKit
 // The same item supplies both audio and the frame for the upcoming display tick.
 final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     private weak var item: AVPlayerItem?
-    private var handler: ((CVPixelBuffer, Double?) -> Void)?
+    private var handler: ((CVPixelBuffer, Double?, Bool) -> Void)?
     private var onAttach: (() -> Void)?
     private let preferBiPlanar: () -> Bool
     private let recovery: Bool
@@ -15,6 +15,7 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     private var cadenceObserver: NSObjectProtocol?
     private var lastDelivery = CACurrentMediaTime()
     private var continuousPull = false
+    private var pausedByUser = false
     private var newestDisplayTime: CMTime = .invalid
     private(set) var frameSequence: UInt64 = 0
     private(set) var hasVideoFrame = false
@@ -24,7 +25,7 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
 
     init(item: AVPlayerItem, recovery: Bool, preferBiPlanar: @escaping () -> Bool,
          afterglowFormat: AfterglowMovieOutput.Format? = nil,
-         onAttach: @escaping () -> Void = {}, handler: @escaping (CVPixelBuffer, Double?) -> Void) {
+         onAttach: @escaping () -> Void = {}, handler: @escaping (CVPixelBuffer, Double?, Bool) -> Void) {
         self.item = item
         self.preferBiPlanar = preferBiPlanar
         self.afterglowFormat = afterglowFormat
@@ -97,6 +98,7 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
         let hostTime = link.targetTimestamp
         if let (frame, displayTime) = frame(for: hostTime, output: output) {
             lastDelivery = hostTime
+            let firstInSequence = !hasVideoFrame
             hasVideoFrame = true
             // If the converter repeatedly returns the same PTS, the decoder
             // has not advanced even though a new buffer object was acquired.
@@ -104,8 +106,8 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
                 frameSequence &+= 1
                 if displayTime.isNumeric { newestDisplayTime = displayTime }
             }
-            handler(frame, displayTime.isNumeric ? displayTime.seconds : nil)
-        } else if hasVideoFrame && !continuousPull && hostTime - lastDelivery > 0.5 {
+            handler(frame, displayTime.isNumeric ? displayTime.seconds : nil, firstInSequence)
+        } else if (hasVideoFrame || pausedByUser) && !continuousPull && hostTime - lastDelivery > 0.5 {
             // Park only when playback is quiescent. A delayed frame while the
             // audio clock runs must not put the consumer to sleep.
             output.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.05)
@@ -134,14 +136,19 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     }
 
     func refreshAfterSeek() {
+        // The last buffer belongs to the previous timeline. Permit a first pull
+        // again even if a paused AV output doesn't advertise a new picture.
+        if afterglowOutput != nil { hasVideoFrame = false }
         newestDisplayTime = .invalid
         refresh()
     }
 
-    func setContinuousPull(_ enabled: Bool) {
-        guard enabled != continuousPull else { return }
+    func setContinuousPull(_ enabled: Bool, paused: Bool) {
+        let resume = pausedByUser && !paused
+        pausedByUser = afterglowOutput != nil && paused
+        guard enabled != continuousPull || resume else { return }
         continuousPull = enabled
-        if enabled { refresh() }
+        if enabled || resume { refresh() }
     }
 
     func refresh() {

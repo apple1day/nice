@@ -97,7 +97,6 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         guard let item = preparedItem ?? player.currentItem, let frameHandler else { return }
         let format = afterglow ? AfterglowMovieOutput.Format(source: afterglowSourceSize, sdr: isSDR,
                                                              recovery: recovery) : nil
-        var first = true
         stereo = AppleStereoFrameOutput(item: item, recovery: recovery, preferBiPlanar: { [weak self] in
             self?.isSDR == true
         }, afterglowFormat: format, onAttach: { [weak self, weak item] in
@@ -107,14 +106,14 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                 guard let self, let item, self.frameHandler != nil else { return }
                 if !self.wantsPlayback { self.preroll(item) }
             }
-        }) { [weak self, weak item] buffer, pts in
+        }) { [weak self, weak item] buffer, pts, firstInSequence in
             guard let self, let item, self.player.currentItem === item else { return }
+            if self.afterglow && (self.seeking || self.pendingSeek != nil) { return }
             self.diagnostics?.decodedFrame(buffer, pts: pts)
             frameHandler(buffer)
-            if first {
+            if firstInSequence {
                 self.firstFrameDeadline?.cancel()
                 self.firstFrameDeadline = nil
-                first = false
                 DispatchQueue.main.async { [weak self] in self?.publish() }
             }
         }
@@ -154,7 +153,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         videoTimeRange = nil
         frameRate = nil
         wantsPlayback = false
-        pendingSeek = seconds.isFinite && seconds > 0 ? seconds : nil
+        pendingSeek = seconds.isFinite && seconds > 0 ? seconds : (afterglow && paused ? 0 : nil)
         let item = AVPlayerItem(asset: asset)
         if afterglow {
             // Afterglow attaches its packed output before handing the item to AVPlayer.
@@ -410,7 +409,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             visibleInForeground && player.timeControlStatus == .playing
         var details = trackDetails
         let hasVideo = MainActor.assumeIsolated {
-            stereo?.setContinuousPull(active)
+            stereo?.setContinuousPull(active, paused: !wantsPlayback)
             let ready = surface?.videoLayer.isReadyForDisplay ?? false
             let hasImage = stereo?.hasVideoFrame ?? ready
             let wantsFramesAtClock = videoTimeRange.map { range in

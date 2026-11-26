@@ -686,6 +686,15 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                         Image(systemName: "scope").frame(minWidth: 44, minHeight: 44)
                     }.accessibilityLabel("视角回正").accessibilityIdentifier("vrRecenterButton")
                 }
+                if !immersive {
+                    Button { performTransportAction(enterAfterglow) } label: {
+                        Text("Afterglow XR").font(.subheadline.weight(.semibold))
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                    }
+                    .disabled(!canInteract)
+                    .accessibilityLabel("用 Afterglow XR 播放")
+                    .accessibilityIdentifier("afterglowCurrentVideo")
+                }
                 videoFormatButton
                 if immersive {
                     Button {
@@ -790,7 +799,6 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         .accessibilityValue(immersive ? vrProfile.projection.label : (displayMode == .standard ? "普通播放" : (displayMode == .half ? "半宽 SBS" : "全宽 SBS")))
         .accessibilityIdentifier("videoFormatButton")
         .confirmationDialog("视频显示方式", isPresented: $showsVideoFormats, titleVisibility: .visible) {
-            Button("用 Afterglow XR 播放") { enterAfterglow() }
             Button("进入全景 VR") { enterPanorama() }
             Button("半宽 SBS（Half SBS）") { displayMode = .half }
             Button("全宽 SBS（Full SBS）") { displayMode = .full }
