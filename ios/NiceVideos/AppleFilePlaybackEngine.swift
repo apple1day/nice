@@ -185,6 +185,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                     }
                 }
                 guard !Task.isCancelled, let self, self.player.currentItem === item else { return }
+                self.diagnostics?.event("AV: no decodable video track")
                 self.failure = "系统播放器没有找到可解码的视频轨道。"
                 self.publish()
             } catch {
@@ -218,6 +219,14 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         if let format {
             let size = CMVideoFormatDescriptionGetDimensions(format)
             if size.width > 0, size.height > 0 { fields.append("\(size.width)×\(size.height)") }
+            let tags = CMFormatDescriptionGetExtensions(format) as? [String: Any]
+            if let transfer = tags?[kCVImageBufferTransferFunctionKey as String] as? String {
+                let names = [kCVImageBufferTransferFunction_ITU_R_709_2 as String: "BT.709",
+                             kCVImageBufferTransferFunction_sRGB as String: "sRGB",
+                             kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String: "PQ",
+                             kCVImageBufferTransferFunction_ITU_R_2100_HLG as String: "HLG"]
+                if let name = names[transfer] { fields.append(name) }
+            }
             let code = CMFormatDescriptionGetMediaSubType(format)
             let bytes = [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: code >> $0) }
             if bytes.allSatisfy({ (32...126).contains($0) }), let subtype = String(bytes: bytes, encoding: .ascii) {
@@ -343,7 +352,12 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             return hasImage
         }
         if item.status == .failed || player.status == .failed {
-            failure = item.error?.localizedDescription ?? player.error?.localizedDescription ?? "系统播放器无法解码这个视频。"
+            let error = (item.error ?? player.error) as NSError?
+            if failure == nil {
+                let domain = error?.domain == AVFoundationErrorDomain ? "AVFoundation" : "system"
+                diagnostics?.event("AV failure: domain=\(domain) code=\(error?.code ?? 0)")
+            }
+            failure = error?.localizedDescription ?? "系统播放器无法解码这个视频。"
         }
         let phase: PlaybackPhase
         if failure != nil { phase = .failed }
