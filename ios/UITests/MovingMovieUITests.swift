@@ -115,19 +115,29 @@ final class MovingMovieUITests: XCTestCase {
             throw MotionFailure("\(description): phases=\(phases), RGB=\(last)")
         }
 
+        func tapPanoramaControl(_ button: XCUIElement) throws {
+            // A control can still have an accessibility frame during its
+            // auto-hide animation. Start a fresh visible interval for the tap.
+            let hidden = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"),
+                                                    object: button)
+            try require(XCTWaiter.wait(for: [hidden], timeout: 8) == .completed,
+                        "Panorama toolbar did not hide: " + button.debugDescription)
+            surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.25)).tap()
+            try require(button.waitForExistence(timeout: 3) && button.isHittable,
+                        "Panorama control unavailable: " + button.debugDescription)
+            button.tap()
+        }
+
         try checkChart("single-eye panorama updates", moving: true)
         let from = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.5))
         let to = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.38, dy: 0.5))
         from.press(forDuration: 0.15, thenDragTo: to)
         try checkChart("leftward drag turns right", panned: true)
-        revealControls(surface)
-        app.buttons["vrRecenterButton"].tap()
+        try tapPanoramaControl(app.buttons["vrRecenterButton"])
         try checkChart("recenter shows forward ray")
-        revealControls(surface)
-        app.buttons["vrHeadsetButton"].tap()
+        try tapPanoramaControl(app.buttons["vrHeadsetButton"])
         try checkChart("both eyes move in sync", stereo: true, moving: true)
-        revealControls(surface)
-        formats.tap()
+        try tapPanoramaControl(formats)
         try require(app.navigationBars["VR 设置"].waitForExistence(timeout: 5), app.debugDescription)
         let copy = app.buttons["copyPlaybackDiagnostics"]
         try require(copy.waitForExistence(timeout: 5) && copy.isHittable, "Missing diagnostics action")
