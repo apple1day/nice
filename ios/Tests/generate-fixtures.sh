@@ -18,16 +18,17 @@ ffmpeg -hide_banner -loglevel error -y \
   -filter_complex "[0:v]drawbox=c=lime:t=fill:enable='gte(mod(t,2),1)'[l];[1:v]drawbox=c=yellow:t=fill:enable='gte(mod(t,2),1)'[r];[l][r]hstack" \
   -t 90 -c:v libx264 -g 8 -pix_fmt yuv420p -movflags +faststart ../../UITests/moving-stereo.mp4
 # The decoder sees 4K HEVC at 24 fps. Encode one two-second cycle and remux
-# it to allow enough time for UI interactions without repeatedly encoding in CI.
+# it for three minutes so the ordinary → SBS → ordinary checks retain moving
+# frames even when simulator gestures and screenshots take over a minute.
 pattern_dir="$(mktemp -d)"
 trap 'rm -rf "$pattern_dir"' EXIT
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -i "color=red:size=3840x2160:rate=24,drawbox=x=1920:y=0:w=1920:h=2160:c=blue:t=fill,drawbox=x=0:y=0:w=1920:h=2160:c=lime:t=fill:enable='gte(t,1)',drawbox=x=1920:y=0:w=1920:h=2160:c=yellow:t=fill:enable='gte(t,1)'" \
   -t 2 -c:v libx265 -preset ultrafast -x265-params 'pools=2:frame-threads=2:keyint=24:min-keyint=24:scenecut=0:log-level=error' \
   -pix_fmt yuv420p -tag:v hvc1 "$pattern_dir/cycle.mp4"
-ffmpeg -hide_banner -loglevel error -y -stream_loop 23 -i "$pattern_dir/cycle.mp4" \
+ffmpeg -hide_banner -loglevel error -y -stream_loop 89 -i "$pattern_dir/cycle.mp4" \
   -f lavfi -i 'anullsrc=sample_rate=48000:channel_layout=mono' -map 0:v:0 -map 1:a:0 \
-  -t 48 -c:v copy -tag:v hvc1 -c:a aac -b:a 32k -movflags +faststart "$pattern_dir/indexed.mp4"
+  -t 180 -c:v copy -tag:v hvc1 -c:a aac -b:a 32k -movflags +faststart "$pattern_dir/indexed.mp4"
 python3 ../../tools/make_large_mp4_fixture.py "$pattern_dir/indexed.mp4" ../../UITests/moving4k
 # A directional stereo panorama with independent eye colors, video motion and
 # a continuous audible tone. Encode a short GOP once and reuse it in the UI test.
