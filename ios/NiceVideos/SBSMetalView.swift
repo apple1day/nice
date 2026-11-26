@@ -1,15 +1,34 @@
 import CoreVideo
 import MetalKit
 import UIKit
+import simd
 
 enum SBSDisplayMode: Equatable {
     case standard
     case half  // Each view was compressed horizontally by a factor of two.
     case full  // Each half already has the correct eye image aspect ratio.
 
+    case immersive(VRProjection, VREyeLayout, headset: Bool)
+
     func eyeAspect(packedAspect: CGFloat) -> CGFloat {
         self == .half ? packedAspect : packedAspect / 2
     }
+}
+
+enum VRProjection: Int, CaseIterable {
+    case flat = 0, vr180, vr360, fisheye180
+}
+
+enum VREyeLayout: Int, CaseIterable {
+    case mono, sideBySide, halfSideBySide, topBottom
+}
+
+private struct VRMovieUniforms {
+    var cameraToWorld: simd_float3x3
+    var rayAndLens: SIMD4<Float>
+    var fitAndDisc: SIMD4<Float>
+    var eyeRect: SIMD4<Float>
+    var options: SIMD4<UInt32>
 }
 
 struct SBSMovieVertex {
@@ -79,20 +98,39 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     }
 
     var mode: SBSDisplayMode = .standard {
-        didSet { if oldValue != mode { requestDraw() } }
+        didSet {
+            if oldValue != mode { updateDrawableSize(); requestDraw() }
+        }
+    }
+
+    var nativeResolution = false {
+        didSet { if oldValue != nativeResolution { updateDrawableSize(); requestDraw() } }
+    }
+    private var cameraToWorld = matrix_identity_float3x3
+    private var shortSideFOV: Float = 80
+
+    func setCamera(yaw: Float, pitch: Float, fieldOfView: Float, head: simd_float3x3 = matrix_identity_float3x3) {
+        guard yaw.isFinite, pitch.isFinite, fieldOfView.isFinite else { return }
+        let radians = Float.pi / 180
+        let turn = simd_quatf(angle: -yaw * radians, axis: SIMD3(0, 1, 0))
+        let tilt = simd_quatf(angle: min(89, max(-89, pitch)) * radians, axis: SIMD3(1, 0, 0))
+        cameraToWorld = simd_float3x3(turn) * head * simd_float3x3(tilt)
+        shortSideFOV = min(110, max(45, fieldOfView))
+        requestDraw()
     }
 
     private let metalView = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
     private let errorLabel = UILabel()
     private var textureCache: CVMetalTextureCache?
     private var pipeline: MTLRenderPipelineState?
+    private var immersivePipeline: MTLRenderPipelineState?
     private var queue: MTLCommandQueue?
     private var indexBuffer: MTLBuffer?
     private var vertexBuffer: MTLBuffer?
     private var geometry: SBSMovieGeometry?
     private var frameToDraw: Frame?
     var isReadyForDisplay: Bool {
-        metalView.device != nil && queue != nil && pipeline != nil && indexBuffer != nil
+        metalView.device != nil && queue != nil && pipeline != nil && immersivePipeline != nil && indexBuffer != nil
     }
 
     private var needsDraw = false
@@ -115,6 +153,8 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         metalView.frame = bounds
         metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         metalView.clearColor = MTLClearColorMake(0, 0, 0, 1)
+        metalView.autoResizeDrawable = false
+        metalView.preferredFramesPerSecond = 60
         metalView.isPaused = true
         metalView.enableSetNeedsDisplay = false
         metalView.delegate = self
@@ -149,9 +189,11 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         descriptor.fragmentFunction = library?.makeFunction(name: "sbsMovieFragment")
         descriptor.colorAttachments[0].pixelFormat = metalView.colorPixelFormat
         pipeline = try? device.makeRenderPipelineState(descriptor: descriptor)
+        descriptor.fragmentFunction = library?.makeFunction(name: "vrMovieFragment")
+        immersivePipeline = try? device.makeRenderPipelineState(descriptor: descriptor)
         let indices = SBSMovieGeometry.indices
         indexBuffer = device.makeBuffer(bytes: indices, length: indices.count * MemoryLayout<UInt16>.stride, options: [])
-        if queue == nil || pipeline == nil || indexBuffer == nil {
+        if queue == nil || pipeline == nil || immersivePipeline == nil || indexBuffer == nil {
             errorLabel.text = "无法初始化视频显示，请重新打开视频。"
         }
     }
@@ -229,10 +271,25 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         if missedDrawables >= 12 { metalView.isPaused = true }
     }
 
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        updateDrawableSize()
+    }
+
+    private func updateDrawableSize() {
+        let scale = window?.screen.scale ?? traitCollection.displayScale
+        let width = bounds.width * scale, height = bounds.height * scale
+        guard width > 0, height > 0 else { return }
+        var factor: CGFloat = 1
+        if case .immersive = mode, !nativeResolution { factor = min(1, 1920 / max(width, height)) }
+        let size = CGSize(width: max(1, (width * factor).rounded()), height: max(1, (height * factor).rounded()))
+        if metalView.drawableSize != size { metalView.drawableSize = size }
+    }
+
     override func didMoveToWindow() {
         super.didMoveToWindow()
         if window == nil { metalView.isPaused = true }
-        else { requestDraw() }
+        else { updateDrawableSize(); requestDraw() }
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -273,7 +330,12 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentTexture(frame.texture, index: 0)
         let width = Double(target.width), height = Double(target.height)
-        if mode == .standard {
+        if case let .immersive(projection, layout, headset) = mode {
+            guard let immersivePipeline else { return }
+            encoder.setRenderPipelineState(immersivePipeline)
+            encodeImmersive(frame: frame, encoder: encoder, width: target.width, height: target.height,
+                            projection: projection, layout: layout, headset: headset)
+        } else if mode == .standard {
             // Fit the complete, unwarped picture, including non-square source pixels.
             let fitHeight = min(height, width / Double(frame.packedAspect))
             let fitWidth = fitHeight * Double(frame.packedAspect)
@@ -305,6 +367,44 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         }
         // GPU sampling can outlive this callback, including across output changes.
         command.addCompletedHandler { _ in withExtendedLifetime(frame) {} }
+    }
+
+    private func encodeImmersive(frame: Frame, encoder: MTLRenderCommandEncoder, width: Int, height: Int,
+                                 projection: VRProjection, layout: VREyeLayout, headset: Bool) {
+        let textureWidth = frame.texture.width, textureHeight = frame.texture.height
+        let splitX = layout == .sideBySide || layout == .halfSideBySide
+        let splitY = layout == .topBottom
+        let tileWidth = splitX ? max(1, textureWidth / 2) : textureWidth
+        let tileHeight = splitY ? max(1, textureHeight / 2) : textureHeight
+        let widthRatio = Float(tileWidth) / Float(textureWidth)
+        let heightRatio = Float(tileHeight) / Float(textureHeight)
+        let sourceAspect = Float(frame.packedAspect) * widthRatio / heightRatio * (layout == .halfSideBySide ? 2 : 1)
+        let views = headset ? 2 : 1
+        encoder.setVertexBytes(Self.flatQuad, length: MemoryLayout<SBSMovieVertex>.stride * 4, index: 0)
+        for eye in 0..<views {
+            let first = eye * width / views
+            let columns = (eye + 1) * width / views - first
+            guard columns > 0 else { continue }
+            let size = SIMD2(Float(columns), Float(height))
+            let relativeSize = size / min(size.x, size.y)
+            let rays = relativeSize * tan(shortSideFOV * .pi / 360)
+            let lens = headset ? relativeSize * tan(Float.pi * 40 / 180) : .zero
+            let screenAspect = size.x / size.y
+            let x = eye == 1 && splitX ? 1 - widthRatio : 0
+            let y = eye == 1 && splitY ? 1 - heightRatio : 0
+            var uniforms = VRMovieUniforms(
+                cameraToWorld: cameraToWorld,
+                rayAndLens: SIMD4(rays.x, rays.y, lens.x, lens.y),
+                fitAndDisc: SIMD4(min(1, sourceAspect / screenAspect), min(1, screenAspect / sourceAspect),
+                                  min(1, 1 / sourceAspect), min(1, sourceAspect)),
+                eyeRect: SIMD4(x, y, x + widthRatio, y + heightRatio),
+                options: SIMD4(UInt32(projection.rawValue), 0, 0, 0)
+            )
+            encoder.setViewport(MTLViewport(originX: Double(first), originY: 0, width: Double(columns),
+                                            height: Double(height), znear: 0, zfar: 1))
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VRMovieUniforms>.stride, index: 0)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
     }
 
     private func setTextureRegion(rightHalf: Bool, widthFraction: Float, encoder: MTLRenderCommandEncoder) {

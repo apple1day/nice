@@ -26,6 +26,8 @@
     <string>UIInterfaceOrientationLandscapeLeft</string>
     <string>UIInterfaceOrientationLandscapeRight</string>
   </array>
+  <key>NSMotionUsageDescription</key>
+  <string>开启陀螺仪环顾时，使用设备方向来更新 VR 视角。</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>连接你自己的局域网视频服务器，获取视频列表并下载到本机。播放本地文件无需联网。</string>
   <key>NSAppTransportSecurity</key><dict>

@@ -9,8 +9,8 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     TARGETED_DEVICE_FAMILY: "1,2"
     CODE_SIGN_STYLE: Automatic
-    MARKETING_VERSION: "1.2.3"
-    CURRENT_PROJECT_VERSION: "8"
+    MARKETING_VERSION: "1.3.0"
+    CURRENT_PROJECT_VERSION: "9"
 targets:
   NiceVideos:
     type: application
@@ -47,9 +47,11 @@ targets:
         type: folder
     dependencies:
       - target: NiceVideos
+      - sdk: MediaToolbox.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anxiong.nicevideos.tests
+        SWIFT_OBJC_BRIDGING_HEADER: Tests/NiceVideosTests-Bridging-Header.h
         GENERATE_INFOPLIST_FILE: YES
   NiceVideosUITests:
     type: bundle.ui-testing

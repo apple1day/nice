@@ -29,3 +29,15 @@ ffmpeg -hide_banner -loglevel error -y -stream_loop 23 -i "$pattern_dir/cycle.mp
   -f lavfi -i 'anullsrc=sample_rate=48000:channel_layout=mono' -map 0:v:0 -map 1:a:0 \
   -t 48 -c:v copy -tag:v hvc1 -c:a aac -b:a 32k -movflags +faststart "$pattern_dir/indexed.mp4"
 python3 ../../tools/make_large_mp4_fixture.py "$pattern_dir/indexed.mp4" ../../UITests/moving4k
+# A directional stereo panorama with independent eye colors, video motion and
+# a continuous audible tone. Encode a short GOP once and reuse it in the UI test.
+ffmpeg -hide_banner -loglevel error -y -f lavfi \
+  -i "color=black:s=384x192:r=12,format=gbrp,geq=r='32+192*mod(X,192)/191':g='32+192*Y/191':b='36+128*gte(X,192)+42*gte(mod(N,24),12)'" \
+  -t 2 -c:v libx264 -threads 2 -g 12 -bf 0 -pix_fmt yuv420p "$pattern_dir/panorama.mp4"
+ffmpeg -hide_banner -loglevel error -y -stream_loop 29 -i "$pattern_dir/panorama.mp4" \
+  -f lavfi -i 'sine=frequency=440:sample_rate=44100' -map 0:v:0 -map 1:a:0 \
+  -t 60 -c:v copy -c:a aac -b:a 32k -movflags +faststart panorama-audio.mp4
+# Keep the ZLIB-compressed launch environment small. The UI gestures check
+# projection and frame motion; actual decoded audio is measured in the hosted test.
+ffmpeg -hide_banner -loglevel error -y -i panorama-audio.mp4 -map 0:v:0 -c copy \
+  -movflags +faststart ../../UITests/panorama-chart.mp4

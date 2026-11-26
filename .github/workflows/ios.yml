@@ -47,6 +47,30 @@ jobs:
           xcodebuild -quiet -workspace ios/NiceVideos.xcworkspace -scheme NiceVideos \
             -configuration Release -destination 'generic/platform=iOS' \
             -derivedDataPath ios/DerivedData-device CODE_SIGNING_ALLOWED=NO build
+      - name: Package the iPhone build for local signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=ios/DerivedData-device/Build/Products/Release-iphoneos/NiceVideos.app
+          plist="$app/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$plist")" = iPhoneOS
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")"
+          lipo -verify_arch arm64 "$app/$executable"
+          test -s "$app/default.metallib"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+          build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")"
+          mkdir -p "$RUNNER_TEMP/ios-package/Payload" ios/device-package
+          ditto "$app" "$RUNNER_TEMP/ios-package/Payload/NiceVideos.app"
+          ipa="ios/device-package/NiceVideos-iOS-$version-$build-unsigned.ipa"
+          ditto -c -k --norsrc --keepParent "$RUNNER_TEMP/ios-package/Payload" "$ipa"
+          unzip -tq "$ipa"
+          shasum -a 256 "$ipa"
+      - name: Save unsigned iPhone IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NiceVideos-iPhone-unsigned
+          path: ios/device-package/*.ipa
+          compression-level: 0
       - name: Show resolved dependency lock
         if: always()
         run: cat ios/Podfile.lock 2>/dev/null || true

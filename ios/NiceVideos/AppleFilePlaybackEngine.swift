@@ -35,6 +35,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private var lastStereoSequence: UInt64?
     private var frameRate: Float?
     private var trackDetails: String?
+    private var reportedPlaybackStalls = 0
 
     init(pickedFile: PickedVideoFile) { self.pickedFile = pickedFile }
 
@@ -117,6 +118,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         ended = false
         failure = nil
         trackDetails = nil
+        reportedPlaybackStalls = 0
         frameRate = nil
         wantsPlayback = false
         pendingSeek = seconds.isFinite && seconds > 0 ? seconds : nil
@@ -149,7 +151,9 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                 case .AVPlayerItemFailedToPlayToEndTime:
                     let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
                     self.failure = error?.localizedDescription ?? "系统播放器无法继续解码这部影片。"
-                default: self.checkReportedStall(item)
+                default:
+                    if self.wantsPlayback, !self.seeking, !self.ended { self.reportedPlaybackStalls += 1 }
+                    self.checkReportedStall(item)
                 }
                 self.publish()
             })
@@ -307,6 +311,9 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         else if item.status != .readyToPlay { phase = .opening }
         else if !wantsPlayback { phase = .paused }
         else { phase = player.timeControlStatus == .playing ? .playing : .opening }
+        if reportedPlaybackStalls > 0 {
+            details = [details, "系统报告播放停顿 \(reportedPlaybackStalls) 次"].compactMap { $0 }.joined(separator: " · ")
+        }
         let length = duration.isFinite ? max(0, duration) : 0
         onUpdate?(PlaybackSnapshot(phase: phase, seconds: pendingSeek ?? (clock.isFinite ? max(0, clock) : 0),
                                    duration: length, seekable: item.status == .readyToPlay && length > 0,

@@ -73,6 +73,64 @@ final class MovingMovieUITests: XCTestCase {
         try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC after leaving VR")
     }
 
+    func testPickedPanoramaCanLookAroundRecenterAndPlayInBothEyes() throws {
+        XCUIDevice.shared.orientation = .landscapeLeft
+        let app = try launchMovie("panorama-chart", fileExtension: "mp4")
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
+        let surface = app.descendants(matching: .any)["playbackSurfaceToggle"]
+        try require(surface.waitForExistence(timeout: 15), app.debugDescription)
+        revealControls(surface)
+        let formats = app.buttons["videoFormatButton"]
+        formats.tap()
+        let enter = app.buttons["进入全景 VR"]
+        try require(enter.waitForExistence(timeout: 5), app.debugDescription)
+        enter.tap()
+
+        func checkChart(_ description: String, stereo: Bool = false,
+                        moving: Bool = false, panned: Bool = false) throws {
+            var phases = Set<Int>()
+            var last = ""
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                let pair = try sampleEyes(image: XCUIScreen.main.screenshot().image,
+                                          viewport: surface.frame, window: app.frame,
+                                          fractions: stereo ? (0.25, 0.75) : (0.5, 0.5))
+                last = "\(pair)"
+                let eye = pair.0
+                let longitudeMatches = panned ? eye.r > 148 : abs(eye.r - 128) < 16
+                if longitudeMatches && abs(eye.g - 128) < 16 && (20...96).contains(eye.b) {
+                    let phase = eye.b < 58 ? 0 : 1
+                    if !stereo || (abs(pair.1.r - 128) < 16 && abs(pair.1.g - 128) < 16
+                        && abs((pair.1.b - eye.b) - 128) < 12) {
+                        phases.insert(phase)
+                        if !moving || phases.count == 2 { return }
+                    }
+                }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+            }
+            let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            attachment.name = description
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            throw MotionFailure("\(description): phases=\(phases), RGB=\(last)")
+        }
+
+        try checkChart("single-eye panorama updates", moving: true)
+        let from = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.5))
+        let to = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.38, dy: 0.5))
+        from.press(forDuration: 0.15, thenDragTo: to)
+        try checkChart("leftward drag turns right", panned: true)
+        revealControls(surface)
+        app.buttons["vrRecenterButton"].tap()
+        try checkChart("recenter shows forward ray")
+        revealControls(surface)
+        app.buttons["vrHeadsetButton"].tap()
+        try checkChart("both eyes move in sync", stereo: true, moving: true)
+        revealControls(surface)
+        formats.tap()
+        app.buttons["退出全景 VR"].tap()
+    }
+
     private func launchMovie(_ resource: String, fileExtension: String, samples: String? = nil) throws -> XCUIApplication {
         let bundle = Bundle(for: Self.self)
         func encoded(_ name: String) throws -> String {
@@ -149,7 +207,8 @@ final class MovingMovieUITests: XCTestCase {
 
     // Sample the system-composited screenshot. Time labels and transport
     // controls sit outside the centers of the two eye images.
-    private func sampleEyes(image: UIImage, viewport: CGRect, window: CGRect) throws -> (RGB, RGB) {
+    private func sampleEyes(image: UIImage, viewport: CGRect, window: CGRect,
+                            fractions: (CGFloat, CGFloat) = (0.25, 0.75)) throws -> (RGB, RGB) {
         let w = 96, h = 54
         var rgba = [UInt8](repeating: 0, count: w * h * 4)
         try rgba.withUnsafeMutableBytes { buffer in
@@ -170,6 +229,6 @@ final class MovingMovieUITests: XCTestCase {
             let i = 4 * (y * w + x)
             return (Int(rgba[i]), Int(rgba[i + 1]), Int(rgba[i + 2]))
         }
-        return (pixel(at: 0.25), pixel(at: 0.75))
+        return (pixel(at: fractions.0), pixel(at: fractions.1))
     }
 }

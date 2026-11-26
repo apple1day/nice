@@ -29,3 +29,49 @@ fragment float4 sbsMovieFragment(SBSVaryings input [[stage_in]],
     float u = (first + clamp(input.movieUV.x * sampleWidth, 0.5f, sampleWidth - 0.5f)) / width;
     return float4(movie.sample(linearSampler, float2(u, input.movieUV.y)).rgb, 1);
 }
+
+struct VRMovieUniforms {
+    float3x3 cameraToWorld;
+    float4 rayAndLens;
+    float4 fitAndDisc;
+    float4 eyeRect;
+    uint4 options;
+};
+
+fragment float4 vrMovieFragment(SBSVaryings input [[stage_in]],
+                                texture2d<float> movie [[texture(0)]],
+                                constant VRMovieUniforms &vr [[buffer(0)]]) {
+    constexpr sampler sampling(coord::normalized, address::clamp_to_edge, filter::linear);
+    constexpr float pi = 3.14159265358979323846f;
+    const float2 screen = (input.movieUV - 0.5f) * float2(2.0f, -2.0f);
+    // Inverse sampling of the generic Cardboard v1 screen, using the same
+    // 40-degree half-FOV and radial coefficients as the flat cinema mesh.
+    const float2 lens = screen * vr.rayAndLens.zw;
+    const float r2 = dot(lens, lens);
+    const float2 plane = screen * (1.0f + r2 * (0.441f + 0.156f * r2));
+    const uint projection = vr.options.x;
+    float2 uv;
+    if (projection == 0u) {
+        const float2 fit = plane / vr.fitAndDisc.xy;
+        if (any(abs(fit) > 1.0f)) return float4(0, 0, 0, 1);
+        uv = 0.5f + fit * float2(0.5f, -0.5f);
+    } else {
+        const float3 ray = normalize(vr.cameraToWorld * float3(plane * vr.rayAndLens.xy, -1));
+        if (projection != 2u && ray.z > 0.00001f) return float4(0, 0, 0, 1);
+        if (projection == 3u) {
+            const float theta = acos(clamp(-ray.z, -1.0f, 1.0f));
+            const float2 radial = ray.xy / max(length(ray.xy), 0.00001f);
+            uv = 0.5f + radial * float2(1, -1) * (theta / pi) * vr.fitAndDisc.zw;
+        } else {
+            const float longitude = dot(ray.xz, ray.xz) > 0.0000001f ? atan2(ray.x, -ray.z) : 0;
+            uv = float2(0.5f + longitude / (projection == 1u ? pi : 2.0f * pi),
+                        0.5f - asin(clamp(ray.y, -1.0f, 1.0f)) / pi);
+        }
+    }
+    // Metal texture coordinates begin at the top-left. Keep interpolation
+    // inside each eye, even when the two tiles meet at an odd pixel boundary.
+    const float2 inset = 0.5f / float2(movie.get_width(), movie.get_height());
+    const float2 coord = clamp(mix(vr.eyeRect.xy, vr.eyeRect.zw, uv),
+                               vr.eyeRect.xy + inset, vr.eyeRect.zw - inset);
+    return float4(movie.sample(sampling, coord).rgb, 1);
+}
