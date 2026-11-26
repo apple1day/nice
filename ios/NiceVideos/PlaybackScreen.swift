@@ -92,8 +92,8 @@ final class PlaybackModel: ObservableObject {
                 if pendingRestartSeek == nil { seconds = 0 }
                 restoredPosition = true
                 phase = .opening
-                // VLCKit 3.7.3 play() alone retains an EOF input. Replacing only
-                // its media reopens this local file without replacing the view.
+                // VLCKit 3.7.3 play() alone retains an EOF input. Reload the
+                // file on the existing playback surface before resuming.
                 try engine.load(fileURL: request.url)
             }
             engine.play()

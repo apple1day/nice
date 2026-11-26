@@ -13,6 +13,7 @@
 - (instancetype)initWithHandler:(NICEVLCFrameHandler)handler;
 - (void)enqueue:(CVPixelBufferRef)frame forMedia:(id<NICEVLCTrackSource>)media;
 - (void)recordBufferMissForMedia:(id<NICEVLCTrackSource>)media;
+- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media;
 @end
 
 @implementation NICEVLCFrameDelivery {
@@ -56,9 +57,19 @@
     }
 }
 
+- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media {
+    @synchronized (self) {
+        if (_handler && media == _sourceMedia) { _frameStats.formatSetups++; }
+    }
+}
+
 - (void)enqueue:(CVPixelBufferRef)frame forMedia:(id<NICEVLCTrackSource>)media {
     @synchronized (self) {
-        if (!_handler || media != _sourceMedia) { return; }
+        if (!_handler) { return; }
+        if (media != _sourceMedia) {
+            _frameStats.staleSource++;
+            return;
+        }
         _frameStats.offered++;
         if (_pending) {
             _frameStats.coalesced++;
@@ -259,6 +270,7 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         pitches[0] = (unsigned)format.pitch;
         lines[0] = *height;
         *opaque = (void *)CFBridgingRetain(format);
+        [delivery recordFormatSetupForMedia:source];
         return 1;
     }
 }

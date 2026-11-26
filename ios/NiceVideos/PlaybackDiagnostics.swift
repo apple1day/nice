@@ -31,6 +31,7 @@ final class PlaybackDiagnostics {
     private var apple = ""
     private var vlc = ""
     private var copies: UInt64 = 0
+    private var loadID: UInt64 = 0
     private var width = 0
     private var height = 0
     private var format: OSType = 0
@@ -60,14 +61,40 @@ final class PlaybackDiagnostics {
         lock.withLock {
             guard route != self.route || mode != self.mode else { return }
             if route != self.route {
-                copies = 0; width = 0; height = 0; format = 0
-                lastCopy = nil; lastPTS = nil; apple = ""; vlc = ""
+                resetFrameSamples()
             }
             self.route = route
             self.mode = mode
             lastSample = nil
             record("output \(route) mode=\(mode)", at: now())
         }
+    }
+
+    func beginInput(at seconds: Double, differentFile: Bool = false) {
+        lock.withLock {
+            loadID &+= 1
+            resetFrameSamples()
+            phase = .opening
+            ready = false
+            clock = seconds
+            if differentFile {
+                track = "unknown"
+                duration = 0
+            }
+            lastSample = nil
+            record("open loadID=\(loadID) start=\(Self.number(seconds))", at: now())
+        }
+    }
+
+    private func resetFrameSamples() {
+        copies = 0
+        width = 0
+        height = 0
+        format = 0
+        lastCopy = nil
+        lastPTS = nil
+        apple = ""
+        vlc = ""
     }
 
     // Called once per buffer obtained from AVPlayerItemVideoOutput / forwarded by VLC.
@@ -119,7 +146,7 @@ final class PlaybackDiagnostics {
         let pts = lastPTS.map(Self.number) ?? "-"
         let routeLabel = route.map { String(describing: $0) } ?? "pending"
         let modeLabel = mode.map { String(describing: $0) } ?? "pending"
-        var values = ["phase=\(phase)", "media=\(Self.number(clock))/\(Self.number(duration))",
+        var values = ["phase=\(phase)", "media=\(Self.number(clock))/\(Self.number(duration))", "loadID=\(loadID)",
                       "route=\(routeLabel)", "mode=\(modeLabel)", "videoReady=\(ready ? 1 : 0)",
                       "track={\(track)}", "copied=\(copies)", "copyAge=\(age)s", "framePTS=\(pts)",
                       "buffer=\(width)x\(height)", "fourcc=\(Self.fourCC(format))",

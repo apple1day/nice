@@ -19,6 +19,8 @@ typedef struct {
     uint64_t delivered;
     uint64_t coalesced;
     uint64_t bufferMisses;
+    uint64_t formatSetups;
+    uint64_t staleSource;
 } NICEVLCFrameStats;
 
 @interface NICEVLCFrameDelivery : NSObject

@@ -259,6 +259,12 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
         }
     }
 
+    @MainActor private func installVLCFrameSession() {
+        let vlc = VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile)
+        vlc.diagnostics = diagnostics
+        observe(vlc)
+    }
+
     @MainActor private func reconcileOutput(_ host: SBSPlaybackView, attaching: Bool = false) {
         let system = host.standardOutput == .system && pickedFile != nil && !systemFailed
         let next: MovieOutput = system ? .system : (host.renderer == nil ? .vlcNative : .vlcFrames)
@@ -283,9 +289,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
             apple.attach(to: host.drawableView)
             configureSystemStereo(apple, host: host)
         } else if next == .vlcFrames {
-            let vlc = VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile)
-            vlc.diagnostics = diagnostics
-            observe(vlc)
+            installVLCFrameSession()
         } else {
             nativeSession().attach(to: host.drawableView)
         }
@@ -306,12 +310,15 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
     }
 
     @MainActor private func reopenAfterOutputChange(_ host: SBSPlaybackView) {
-        guard let file, let session else { return }
+        // At EOF the model will explicitly reload on replay or a new seek.
+        // Opening here would first prepare an unused input at the end of the file.
+        guard phase != .ended, let file, let session else { return }
         do {
-            let resume = hasStarted && phase != .ended
+            let resume = hasStarted
             openingPaused = resume && !wantsPlayback
             awaitingOutput = resume
             pendingSeek = nil
+            diagnostics.beginInput(at: seconds)
             try session.load(fileURL: file, startAt: seconds, paused: openingPaused)
             if resume { session.play(waitForPausedFrame: openingPaused) }
         } catch {
@@ -332,6 +339,18 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
 
     func load(fileURL: URL) throws {
         guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
+        let differentFile = file != fileURL
+        if currentOutput == .vlcFrames, let vlc = session as? VLCPlaybackEngine, vlc.loaded {
+            // VLC 3 may reuse a vout across equal-format inputs. Its vmem
+            // format still owns the old media token; do not reuse that player
+            // or weaken the check that rejects frames from a retired input.
+            vlc.onUpdate = nil
+            vlc.stop()
+            MainActor.assumeIsolated {
+                hostView?.renderer?.clear()
+                installVLCFrameSession()
+            }
+        }
         file = fileURL
         seconds = 0
         phase = .idle
@@ -340,7 +359,9 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
         pendingSeek = nil
         hasStarted = false
         do {
-            try nativeSession().load(fileURL: fileURL)
+            let player = nativeSession()
+            diagnostics.beginInput(at: 0, differentFile: differentFile)
+            try player.load(fileURL: fileURL)
         } catch {
             guard currentOutput == .system, let hostView else { throw error }
             systemFailed = true

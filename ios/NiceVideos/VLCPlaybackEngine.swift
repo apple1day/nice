@@ -131,7 +131,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     private let pickedFile: PickedVideoFile?
     private var pickedReadStatus: PickedFileReadStatus?
     private var stopped = false
-    private var loaded = false
+    private(set) var loaded = false
     private var pausedPreviewDeadline: TimeInterval?
     private var needsPausedFrame = false
 
@@ -347,6 +347,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
             var status = nativeLifetime?.resource?.videoStatistics ?? "stats=unavailable"
             if let stats {
                 status += " offered=\(stats.offered) delivered=\(stats.delivered) coalesced=\(stats.coalesced) bufferMisses=\(stats.bufferMisses)"
+                status += " formatSetups=\(stats.formatSetups) staleSource=\(stats.staleSource)"
             }
             MainActor.assumeIsolated { diagnostics.vlcStatus(status) }
         }

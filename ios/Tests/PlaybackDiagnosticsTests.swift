@@ -35,6 +35,24 @@ final class PlaybackDiagnosticsTests: XCTestCase {
         XCTAssertTrue(messages.contains(where: { $0.contains("media=9.00/100.00") }))
     }
 
+    func testReplayOnSameOutputStartsNewFrameCountsAndKeepsPreviousSamples() throws {
+        let trace = PlaybackDiagnostics(bytes: nil, now: { 20 }, log: { _ in })
+        trace.setRoute(.vlcFrames, mode: .immersive(.vr360, .sideBySide, headset: true))
+        trace.beginInput(at: 0, differentFile: true)
+        var pixel: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(nil, 8, 4, kCVPixelFormatType_32BGRA, nil, &pixel), kCVReturnSuccess)
+        trace.decodedFrame(try XCTUnwrap(pixel), pts: nil)
+        trace.observe(PlaybackSnapshot(phase: .ended, seconds: 8, duration: 8, hasVideo: true)) { "presentID=91" }
+
+        trace.beginInput(at: 0)
+        let lines = trace.report { "presentID=91" }.split(separator: "\n")
+        XCTAssertTrue(lines.contains { $0.contains("loadID=1") && $0.contains("copied=1") })
+        let capture = try XCTUnwrap(lines.last)
+        XCTAssertTrue(capture.contains("loadID=2"))
+        XCTAssertTrue(capture.contains("videoReady=0"))
+        XCTAssertTrue(capture.contains("copied=0 copyAge=-s"))
+    }
+
     func testCaptureIncludesFallbackReasonOmitsPrivateErrorsAndBoundsHistory() {
         var t = 0.0
         let trace = PlaybackDiagnostics(bytes: nil, now: { t }, log: { _ in })
