@@ -2,7 +2,7 @@
 
 [下载 NiceVideos.apk](./NiceVideos.apk)
 
-Android 8.0（API 26）及以上的手机和平板可以安装本目录的测试版 APK。1.2.0 使用 AndroidX Media3 ExoPlayer、设备解码器和 OpenGL ES 2.0。应用名称为「Nice 视频 VR 1.2」。1.1.0 使用了临时签名，本次试用版使用独立包名，可保留 1.1.0 的本地记录和下载并同时安装。首次使用请重新选择本地文件或填写服务器地址。安装 APK 或用 Android Studio 打开本目录均可，无需运行 iOS 工程。
+Android 8.0（API 26）及以上的手机和平板可以安装本目录的测试版 APK。1.2.1（版本号 4）使用 AndroidX Media3 ExoPlayer、设备解码器和 OpenGL ES 2.0。应用名称为「Nice 视频 VR 1.2」。1.2.1 和 1.2.0 使用同一包名 `com.anxiong.nicevideos.vr.preview`。从 1.2.0 升级请先阅读下面的历史视频说明。安装 APK 或用 Android Studio 打开本目录均可，无需运行 iOS 工程。
 
 ## 安装试用
 
@@ -12,7 +12,31 @@ Android 8.0（API 26）及以上的手机和平板可以安装本目录的测试
 adb install -r android/NiceVideos.apk
 ```
 
-这是用于侧载试用的 debug 签名包。覆盖更新需要使用相同的签名证书。
+### 从 1.2.0 升级并保留历史视频
+
+同一证书签名的自建版本可直接覆盖安装。仓库分发的 APK 由 CI 使用临时调试证书签名，不同构建可能需要更换安装。遇到 `INSTALL_FAILED_UPDATE_INCOMPATIBLE` 或「签名不一致」，保留旧应用，先备份视频。卸载会清理旧版专属目录。
+
+从仓库的 1.2.0 调试包换到不同签名的 1.2.1 时，可以用 Mac、Python 3.8+ 和 Android 平台工具中的 `adb` 保留离线影片、收藏、服务器配置和续播进度。连接平板并授权 USB 调试，在旧版中等下载结束或取消未完成的下载。用以下命令将副本备份到 Mac 上空间充足的新文件夹。示例命令在仓库根目录运行。
+
+```sh
+python3 android/tools/legacy_download_backup.py backup "$HOME/NiceVideos-1.2-backup"
+```
+
+看到 `Verified backup complete` 后，核对影片数量和备份中的 `manifest.json`。有下载记录却显示 0 个文件时，请保留旧安装并检查当前设备和用户。确认备份完整后，可在设备上卸载旧版、安装此版，再运行下面的命令。请在恢复完成后再添加新影片。
+
+```sh
+python3 android/tools/legacy_download_backup.py restore "$HOME/NiceVideos-1.2-backup"
+```
+
+看到 `Verified restore complete` 后打开 App 的「本地」。旧版中通过「打开文件」选过的外部影片仍在原处；更换安装后，Android 可能需要重新授权那些文件。请保留 Mac 上的备份直到在文件管理器和 App 内确认影片可播放。
+
+### 下载位置与历史迁移
+
+新下载保存在内部存储的 `Download/NiceVideos/`。可用文件管理器按片名查找，同名文件会使用新的文件名。Android 8、9 首次向公共目录写入时需要授予存储权限。
+
+「本地」会自动逐个迁移已完成的旧版下载，保留片库编号、收藏及续播位置。覆盖升级时仍在传输的任务可在完成后迁移，失败任务再次下载时使用公共目录。迁移会先核对公共副本，再清理旧文件。设备不支持直接链接时，需要为当前影片留出复制空间。中断后可重新打开 App 继续，或点「本地 → 迁移历史下载」重试。
+
+在已下载影片右侧菜单中，「从列表移除」保留公共文件，「删除本机副本」会删除公共文件。
 
 ## 播放
 

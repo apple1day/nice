@@ -1,14 +1,17 @@
 package com.anxiong.nicevideos;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -25,7 +28,13 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
-    private static final int PICK = 30;
+    private static final int PICK = 30, WRITE_DOWNLOADS = 31;
+    private final ExecutorService migrations = Executors.newSingleThreadExecutor();
+    private final Set<String> missing = new HashSet<>();
+    private boolean migrating, rescanAfterMigration;
+    private String migrationStatus = "";
+    private ServerVideos.Movie requestedDownload;
+    private String requestedRetryId;
     private static final int INK = 0xfff4f7f8, MUTED = 0xff9ca9b0, ACCENT = 0xff9ee5d6,
             BG = 0xff10171b, CARD = 0xff1b262d, ACTIVE = 0xff28423f;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -46,8 +55,19 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        if ("com.anxiong.nicevideos.PREPARE_RESTORE".equals(getIntent().getAction())) {
+            // Android 11+ provisions this app-specific folder through the framework.
+            getExternalFilesDir(android.os.Environment.DIRECTORY_MOVIES);
+            finish();
+            return;
+        }
         library = new VideoLibrary(this);
         if (state != null) { server = state.getBoolean("server"); filter = state.getInt("filter"); }
+        if (state != null && state.containsKey("downloadUrl")) {
+            requestedDownload = new ServerVideos.Movie(state.getString("downloadName"),
+                    state.getLong("downloadBytes"), state.getString("downloadUrl"));
+            requestedRetryId = state.getString("downloadRetry");
+        }
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         build();
@@ -57,6 +77,12 @@ public final class MainActivity extends Activity {
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
         state.putBoolean("server", server); state.putInt("filter", filter);
+        if (requestedDownload != null) {
+            state.putString("downloadName", requestedDownload.name);
+            state.putString("downloadUrl", requestedDownload.url);
+            state.putLong("downloadBytes", requestedDownload.bytes);
+            state.putString("downloadRetry", requestedRetryId);
+        }
     }
 
     private String address() { return library.prefs.getString("server", ""); }
@@ -136,6 +162,14 @@ public final class MainActivity extends Activity {
                 if (filter == i) { chip.setBackground(bg(ACTIVE, 12)); chip.setTextColor(ACCENT); }
                 chips.addView(chip); gap(chips);
             }
+            if (library.all().stream().anyMatch(LegacyDownloadMigration::needsMigration)) {
+                TextView migrate = pill(migrating ? "正在迁移…" : "迁移历史下载", false, () -> {
+                    if (canWriteDownloads()) startMigration();
+                    else requestDownloadPermission();
+                });
+                migrate.setEnabled(!migrating);
+                panel.addView(migrate, -1, dp(44));
+            }
         }
     }
 
@@ -156,6 +190,7 @@ public final class MainActivity extends Activity {
             message = filter == 1 ? "还没有收藏。可在影片右侧菜单中加入收藏。" : filter == 2 ?
                     "还没有离线副本。可从服务器选择影片下载。" : "点「打开文件」选择视频。手机或外接盘上的影片可直接从原位置播放。";
         }
+        if (!server && !migrationStatus.isEmpty()) message = migrationStatus;
         feedback.setText(message); feedback.setVisibility(message.isEmpty() ? View.GONE : View.VISIBLE);
         adapter.notifyDataSetChanged();
     }
@@ -222,25 +257,48 @@ public final class MainActivity extends Activity {
         }
         VideoLibrary.Entry e = (VideoLibrary.Entry) item;
         if (VideoLibrary.READY.equals(e.state)) {
-            e.time = System.currentTimeMillis(); library.save(e); play(library.uri(e), e.name);
+            if (missing.contains(e.id)) {
+                new AlertDialog.Builder(this).setTitle("公共目录中的影片已移走或删除")
+                        .setMessage(e.name).setNegativeButton("返回", null)
+                        .setPositiveButton("重新下载", (d, w) ->
+                                download(new ServerVideos.Movie(e.name, e.bytes, e.source), e)).show();
+                return;
+            }
+            VideoLibrary.Entry current = library.touch(e.id);
+            if (current != null) play(library.uri(current), current.name);
         } else if (VideoLibrary.FAILED.equals(e.state)) download(new ServerVideos.Movie(e.name, e.bytes, e.source), e);
         else confirmRemove(e);
     }
 
     private void download(ServerVideos.Movie m, VideoLibrary.Entry prior) {
         if (ServerVideos.playlist(m.name)) { toast("播放列表包含外部分片，无法作为单个离线影片下载。"); return; }
+        if (!canWriteDownloads()) {
+            requestedDownload = m;
+            requestedRetryId = prior == null ? null : prior.id;
+            requestDownloadPermission();
+            return;
+        }
         try {
-            library.enqueue(m, prior); refreshRows(); toast("已加入系统下载，可在「本地」查看进度。"); poll();
+            library.enqueue(m, prior);
+            if (prior != null) missing.remove(prior.id);
+            refreshRows(); toast("已开始下载到 Download/NiceVideos"); poll();
         } catch (IOException | RuntimeException ex) { toast(error(ex)); }
     }
 
     private void actions(View anchor, VideoLibrary.Entry e) {
         PopupMenu menu = new PopupMenu(this, anchor);
         menu.getMenu().add(e.favorite ? "取消收藏" : "加入收藏").setOnMenuItemClickListener(item -> {
-            VideoLibrary.Entry current = library.find(e.id);
-            if (current != null) { current.favorite = !current.favorite; library.save(current); refreshRows(); }
+            library.toggleFavorite(e.id);
+            refreshRows();
             return true;
         });
+        if (e.publicDownload && !VideoLibrary.TRANSFER.equals(e.state)) {
+            menu.getMenu().add("从列表移除").setOnMenuItemClickListener(item -> {
+                library.forget(e); missing.remove(e.id); refreshRows();
+                return true;
+            });
+            if (missing.contains(e.id)) { menu.show(); return; }
+        }
         menu.getMenu().add(!e.downloaded() ? "从最近播放移除" : VideoLibrary.TRANSFER.equals(e.state) ?
                 "取消下载" : "删除本机副本").setOnMenuItemClickListener(item -> { confirmRemove(e); return true; });
         menu.show();
@@ -250,7 +308,9 @@ public final class MainActivity extends Activity {
         boolean transfer = VideoLibrary.TRANSFER.equals(e.state);
         String title = !e.downloaded() ? "移除播放记录" : transfer ? "取消下载" : "删除本机副本";
         String hint = !e.downloaded() ? "只移除这条记录，文件管理器中的原片会保留。" :
-                transfer ? "已传输的部分将被清理。" : "删除后可从服务器重新下载，服务器原片会保留。";
+                transfer ? "已传输的部分将被清理。" : e.publicDownload ?
+                        "这会删除公共下载目录中的视频文件，其他播放器也将无法打开它。" :
+                        "删除后可从服务器重新下载，服务器原片会保留。";
         new AlertDialog.Builder(this).setTitle(title).setMessage(e.name + "\n\n" + hint)
                 .setNegativeButton("返回", null).setPositiveButton("确认", (d, w) -> {
                     try { library.remove(e); progress.remove(e.id); refreshRows(); }
@@ -293,13 +353,85 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private boolean canWriteDownloads() {
+        return Build.VERSION.SDK_INT >= 29 || checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestDownloadPermission() {
+        requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, WRITE_DOWNLOADS);
+    }
+
+    @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] grants) {
+        super.onRequestPermissionsResult(code, permissions, grants);
+        if (code != WRITE_DOWNLOADS) return;
+        ServerVideos.Movie movie = requestedDownload;
+        String retryId = requestedRetryId;
+        requestedDownload = null;
+        requestedRetryId = null;
+        if (!canWriteDownloads()) {
+            toast("保存到公共下载目录需要存储权限。已有离线影片仍可播放。");
+            return;
+        }
+        if (movie != null) download(movie, retryId == null ? sources.get(movie.url) : library.find(retryId));
+        startMigration();
+    }
+
+    private void checkPublicFiles() {
+        jobs.execute(() -> {
+            Set<String> absent = new HashSet<>();
+            for (VideoLibrary.Entry e : library.all()) {
+                if (library.missingPublicFile(e)) absent.add(e.id);
+            }
+            main.post(() -> {
+                if (!live()) return;
+                missing.clear(); missing.addAll(absent); refreshRows();
+            });
+        });
+    }
+
+    private void startMigration() {
+        if (!canWriteDownloads()) return;
+        if (migrating) { rescanAfterMigration = true; return; }
+        migrating = true;
+        updatePanel();
+        migrations.execute(() -> {
+            LegacyDownloadMigration migration = new LegacyDownloadMigration(library);
+            String problem = "";
+            int moved = 0;
+            try {
+                migration.recover();
+            } catch (IOException | RuntimeException ex) { problem = error(ex); }
+            for (VideoLibrary.Entry entry : library.all()) {
+                if (Thread.currentThread().isInterrupted()) return;
+                if (!LegacyDownloadMigration.needsMigration(entry)) continue;
+                main.post(() -> {
+                    if (live()) { migrationStatus = "正在迁移：" + entry.name; refreshRows(); }
+                });
+                try {
+                    if (migration.migrate(entry.id)) moved++;
+                } catch (IOException | RuntimeException ex) {
+                    if (problem.isEmpty()) problem = entry.name + " · " + error(ex);
+                }
+            }
+            String summary = !problem.isEmpty() ? "迁移待重试：" + problem :
+                    moved > 0 ? moved + " 个视频已迁移到 Download/NiceVideos" : "";
+            main.post(() -> {
+                if (!live()) return;
+                migrating = false; migrationStatus = summary;
+                updatePanel(); refreshRows();
+                if (rescanAfterMigration) { rescanAfterMigration = false; startMigration(); }
+            });
+        });
+    }
+
     @Override protected void onResume() {
         super.onResume(); resumed = true;
-        if (library != null) { refreshRows(); poll(); }
+        if (library != null) { updatePanel(); refreshRows(); poll(); checkPublicFiles(); startMigration(); }
     }
     @Override protected void onPause() { resumed = false; main.removeCallbacks(pollLater); super.onPause(); }
     @Override protected void onDestroy() {
-        main.removeCallbacksAndMessages(null); network.shutdownNow(); documents.shutdownNow(); jobs.shutdownNow();
+        main.removeCallbacksAndMessages(null); network.shutdownNow(); documents.shutdownNow(); jobs.shutdownNow(); migrations.shutdownNow();
         super.onDestroy();
     }
     private final Runnable pollLater = this::poll;
@@ -320,6 +452,7 @@ public final class MainActivity extends Activity {
             main.post(() -> {
                 if (!live()) return;
                 checking = false;
+                boolean legacyFinished = false;
                 for (VideoLibrary.Entry old : active) {
                     VideoLibrary.Transfer t = updates.get(old.id);
                     VideoLibrary.Entry e = library.find(old.id);
@@ -327,10 +460,16 @@ public final class MainActivity extends Activity {
                     progress.put(e.id, t);
                     if (!VideoLibrary.TRANSFER.equals(t.state)) {
                         e.state = t.state; e.error = VideoLibrary.FAILED.equals(t.state) ? t.label : "";
-                        if (VideoLibrary.READY.equals(t.state)) e.bytes = t.bytes;
+                        if (VideoLibrary.READY.equals(t.state)) {
+                            e.bytes = t.bytes;
+                            if (!t.publicUri.isEmpty()) e.publicUri = t.publicUri;
+                            if (!t.disk.isEmpty()) e.disk = t.disk;
+                            legacyFinished |= LegacyDownloadMigration.needsMigration(e);
+                        }
                         library.save(e);
                     }
                 }
+                if (legacyFinished) { updatePanel(); startMigration(); }
                 if (resumed) { refreshRows(); main.postDelayed(pollLater, 1500); }
             });
         });
@@ -349,7 +488,9 @@ public final class MainActivity extends Activity {
             VideoLibrary.Transfer t = progress.get(e.id);
             return t == null ? "等待下载" : t.label + (t.bytes > 0 ? " · " + size(t.bytes) + (t.total > 0 ? " / " + size(t.total) : "") : "");
         }
-        return (e.downloaded() ? "离线副本" : "文件") + (e.bytes >= 0 ? " · " + size(e.bytes) : "") + (e.favorite ? " · 已收藏" : "");
+        if (missing.contains(e.id)) return "公共文件已移走或删除 · 轻点重新下载";
+        String location = e.publicDownload ? "Download/NiceVideos/" + e.disk : e.downloaded() ? "旧版离线副本" : "文件";
+        return location + (e.bytes >= 0 ? " · " + size(e.bytes) : "") + (e.favorite ? " · 已收藏" : "");
     }
 
     private final class Rows extends BaseAdapter {

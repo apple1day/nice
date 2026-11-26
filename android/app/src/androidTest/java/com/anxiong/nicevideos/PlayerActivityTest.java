@@ -35,6 +35,11 @@ import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.FileOutputStream;
+import java.io.FileInputStream;
+import java.io.RandomAccessFile;
+import java.util.UUID;
+
+import static org.junit.Assume.assumeTrue;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -97,6 +102,62 @@ public class PlayerActivityTest {
             assertTrue(clip.length() > (1L << 32));
             verifyLargeMovie(Uri.fromFile(clip));
         } finally { clip.delete(); }
+    }
+
+    @Test public void migratesAndSeeksInAnOfflineMovieLargerThanFourGiB() throws Exception {
+        VideoLibrary library = new VideoLibrary(app);
+        VideoLibrary.Entry entry = new VideoLibrary.Entry(UUID.randomUUID().toString());
+        entry.name = "旧版大影片-" + entry.id + ".mp4";
+        entry.disk = entry.id + ".mp4";
+        File source = library.file(entry);
+        final long sampleOffset = 1L << 32;
+        byte[] expected = new byte[32];
+        LegacyDownloadMigration migration = new LegacyDownloadMigration(library);
+        if (android.os.Build.VERSION.SDK_INT < 29) {
+            InstrumentationRegistry.getInstrumentation().getUiAutomation().grantRuntimePermission(
+                    app.getPackageName(), android.Manifest.permission.WRITE_EXTERNAL_STORAGE);
+        }
+        try {
+            try (FileOutputStream output = new FileOutputStream(source)) {
+                append(output, "co64-index.bin");
+                output.getChannel().position(sampleOffset);
+                append(output, "co64-samples.bin");
+            }
+            entry.bytes = source.length();
+            assertTrue(entry.bytes > sampleOffset + expected.length);
+            long free = source.getParentFile().getUsableSpace();
+            assumeTrue("Full migration needs room for a streamed copy: " + entry.bytes
+                    + " bytes plus filesystem overhead, available: " + free,
+                    free >= entry.bytes + (128L << 20));
+            try (RandomAccessFile original = new RandomAccessFile(source, "r")) {
+                original.seek(sampleOffset);
+                original.readFully(expected);
+            }
+            assertTrue(library.saveCommitted(entry));
+            Uri playback = library.uri(entry);
+            assertTrue(migration.migrate(entry.id));
+            VideoLibrary.Entry migrated = library.find(entry.id);
+            assertNotNull(migrated);
+            assertTrue(migrated.publicDownload);
+            assertEquals(entry.bytes, migrated.bytes);
+            assertEquals(playback, library.uri(migrated));
+            assertFalse(source.exists());
+            ParcelFileDescriptor descriptor = app.getContentResolver()
+                    .openFileDescriptor(Uri.parse(migrated.publicUri), "r");
+            assertNotNull(descriptor);
+            assertEquals(entry.bytes, descriptor.getStatSize());
+            try (FileInputStream input = new ParcelFileDescriptor.AutoCloseInputStream(descriptor)) {
+                input.getChannel().position(sampleOffset);
+                byte[] actual = new byte[expected.length];
+                new java.io.DataInputStream(input).readFully(actual);
+                assertArrayEquals(expected, actual);
+            }
+            verifyLargeMovie(playback);
+        } finally {
+            library.remove(entry);
+            source.delete();
+            migration.recover();
+        }
     }
 
     @Test @SdkSuppress(minSdkVersion = 29)

@@ -1,6 +1,10 @@
 package com.anxiong.nicevideos;
 
+import android.app.DownloadManager;
 import android.content.Context;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Environment;
 import android.os.SystemClock;
 import android.view.View;
 import android.view.ViewGroup;
@@ -15,6 +19,7 @@ import org.junit.runner.RunWith;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -129,6 +134,16 @@ public final class ServerDownloadTest {
                 assertEquals("System download: " + e.state + " / " + e.error, VideoLibrary.READY, e.state);
                 assertTrue("Download route didn't receive GET for the decoded filename", server.downloaded);
                 assertEquals(server.media.length, e.bytes);
+                assertTrue(e.publicDownload);
+                File expected = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                        "NiceVideos/" + e.disk);
+                assertTrue(e.disk.startsWith("样片 #+ 1%"));
+                try (Cursor row = library.manager().query(new DownloadManager.Query().setFilterById(e.job))) {
+                    assertNotNull(row);
+                    assertTrue(row.moveToFirst());
+                    String localUri = row.getString(row.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI));
+                    assertEquals(expected.getAbsolutePath(), Uri.parse(localUri).getPath());
+                }
                 try (InputStream in = context.getContentResolver().openInputStream(library.uri(e))) {
                     assertNotNull(in);
                     ByteArrayOutputStream read = new ByteArrayOutputStream();
@@ -138,7 +153,10 @@ public final class ServerDownloadTest {
                 }
                 library.remove(e);
                 assertNull(library.find(e.id));
-                assertFalse(library.file(e).exists());
+                // DownloadProvider schedules its file cleanup after removing the job.
+                long cleanupDeadline = SystemClock.elapsedRealtime() + 5000;
+                while (expected.exists() && SystemClock.elapsedRealtime() < cleanupDeadline) SystemClock.sleep(50);
+                assertFalse(expected.exists());
             } finally {
                 for (VideoLibrary.Entry e : library.all()) if (e.source.startsWith(base + "/")) library.remove(e);
                 library.prefs.edit().putString("server", previous).commit();

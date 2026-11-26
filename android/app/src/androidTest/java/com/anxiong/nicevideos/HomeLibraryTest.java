@@ -117,7 +117,10 @@ public final class HomeLibraryTest {
                     assertTrue("System document was never forwarded", handedOff.await(8, TimeUnit.SECONDS));
                     assertEquals(source, playback.get().getData());
                     assertEquals(e.name, playback.get().getStringExtra("title"));
-                    assertEquals(3L, file.length());
+                    try (ParcelFileDescriptor fd = app.getContentResolver().openFileDescriptor(source, "r")) {
+                        assertNotNull(fd);
+                        assertEquals(3L, fd.getStatSize());
+                    }
                 } finally { ins.removeMonitor(monitor); }
             }
         } finally {

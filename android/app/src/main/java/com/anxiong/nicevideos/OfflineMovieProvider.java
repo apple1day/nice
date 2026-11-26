@@ -8,7 +8,6 @@ import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
 import android.webkit.MimeTypeMap;
-import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 
@@ -26,11 +25,8 @@ public final class OfflineMovieProvider extends ContentProvider {
         VideoLibrary.Entry e = lookup(uri);
         if (e == null || !"r".equals(mode)) throw new FileNotFoundException("没有可读取的本机副本。");
         try {
-            File f = new VideoLibrary(getContext()).file(e);
-            if (!f.isFile() || f.length() == 0 || (e.bytes >= 0 && f.length() != e.bytes))
-                throw new FileNotFoundException("本机副本不完整。");
-            return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY);
-        } catch (IOException ex) { throw new FileNotFoundException(ex.getMessage()); }
+            return new VideoLibrary(getContext()).openMovie(e);
+        } catch (IOException | SecurityException ex) { throw new FileNotFoundException(ex.getMessage()); }
     }
 
     @Override public Cursor query(Uri uri, String[] projection, String where, String[] args, String order) {
@@ -47,7 +43,7 @@ public final class OfflineMovieProvider extends ContentProvider {
     @Override public String getType(Uri uri) {
         VideoLibrary.Entry e = lookup(uri);
         if (e == null) return null;
-        String type = MimeTypeMap.getSingleton().getMimeTypeFromExtension(e.disk.substring(e.disk.lastIndexOf('.') + 1));
+        String type = MimeTypeMap.getSingleton().getMimeTypeFromExtension(e.disk.substring(e.disk.lastIndexOf('.') + 1).toLowerCase(java.util.Locale.ROOT));
         return type == null ? "video/*" : type;
     }
     @Override public Uri insert(Uri u, ContentValues v) { throw new UnsupportedOperationException(); }
