@@ -869,18 +869,22 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         let retryOutput: MovieOutput = afterglowViewing ? .afterglow : .system
         let retryTitle = afterglowViewing ? "重试 Afterglow XR" : "恢复系统解码"
         let fallback = outputOverride == .afterglow && activeOutput == .vlcFrames
-        return VRViewerSettingsView(profile: Binding(get: { vrProfile }, set: applyProfile),
-                             followHead: afterglowViewing ? $afterglowGyro : $followHead, nativeResolution: $nativeResolution,
+        var details = model.videoDetails
+        if fallback {
+            details = "Afterglow XR 已回退到 VLC。" + (details.map { " " + $0 } ?? "")
+        }
+        let action: String? = appleActive ? "尝试 VLC 解码" :
+            (afterglowViewing || defaultOutput == .system ? retryTitle : nil)
+        let gyro: Binding<Bool> = afterglowViewing ? $afterglowGyro : $followHead
+        let profile = Binding<VRMoviePreferences>(get: { vrProfile }, set: { applyProfile($0) })
+        return VRViewerSettingsView(profile: profile, followHead: gyro, nativeResolution: $nativeResolution,
                              doubleTap: $doubleTap, pinchResponse: $pinchResponse, wakeGesture: $wakeGesture,
                              sensorAvailable: camera.sensorAvailable, decoder: activeOutput.title,
-                             details: [fallback ? "Afterglow XR 已回退到 VLC。" : nil, model.videoDetails]
-                                .compactMap { $0 }.joined(separator: " "),
-                             decoderAction: appleActive ? "尝试 VLC 解码" :
-                                (afterglowViewing || defaultOutput == .system ? retryTitle : nil),
+                             details: details, decoderAction: action,
                              onCopyDiagnostics: model.copyPlaybackDiagnostics,
                              onDecoderChange: { selectOutput(appleActive ? .vlcFrames : retryOutput) },
                              usesAfterglowPreset: afterglowViewing,
-                             onOpenAfterglow: afterglowViewing ? nil : enterAfterglow,
+                             onOpenAfterglow: { enterAfterglow() },
                              onExit: { leavePanorama(); revealControls() })
     }
 

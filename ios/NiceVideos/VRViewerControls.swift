@@ -255,7 +255,7 @@ enum VRPinchResponse: String, CaseIterable {
     let onCopyDiagnostics: () -> Bool
     let onDecoderChange: () -> Void
     let usesAfterglowPreset: Bool
-    let onOpenAfterglow: (() -> Void)?
+    let onOpenAfterglow: () -> Void
     let onExit: () -> Void
 
     var body: some View {
@@ -299,7 +299,7 @@ enum VRPinchResponse: String, CaseIterable {
                     LabeledContent("当前解码", value: decoder)
                     if let details { Text(details).font(.footnote) }
                     if let decoderAction { Button(decoderAction) { onDecoderChange(); dismiss() } }
-                    if let onOpenAfterglow {
+                    if !usesAfterglowPreset {
                         Button("用 Afterglow XR 播放") { onOpenAfterglow(); dismiss() }
                     }
                 }

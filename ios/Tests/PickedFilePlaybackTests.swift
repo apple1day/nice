@@ -128,6 +128,7 @@ final class PickedFilePlaybackTests: XCTestCase {
             }
         }
         var baseline: [[UInt8]]?
+        var sampledRoute: MovieOutput?
         var sampledID: UInt64 = 0
         var seekRequested = false
         let deadline = Date().addingTimeInterval(allowVLCFallback ? 40 : 20)
@@ -136,6 +137,10 @@ final class PickedFilePlaybackTests: XCTestCase {
             if usableRoute && state.phase == .playing &&
                 state.seekable && renderer.acceptedFrameID > sampledID {
                 sampledID = renderer.acceptedFrameID
+                if sampledRoute != state.videoOutput {
+                    baseline = nil
+                    sampledRoute = state.videoOutput
+                }
                 if !seekRequested {
                     seekRequested = true
                     engine.seek(to: 5)
