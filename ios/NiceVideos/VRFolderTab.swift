@@ -186,48 +186,17 @@ import UIKit
                                    description: Text("可以从上一级选择其他文件夹。"))
         } else {
             ForEach(library.entries) { entry in
-                Button {
+                VRFolderEntryRow(entry: entry, isOpening: openingID == entry.id,
+                                 lease: { try? library.selection(for: entry) }) {
                     if entry.isDirectory { cancelOpen(); library.enter(entry) }
                     else {
                         do { open(try library.selection(for: entry), id: entry.id) }
                         catch { playbackError = error.localizedDescription }
                     }
-                } label: {
-                    HStack(spacing: 13) {
-                        if entry.isDirectory {
-                            RoundedRectangle(cornerRadius: 8).fill(Self.panel)
-                                .overlay { Image(systemName: "folder.fill").foregroundStyle(.cyan).font(.title3) }
-                                .frame(width: 86, height: 54)
-                        } else {
-                            VRFolderVideoPoster(entry: entry) { try? library.selection(for: entry) }
-                                .frame(width: 86, height: 54)
-                        }
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(entry.name).font(.subheadline.weight(.semibold))
-                                .lineLimit(2).truncationMode(.middle)
-                            Text(metadata(entry)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 2)
-                        if openingID == entry.id { ProgressView() }
-                        else { Image(systemName: entry.isDirectory ? "chevron.right" : "play.fill")
-                            .font(.caption).foregroundStyle(.secondary).padding(.trailing, 4) }
-                    }
-                    .padding(.vertical, 8).contentShape(Rectangle())
                 }
-                .foregroundStyle(.white).buttonStyle(.plain)
-                .accessibilityLabel(entry.name + "，" + metadata(entry))
-                .accessibilityHint(entry.isDirectory ? "浏览子文件夹" : "直接进入 VR 播放")
-                .accessibilityIdentifier("vrEntry-" + entry.name)
                 Divider().overlay(.white.opacity(0.09))
             }
         }
-    }
-
-    private func metadata(_ entry: VRFolderEntry) -> String {
-        if entry.isDirectory { return "文件夹" }
-        var parts = [entry.url.pathExtension.uppercased()]
-        if let size = entry.byteCount { parts.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) }
-        return parts.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
     private func folderMenu(_ root: VRFolderRoot) -> some View {
@@ -307,65 +276,133 @@ private struct VRDirectoryPicker: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
 }
 
-@MainActor private struct VRFolderVideoPoster: View {
+@MainActor private struct VRFolderEntryRow: View {
     let entry: VRFolderEntry
+    let isOpening: Bool
     let lease: () -> PickedVideoFile.Selection?
-    @State private var poster: UIImage?
-    private static let cache: NSCache<NSString, UIImage> = {
-        let cache = NSCache<NSString, UIImage>()
+    let open: () -> Void
+
+    private final class Details {
+        var image: UIImage?
+        var duration: String?
+        var dimensions: String?
+    }
+    @State private var details: Details?
+    private static let cache: NSCache<NSString, Details> = {
+        let cache = NSCache<NSString, Details>()
+        cache.countLimit = 250
         cache.totalCostLimit = 12 * 1024 * 1024
         return cache
     }()
+
     private var key: String {
         "\(entry.id)|\(entry.byteCount ?? -1)|\(entry.modifiedAt?.timeIntervalSinceReferenceDate ?? 0)"
     }
+    private var metadata: String {
+        if entry.isDirectory { return "文件夹" }
+        var parts = [entry.url.pathExtension.uppercased()]
+        if let dimensions = details?.dimensions { parts.append(dimensions) }
+        if let bytes = entry.byteCount { parts.append(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) }
+        return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
     var body: some View {
+        Button(action: open) {
+            HStack(spacing: 13) {
+                poster.frame(width: 86, height: 54)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(entry.name).font(.subheadline.weight(.semibold)).lineLimit(2).truncationMode(.middle)
+                    Text(metadata).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 2)
+                if isOpening { ProgressView() }
+                else { Image(systemName: entry.isDirectory ? "chevron.right" : "play.fill")
+                    .font(.caption).foregroundStyle(.secondary).padding(.trailing, 4) }
+            }
+            .padding(.vertical, 8).contentShape(Rectangle())
+        }
+        .foregroundStyle(.white).buttonStyle(.plain)
+        .accessibilityLabel([entry.name, metadata, details?.duration].compactMap { $0 }.joined(separator: "，"))
+        .accessibilityHint(entry.isDirectory ? "浏览子文件夹" : "直接进入 VR 播放")
+        .accessibilityIdentifier("vrEntry-" + entry.name)
+        .task(id: key) { await loadDetails() }
+    }
+
+    private var poster: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8).fill(Color(white: 0.14))
-            if let poster {
+            if entry.isDirectory {
+                Image(systemName: "folder.fill").font(.title3).foregroundStyle(.cyan)
+            } else if let image = details?.image {
                 GeometryReader { geometry in
-                    Image(uiImage: poster).resizable().scaledToFill()
+                    Image(uiImage: image).resizable().scaledToFill()
                         .frame(width: geometry.size.width, height: geometry.size.height).clipped()
                 }
             } else {
                 Image(systemName: "film").font(.title2.weight(.light)).foregroundStyle(.secondary)
             }
-        }.clipShape(RoundedRectangle(cornerRadius: 8))
-        .accessibilityHidden(true)
-        .task(id: key) {
-            poster = nil
-            guard entry.canThumbnail else { return }
-            let name = key as NSString
-            if let hit = Self.cache.object(forKey: name) { poster = hit; return }
-            guard !Task.isCancelled, let selection = lease() else { return }
-            // Decode a small poster only for files the provider reports as local.
-            // Keep the folder grant alive until the asynchronous request has finished.
-            defer { withExtendedLifetime(selection) {} }
-            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: selection.url))
-            generator.appliesPreferredTrackTransform = true
-            generator.maximumSize = CGSize(width: 258, height: 162)
-            var result: UIImage?
-            do {
-                let frame = try await withTaskCancellationHandler {
-                    try await generator.image(at: .zero)
-                } onCancel: { generator.cancelAllCGImageGeneration() }
-                result = UIImage(cgImage: frame.image)
-            } catch {
-                guard !Task.isCancelled else { return }
-                let request = QLThumbnailGenerator.Request(fileAt: selection.url, size: CGSize(width: 86, height: 54),
-                                                           scale: UIScreen.main.scale, representationTypes: .thumbnail)
-                let thumbnails = QLThumbnailGenerator.shared
-                result = await withTaskCancellationHandler {
-                    await withCheckedContinuation { continuation in
-                        thumbnails.generateBestRepresentation(for: request) { item, _ in
-                            continuation.resume(returning: item?.uiImage)
-                        }
-                    }
-                } onCancel: { thumbnails.cancel(request) }
-            }
-            guard !Task.isCancelled, let result else { return }
-            if let cg = result.cgImage { Self.cache.setObject(result, forKey: name, cost: cg.bytesPerRow * cg.height) }
-            poster = result
         }
+        .overlay(alignment: .bottomTrailing) {
+            if let duration = details?.duration {
+                Text(duration).font(.caption2.monospacedDigit().weight(.semibold)).foregroundStyle(.white)
+                    .padding(.horizontal, 4).padding(.vertical, 1)
+                    .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 3))
+                    .padding(3)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8)).accessibilityHidden(true)
+    }
+
+    private func loadDetails() async {
+        details = nil
+        guard !entry.isDirectory, entry.canThumbnail else { return }
+        let name = key as NSString
+        if let hit = Self.cache.object(forKey: name) { details = hit; return }
+        guard !Task.isCancelled, let selection = lease() else { return }
+        defer { withExtendedLifetime(selection) {} }
+        let asset = AVURLAsset(url: selection.url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 258, height: 162)
+        let value = Details()
+        await withTaskCancellationHandler {
+            if let duration = try? await asset.load(.duration), duration.seconds.isFinite, duration.seconds > 0 {
+                value.duration = PlaybackPosition.label(duration.seconds)
+            }
+            if !Task.isCancelled, let tracks = try? await asset.loadTracks(withMediaType: .video), let track = tracks.first,
+               let size = try? await track.load(.naturalSize), let transform = try? await track.load(.preferredTransform) {
+                let rect = CGRect(origin: .zero, size: size).applying(transform)
+                if rect.width >= 1 && rect.height >= 1, let width = Int(exactly: rect.width.rounded()),
+                   let height = Int(exactly: rect.height.rounded()) {
+                    value.dimensions = "\(width) × \(height)"
+                }
+            }
+            if !Task.isCancelled, let frame = try? await generator.image(at: .zero) {
+                value.image = UIImage(cgImage: frame.image)
+            }
+        } onCancel: {
+            asset.cancelLoading()
+            generator.cancelAllCGImageGeneration()
+        }
+        // A provider can have its own preview even when AVFoundation cannot
+        // decode the source. Unmaterialized cloud files never reach this path.
+        if value.image == nil, !Task.isCancelled {
+            let request = QLThumbnailGenerator.Request(fileAt: selection.url, size: CGSize(width: 86, height: 54),
+                                                       scale: UIScreen.main.scale, representationTypes: .thumbnail)
+            let thumbnails = QLThumbnailGenerator.shared
+            value.image = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    thumbnails.generateBestRepresentation(for: request) { item, _ in
+                        continuation.resume(returning: item?.uiImage)
+                    }
+                }
+            } onCancel: { thumbnails.cancel(request) }
+        }
+        guard !Task.isCancelled, value.image != nil || value.dimensions != nil || value.duration != nil else { return }
+        let cost: Int
+        if let image = value.image?.cgImage { cost = image.bytesPerRow * image.height }
+        else { cost = 1 }
+        Self.cache.setObject(value, forKey: name, cost: cost)
+        details = value
     }
 }

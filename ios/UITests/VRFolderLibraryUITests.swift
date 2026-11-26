@@ -60,6 +60,8 @@ final class VRFolderLibraryUITests: XCTestCase {
         XCTAssertFalse(control("vrEntry-notes.txt").exists)
         XCTAssertTrue(try hasChartThumbnail(rootMovie), "Expected the film's colored preview inside its list row")
 
+        XCTAssertTrue(rootMovie.label.contains("384 × 192"), rootMovie.label)
+        XCTAssertTrue(rootMovie.label.contains("01:00"), rootMovie.label)
         attachVRScreen("VR-library-folder")
         let subfolder = control("vrEntry-旅行")
         XCTAssertTrue(subfolder.exists)
@@ -106,7 +108,7 @@ final class VRFolderLibraryUITests: XCTestCase {
     }
 
     private func attachVRScreen(_ name: String) {
-        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        let attachment = XCTAttachment(data: XCUIScreen.main.screenshot().pngRepresentation, uniformTypeIdentifier: "public.png")
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
