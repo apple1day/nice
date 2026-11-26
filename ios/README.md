@@ -39,7 +39,7 @@ PORT=8106 go run .
 - 只有云端副本时，iCloud 或网盘可能先下载、缓存整部影片，需要相应的本机空间。若打算断网看，先在「文件」中将影片下载到设备。
 - 选中的文件单独播放，退出后仍在原位置。下次通过「打开文件」重新选择。下载片库的批量删除不会处理这些外部文件。
 
-### 在 iPhone 上看 VR 影片（1.3.1，构建 10）
+### 在 iPhone 上看 VR 影片（1.3.2，构建 11）
 
 1. 打开底部的「VR」，点「选择文件夹」，在系统「文件」中选中影片所在目录。点子文件夹可以继续浏览，点影片直接进入全景播放。列表显示文件名、大小和格式，已经在本地的影片会按需读取缩略图、时长和分辨率。App 会记住已授权的文件夹，也可以从「VR」只打开一个视频。文件夹只读，影片从原位置按需读取。首次按 180° 经纬全景、左右分屏、手机单屏观看处理。
    原「本地 → 打开文件」仍先进入普通播放，可在播放器中点「VR → 进入全景 VR」。
@@ -49,6 +49,21 @@ PORT=8106 go run .
 5. 拖动视角仅更新 Metal 画面；拖动进度条只预览目标时间，松手后跳转一次，取消时保留原播放位置。通过「文件」打开受支持的 MP4、MOV、M4V 时，平面与全景共用一个 AVPlayerItem。主动更换解码器或切换 VLC 原生／兼容输出会按原进度重新打开影片。
 
 要覆盖自己的旧版，请在 Mac 上保留原有签名 Team 和 Bundle Identifier，拉取改动后运行 `bash ios/setup.sh`，打开 `ios/NiceVideos.xcworkspace`，选中 iPhone 并运行。CI 的 `NiceVideos-iPhone-unsigned` 包含已编译的 arm64 真机 IPA，须由使用者签名后安装。
+
+### 在 iPhone 上定位进度前进、画面静止或黑屏
+
+1. 用原片和出问题的投影模式播放，时间继续走动时先等约 20 秒，保持 App 在前台。点「VR 设置 → 复制播放诊断」即可粘贴整份报告；普通模式下从播放器的「VR」菜单复制。报告按会话保留一段采样历史，包含版本、设备、视频轨和实际出帧情况。
+2. 如需连续日志，在 Mac 的仓库运行 `bash ios/setup.sh`，打开 `ios/NiceVideos.xcworkspace`，选择 scheme `NiceVideos` 和已连接的 iPhone，按 ⌘R。在 Xcode 按 ⇧⌘Y 显示调试区，在控制台筛选 `[NiceVR]`。从打开原片起录到故障出现后约 20 秒，复制同一个 `session=` 的记录。可以一并说明当时声音是否连续、文件在手机／外接盘／网盘哪一处，以及退出全景使用普通播放是否恢复画面。
+3. 对比相隔约 5 秒的几条记录。`media` 是播放时钟，系统解码路径另有 `framePTS` 和 `copied`。在 Metal 渲染器中，`recvID`、`acceptID`、`submitID`、`completeID`、`presentID` 分别反映收到、可绘制、提交、GPU 完成和收到屏幕呈现回调的最新帧。普通系统图层不经过这条 Metal 路径。收到呈现回调也不能判断两帧的实际像素或原片内容是否相同。
+4. 如有原片的 Mac 副本，下面的命令只输出第一条视频轨的媒体参数。将最后一个参数换为实际文件路径。
+
+```bash
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=codec_name,profile,level,width,height,pix_fmt,avg_frame_rate,color_space,color_transfer,color_primaries,bit_rate:format=duration,size,bit_rate \
+  -of json "/path/to/video.mp4"
+```
+
+技术参考：[GPUImage 的 AVPlayerItemVideoOutput 取帧实现](https://github.com/BradLarson/GPUImage/blob/master/framework/Source/GPUImageMovie.m)、[Apple 的视频输出通知说明](https://developer.apple.com/documentation/avfoundation/avplayeritemvideooutput/requestnotificationofmediadatachange(withadvanceinterval:))、[VideoLAN 的内存帧回调及性能说明](https://videolan.videolan.me/vlc-3.0/group__libvlc__media__player.html)。
 
 ### 管理服务器地址
 

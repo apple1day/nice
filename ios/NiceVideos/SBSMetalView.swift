@@ -90,11 +90,44 @@ struct SBSMovieGeometry: Equatable {
 
 @MainActor
 final class SBSMetalView: UIView, MTKViewDelegate {
-    private struct Frame {
-        let pixelBuffer: CVPixelBuffer
-        let imageTexture: CVMetalTexture?
-        let texture: MTLTexture
-        let packedAspect: CGFloat
+    // GPU completion and actual drawable presentation are distinct callbacks.
+    // The latter may arrive on another queue or after a newer source frame.
+    private final class GPUProgress: @unchecked Sendable {
+        private let lock = NSLock()
+        private var completedID: UInt64 = 0
+        private var presentedID: UInt64 = 0
+        private var presentationTime: CFTimeInterval = 0
+        private var failures = 0
+        private var lastError = "none"
+
+        func completed(id: UInt64, command: MTLCommandBuffer) {
+            lock.withLock {
+                if command.status == .completed { completedID = max(completedID, id) }
+                else {
+                    failures += 1
+                    if let error = command.error as NSError? { lastError = "\(error.domain):\(error.code)" }
+                    else { lastError = "status-\(command.status.rawValue)" }
+                }
+            }
+        }
+
+        func presented(id: UInt64, time: CFTimeInterval) {
+            lock.withLock {
+                if id > presentedID && time > 0 {
+                    presentedID = id
+                    presentationTime = time
+                }
+            }
+        }
+
+        var lastPresentedID: UInt64 { lock.withLock { presentedID } }
+
+        var summary: String {
+            lock.withLock {
+                let age = presentationTime > 0 ? String(format: "%.2f", max(0, CACurrentMediaTime() - presentationTime)) : "NA"
+                return "completeID=\(completedID) presentID=\(presentedID) presentAgeSec=\(age) gpuFailures=\(failures) gpuError=\(lastError)"
+            }
+        }
     }
 
     var mode: SBSDisplayMode = .standard {
@@ -128,7 +161,31 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     private var indexBuffer: MTLBuffer?
     private var vertexBuffer: MTLBuffer?
     private var geometry: SBSMovieGeometry?
-    private var frameToDraw: Frame?
+    private var frameToDraw: MetalMovieFrame?
+    private let gpuProgress = GPUProgress()
+    private(set) var receivedFrameID: UInt64 = 0
+    private(set) var acceptedFrameID: UInt64 = 0
+    private var submittedFrameID: UInt64 = 0
+    var presentedFrameID: UInt64 { gpuProgress.lastPresentedID }
+    private var receivedWidth = 0, receivedHeight = 0
+    private var pixelFormat: OSType = 0
+    private var rejected = 0, cpuUploads = 0, noDrawable = 0, gpuBusy = 0
+    private var lastMapError = "none"
+    private var lastCacheResult: CVReturn = kCVReturnSuccess
+    private var retries = 0
+    private var delayedRetry: DispatchWorkItem?
+
+    // Sample only when logging or copying diagnostics, never per display tick.
+    var frameDiagnostics: String {
+        let size = metalView.drawableSize
+        let bytes = [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: pixelFormat >> $0) }
+        let fourCC = bytes.allSatisfy { (32..<127).contains($0) } ? String(decoding: bytes, as: UTF8.self) : "unknown"
+        return "metal recvID=\(receivedFrameID) acceptID=\(acceptedFrameID) submitID=\(submittedFrameID) " +
+            gpuProgress.summary + " input=\(receivedWidth)x\(receivedHeight):\(fourCC) target=\(Int(size.width))x\(Int(size.height))" +
+            " visible=\(canPresent) paused=\(metalView.isPaused) rejected=\(rejected) cpuUpload=\(cpuUploads)" +
+            " noDrawable=\(noDrawable) gpuBusy=\(gpuBusy) textureCV=\(lastCacheResult) mapError=\(lastMapError)"
+    }
+
     var isReadyForDisplay: Bool {
         metalView.device != nil && queue != nil && pipeline != nil && immersivePipeline != nil && indexBuffer != nil
     }
@@ -204,48 +261,28 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     }
 
     func display(_ pixelBuffer: CVPixelBuffer) {
-        guard let device = metalView.device, pipeline != nil, queue != nil, indexBuffer != nil else { return }
-        let width = CVPixelBufferGetWidth(pixelBuffer), height = CVPixelBufferGetHeight(pixelBuffer)
-        guard width >= 2, height > 0, CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
-            errorLabel.text = "无法显示该视频帧。"
-            clear()
+        receivedFrameID &+= 1
+        receivedWidth = CVPixelBufferGetWidth(pixelBuffer)
+        receivedHeight = CVPixelBufferGetHeight(pixelBuffer)
+        pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard let device = metalView.device, isReadyForDisplay else {
+            rejected += 1
+            lastMapError = "renderer-unavailable"
             return
         }
-        var cvTexture: CVMetalTexture?
-        if let textureCache {
-            CVMetalTextureCacheCreateTextureFromImage(nil, textureCache, pixelBuffer, nil,
-                                                     .bgra8Unorm, width, height, 0, &cvTexture)
+        do {
+            let frame = try MetalMovieFrame(id: receivedFrameID, buffer: pixelBuffer, device: device, cache: textureCache)
+            frameToDraw = frame
+            acceptedFrameID = frame.id
+            lastCacheResult = frame.cacheResult
+            if frame.copiedToGPU { cpuUploads += 1 }
+            errorLabel.text = nil
+            requestDraw()
+        } catch {
+            rejected += 1
+            lastMapError = (error as? MetalMovieFrame.MappingError)?.reason ?? "unknown"
+            errorLabel.text = "无法显示当前视频帧，可在 VR 设置中查看播放诊断。"
         }
-        // VLC can also supply CPU-backed rows. Use their real pitch and copy
-        // before relinquishing the lock when the zero-copy mapping is unavailable.
-        let texture = cvTexture.flatMap { CVMetalTextureGetTexture($0) }
-            ?? upload(pixelBuffer, width: width, height: height, device: device)
-        guard let texture else {
-            errorLabel.text = "无法显示视频帧，请重新打开视频。"
-            clear()
-            return
-        }
-        let displaySize = CVImageBufferGetDisplaySize(pixelBuffer)
-        let aspect = displaySize.width > 0 && displaySize.height > 0
-            ? displaySize.width / displaySize.height : CGFloat(width) / CGFloat(height)
-        frameToDraw = Frame(pixelBuffer: pixelBuffer, imageTexture: cvTexture,
-                            texture: texture, packedAspect: aspect)
-        errorLabel.text = nil
-        requestDraw()
-    }
-
-    private func upload(_ buffer: CVPixelBuffer, width: Int, height: Int, device: MTLDevice) -> MTLTexture? {
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width,
-                                                                 height: height, mipmapped: false)
-        descriptor.storageMode = .shared
-        descriptor.usage = .shaderRead
-        guard let texture = device.makeTexture(descriptor: descriptor),
-              CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { return nil }
-        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-        guard let address = CVPixelBufferGetBaseAddress(buffer) else { return nil }
-        texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
-                        withBytes: address, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer))
-        return texture
     }
 
     private var canPresent: Bool {
@@ -259,6 +296,9 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     @objc private func applicationWillResignActive(_ note: Notification) { metalView.isPaused = true }
 
     private func requestDraw() {
+        delayedRetry?.cancel()
+        delayedRetry = nil
+        retries = 0
         needsDraw = true
         missedDrawables = 0
         if canPresent && isReadyForDisplay { metalView.isPaused = false }
@@ -268,7 +308,24 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         // When a paused video loses its window or the GPU stays unavailable,
         // do not spin forever. A new frame, layout, or reactivation wakes it.
         missedDrawables += 1
-        if missedDrawables >= 12 { metalView.isPaused = true }
+        if missedDrawables >= 12 {
+            metalView.isPaused = true
+            scheduleRetry()
+        }
+    }
+
+    private func scheduleRetry() {
+        guard canPresent, delayedRetry == nil, retries < 3 else { return }
+        retries += 1
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.delayedRetry = nil
+            guard self.needsDraw, self.canPresent else { return }
+            self.missedDrawables = 0
+            self.metalView.isPaused = false
+        }
+        delayedRetry = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
     }
 
     override func layoutSubviews() {
@@ -305,33 +362,56 @@ final class SBSMetalView: UIView, MTKViewDelegate {
             return
         }
         guard gpuSlots.wait(timeout: .now()) == .success else {
+            gpuBusy += 1
             missedDisplayTick()
             return
         }
         guard let command = queue?.makeCommandBuffer(), let pass = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable else {
+            noDrawable += 1
             gpuSlots.signal()
             missedDisplayTick()
             return
         }
-        encodeMovie(pass: pass, command: command)
-        command.addCompletedHandler { [gpuSlots] _ in gpuSlots.signal() }
+        let id = frameToDraw?.id ?? 0
+        guard encodeMovie(pass: pass, command: command) else {
+            gpuSlots.signal()
+            missedDisplayTick()
+            return
+        }
+        submittedFrameID = max(submittedFrameID, id)
+        command.addCompletedHandler { [weak self, gpuSlots, gpuProgress] command in
+            gpuSlots.signal()
+            gpuProgress.completed(id: id, command: command)
+            if command.status == .error {
+                DispatchQueue.main.async {
+                    guard let self, self.frameToDraw?.id == id else { return }
+                    self.needsDraw = true
+                    self.metalView.isPaused = true
+                    self.scheduleRetry()
+                }
+            }
+        }
+        drawable.addPresentedHandler { [gpuProgress] shown in
+            gpuProgress.presented(id: id, time: shown.presentedTime)
+        }
         command.present(drawable)
         needsDraw = false
         command.commit()
     }
 
     // The view and offscreen render tests use the same render pass.
-    func encodeMovie(pass: MTLRenderPassDescriptor, command: MTLCommandBuffer) {
+    @discardableResult func encodeMovie(pass: MTLRenderPassDescriptor, command: MTLCommandBuffer) -> Bool {
         guard let target = pass.colorAttachments[0].texture,
-              let encoder = command.makeRenderCommandEncoder(descriptor: pass) else { return }
+              let encoder = command.makeRenderCommandEncoder(descriptor: pass) else { return false }
         defer { encoder.endEncoding() }
-        guard let frame = frameToDraw, let pipeline else { return }
+        guard let frame = frameToDraw else { return true } // Deliberate black clear.
+        guard let pipeline else { return false }
         encoder.setRenderPipelineState(pipeline)
-        encoder.setFragmentTexture(frame.texture, index: 0)
+        frame.bind(to: encoder)
         let width = Double(target.width), height = Double(target.height)
         if case let .immersive(projection, layout, headset) = mode {
-            guard let immersivePipeline else { return }
+            guard let immersivePipeline else { return false }
             encoder.setRenderPipelineState(immersivePipeline)
             encodeImmersive(frame: frame, encoder: encoder, width: target.width, height: target.height,
                             projection: projection, layout: layout, headset: headset)
@@ -355,7 +435,7 @@ final class SBSMetalView: UIView, MTKViewDelegate {
                 )
                 geometry = nextGeometry
             }
-            guard let vertexBuffer, let indexBuffer else { return }
+            guard let vertexBuffer, let indexBuffer else { return false }
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             for eye in 0..<2 {
                 encoder.setViewport(MTLViewport(originX: Double(eye) * eyeWidth, originY: 0, width: eyeWidth,
@@ -367,9 +447,10 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         }
         // GPU sampling can outlive this callback, including across output changes.
         command.addCompletedHandler { _ in withExtendedLifetime(frame) {} }
+        return true
     }
 
-    private func encodeImmersive(frame: Frame, encoder: MTLRenderCommandEncoder, width: Int, height: Int,
+    private func encodeImmersive(frame: MetalMovieFrame, encoder: MTLRenderCommandEncoder, width: Int, height: Int,
                                  projection: VRProjection, layout: VREyeLayout, headset: Bool) {
         let textureWidth = frame.texture.width, textureHeight = frame.texture.height
         let splitX = layout == .sideBySide || layout == .halfSideBySide

@@ -11,6 +11,7 @@ private final class AppleVideoSurface: UIView {
 /// to one item. Only stereo projection requests decoded video buffers from AVPlayer.
 final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
+    weak var diagnostics: PlaybackDiagnostics?
     private let pickedFile: PickedVideoFile
     private let player = AVPlayer()
     private var surface: AppleVideoSurface?
@@ -30,9 +31,9 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private var ended = false
     private var stopped = false
     private var failure: String?
-    private var clockWithoutFrame = 0.0
-    private var lastClock: Double?
-    private var lastStereoSequence: UInt64?
+    private var frameWatch = AppleVideoFrameWatch()
+    private var videoTimeRange: CMTimeRange?
+    private var isSDR = false
     private var frameRate: Float?
     private var trackDetails: String?
     private var reportedPlaybackStalls = 0
@@ -63,7 +64,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         guard !stopped else { return }
         let returningToLayer = frameHandler != nil && handler == nil
         frameHandler = handler
-        resetFrameWatch()
+        frameWatch = AppleVideoFrameWatch()
         // Keep the native display alive under the opaque stereo view. A ready
         // layer can be uncovered without an extra seek or decoder restart.
         let needsPreroll = MainActor.assumeIsolated {
@@ -82,20 +83,23 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         if needsPreroll, let item = player.currentItem { preroll(item) }
     }
 
-    @MainActor private func installStereoOutput() {
+    @MainActor private func installStereoOutput(recovery: Bool = false) {
         stereo?.stop()
         stereo = nil
         guard let item = player.currentItem, let frameHandler else { return }
         var first = true
-        stereo = AppleStereoFrameOutput(item: item, onAttach: { [weak self, weak item] in
+        stereo = AppleStereoFrameOutput(item: item, recovery: recovery, preferBiPlanar: { [weak self] in
+            self?.isSDR == true
+        }, onAttach: { [weak self, weak item] in
             // Item size, and hence the stereo output, can become available
             // several event turns after the user paused. Preroll it after attach.
             DispatchQueue.main.async {
                 guard let self, let item, self.frameHandler != nil else { return }
                 if !self.wantsPlayback { self.preroll(item) }
             }
-        }) { [weak self, weak item] buffer in
+        }) { [weak self, weak item] buffer, pts in
             guard let self, let item, self.player.currentItem === item else { return }
+            self.diagnostics?.decodedFrame(buffer, pts: pts)
             frameHandler(buffer)
             if first {
                 first = false
@@ -119,6 +123,8 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         failure = nil
         trackDetails = nil
         reportedPlaybackStalls = 0
+        isSDR = false
+        videoTimeRange = nil
         frameRate = nil
         wantsPlayback = false
         pendingSeek = seconds.isFinite && seconds > 0 ? seconds : nil
@@ -167,9 +173,13 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                     if try await track.load(.isDecodable) {
                         let formats = try? await track.load(.formatDescriptions)
                         let rate = try? await track.load(.nominalFrameRate)
+                        let range = try? await track.load(.timeRange)
+                        let bitRate = try? await track.load(.estimatedDataRate)
                         guard !Task.isCancelled, let self, self.player.currentItem === item else { return }
                         self.frameRate = rate
-                        self.trackDetails = Self.videoDescription(format: formats?.first, rate: rate)
+                        self.videoTimeRange = range
+                        self.isSDR = Self.supportsSDRConversion(formats?.first)
+                        self.trackDetails = Self.videoDescription(format: formats?.first, rate: rate, bitRate: bitRate)
                         self.publish()
                         return
                     }
@@ -185,7 +195,25 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         }
     }
 
-    private static func videoDescription(format: CMFormatDescription?, rate: Float?) -> String? {
+    // Preserve the existing system color conversion for HDR, wide gamut and
+    // untagged sources. The two-plane shader handles conventional SDR video.
+    private static func supportsSDRConversion(_ format: CMFormatDescription?) -> Bool {
+        guard let format, let tags = CMFormatDescriptionGetExtensions(format) as? [String: Any],
+              let transfer = tags[kCVImageBufferTransferFunctionKey as String] as? String,
+              [kCVImageBufferTransferFunction_ITU_R_709_2 as String, kCVImageBufferTransferFunction_sRGB as String].contains(transfer)
+        else { return false }
+        if let matrix = tags[kCVImageBufferYCbCrMatrixKey as String] as? String,
+           ![kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String, kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String].contains(matrix) {
+            return false
+        }
+        if let primaries = tags[kCVImageBufferColorPrimariesKey as String] as? String {
+            return [kCVImageBufferColorPrimaries_ITU_R_709_2 as String, kCVImageBufferColorPrimaries_SMPTE_C as String,
+                    kCVImageBufferColorPrimaries_EBU_3213 as String].contains(primaries)
+        }
+        return true
+    }
+
+    private static func videoDescription(format: CMFormatDescription?, rate: Float?, bitRate: Float?) -> String? {
         var fields: [String] = []
         if let format {
             let size = CMVideoFormatDescriptionGetDimensions(format)
@@ -199,6 +227,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         if let rate, rate.isFinite, rate > 0 {
             fields.append(String(format: rate.rounded() == rate ? "%.0f fps" : "%.2f fps", Double(rate)))
         }
+        if let bitRate, bitRate.isFinite, bitRate > 0 { fields.append(String(format: "%.1f Mb/s", Double(bitRate) / 1_000_000)) }
         return fields.isEmpty ? nil : fields.joined(separator: " · ")
     }
 
@@ -213,7 +242,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     func pause() {
         wantsPlayback = false
         player.pause()
-        resetFrameWatch()
+        frameWatch.interrupt()
         stallCheck?.cancel()
     }
 
@@ -222,7 +251,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         pendingSeek = max(0, seconds)
         seekGeneration += 1
         seeking = false
-        resetFrameWatch()
+        frameWatch.interrupt()
         stallCheck?.cancel()
         applyIntent()
     }
@@ -241,7 +270,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                     guard let self, let item, self.player.currentItem === item, self.seekGeneration == request else { return }
                     self.pendingSeek = nil
                     self.seeking = false
-                    self.stereo?.refresh()
+                    self.stereo?.refreshAfterSeek()
                     self.applyIntent()
                     self.publish()
                 }
@@ -252,12 +281,6 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             player.pause()
             MainActor.assumeIsolated { stereo?.refresh() }
         }
-    }
-
-    private func resetFrameWatch() {
-        clockWithoutFrame = 0
-        lastClock = nil
-        lastStereoSequence = nil
     }
 
     private var visibleInForeground: Bool {
@@ -286,22 +309,39 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         guard !stopped, let item = player.currentItem else { return }
         let duration = item.duration.seconds
         let clock = item.currentTime().seconds
-        let hasVideo = MainActor.assumeIsolated { stereo?.hasVideoFrame ?? surface?.videoLayer.isReadyForDisplay ?? false }
+        let projected = stereo != nil
+        let active = wantsPlayback && !ended && !seeking && pendingSeek == nil && failure == nil &&
+            visibleInForeground && player.timeControlStatus == .playing
         var details = trackDetails
-        if wantsPlayback && !ended && !seeking && visibleInForeground && player.timeControlStatus == .playing && clock.isFinite {
-            let advance = lastClock.map { min(1, max(0, clock - $0)) } ?? 0
-            lastClock = clock
-            if !hasVideo {
-                clockWithoutFrame += advance
-                if clockWithoutFrame >= 6 { failure = "系统播放器的进度已前进，但未能输出视频画面。" }
-            } else if let sequence = MainActor.assumeIsolated({ stereo?.frameSequence }), (frameRate ?? 0) >= 12 {
-                clockWithoutFrame = lastStereoSequence == sequence ? clockWithoutFrame + advance : 0
-                lastStereoSequence = sequence
-                if clockWithoutFrame >= 8 {
-                    details = [trackDetails, "VR 暂无新视频帧，可切换播放器测试"].compactMap { $0 }.joined(separator: " · ")
-                }
-            } else { clockWithoutFrame = 0 }
-        } else { resetFrameWatch() }
+        let hasVideo = MainActor.assumeIsolated {
+            stereo?.setContinuousPull(active)
+            let ready = surface?.videoLayer.isReadyForDisplay ?? false
+            let hasImage = stereo?.hasVideoFrame ?? ready
+            let wantsFramesAtClock = videoTimeRange.map { range in
+                !range.isValid || !range.duration.isNumeric || range.duration.seconds <= 0 ||
+                    (clock >= range.start.seconds && clock < range.end.seconds)
+            } ?? true
+            let action = frameWatch.sample(clock: clock, expectingVideo: active && wantsFramesAtClock,
+                                           projected: projected, hasImage: hasImage,
+                                           sequence: stereo?.frameSequence ?? 0, fps: frameRate)
+            if let diagnostics {
+                let route = stereo.map { "\($0.requestDescription) ticks=\($0.ticks) parked=\($0.isParked) uniquePTS=\($0.frameSequence)" } ?? "nativeLayer"
+                diagnostics.appleStatus("item=\(item.status.rawValue) timeControl=\(player.timeControlStatus.rawValue) layerReady=\(ready) output=\(route) stalls=\(reportedPlaybackStalls)")
+            }
+            switch action {
+            case .rebuildOutput:
+                diagnostics?.event("AV: media time advanced without fresh video; rebuilding the video output on the same item")
+                installStereoOutput(recovery: true)
+            case .fail:
+                diagnostics?.event("AV: media time advanced without fresh video; requesting decoder fallback")
+                failure = "系统播放时间持续前进，视频画面没有更新。"
+            case nil: break
+            }
+            if projected && frameWatch.rebuilt {
+                details = [trackDetails, "已重连系统视频输出"].compactMap { $0 }.joined(separator: " · ")
+            }
+            return hasImage
+        }
         if item.status == .failed || player.status == .failed {
             failure = item.error?.localizedDescription ?? player.error?.localizedDescription ?? "系统播放器无法解码这个视频。"
         }
@@ -333,7 +373,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         MainActor.assumeIsolated { stereo?.stop(); stereo = nil }
         seekGeneration += 1
         seeking = false
-        resetFrameWatch()
+        frameWatch = AppleVideoFrameWatch()
         player.pause()
         player.currentItem?.cancelPendingSeeks()
         loader?.cancel()

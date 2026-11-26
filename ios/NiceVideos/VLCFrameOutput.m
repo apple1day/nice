@@ -12,6 +12,7 @@
 @interface NICEVLCFrameDelivery ()
 - (instancetype)initWithHandler:(NICEVLCFrameHandler)handler;
 - (void)enqueue:(CVPixelBufferRef)frame forMedia:(id<NICEVLCTrackSource>)media;
+- (void)recordBufferMissForMedia:(id<NICEVLCTrackSource>)media;
 @end
 
 @implementation NICEVLCFrameDelivery {
@@ -19,7 +20,7 @@
     CVPixelBufferRef _pending;
     BOOL _scheduled;
     id<NICEVLCTrackSource> _sourceMedia;
-    BOOL _hasDeliveredFrame;
+    NICEVLCFrameStats _frameStats;
 }
 
 - (instancetype)initWithHandler:(NICEVLCFrameHandler)handler {
@@ -35,20 +36,34 @@
 - (void)setSourceMedia:(id<NICEVLCTrackSource>)media {
     @synchronized (self) {
         _sourceMedia = media;
-        _hasDeliveredFrame = NO;
+        _frameStats = (NICEVLCFrameStats){0};
         if (_pending) { CVPixelBufferRelease(_pending); }
         _pending = NULL;
     }
 }
 
 - (BOOL)hasDeliveredFrame {
-    @synchronized (self) { return _hasDeliveredFrame; }
+    @synchronized (self) { return _frameStats.delivered != 0; }
+}
+
+- (NICEVLCFrameStats)frameStats {
+    @synchronized (self) { return _frameStats; }
+}
+
+- (void)recordBufferMissForMedia:(id<NICEVLCTrackSource>)media {
+    @synchronized (self) {
+        if (_handler && media == _sourceMedia) { _frameStats.bufferMisses++; }
+    }
 }
 
 - (void)enqueue:(CVPixelBufferRef)frame forMedia:(id<NICEVLCTrackSource>)media {
     @synchronized (self) {
         if (!_handler || media != _sourceMedia) { return; }
-        if (_pending) { CVPixelBufferRelease(_pending); }
+        _frameStats.offered++;
+        if (_pending) {
+            _frameStats.coalesced++;
+            CVPixelBufferRelease(_pending);
+        }
         _pending = CVPixelBufferRetain(frame);
         if (_scheduled) { return; }
         _scheduled = YES;
@@ -61,7 +76,7 @@
             self->_pending = NULL;
             self->_scheduled = NO;
             handler = self->_handler;
-            if (handler && frameToDraw) { self->_hasDeliveredFrame = YES; }
+            if (handler && frameToDraw) { self->_frameStats.delivered++; }
         }
         if (frameToDraw) {
             if (handler) { handler(frameToDraw); }
@@ -188,6 +203,7 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
     CVPixelBufferRef candidate = NULL;
     if (CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(NULL, _pool, (__bridge CFDictionaryRef)_poolLimits,
                                                            &candidate) != kCVReturnSuccess) {
+        [_delivery recordBufferMissForMedia:_source];
         return NULL;
     }
     if (CVPixelBufferLockBaseAddress(candidate, 0) == kCVReturnSuccess) {
@@ -200,6 +216,7 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
         CVPixelBufferUnlockBaseAddress(candidate, 0);
     }
     CVPixelBufferRelease(candidate);
+    [_delivery recordBufferMissForMedia:_source];
     return NULL;
 }
 

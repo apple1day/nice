@@ -17,17 +17,35 @@ vertex SBSVaryings sbsMovieVertex(uint index [[vertex_id]],
     return {float4(point.position, 0, 1), point.movieUV};
 }
 
+struct MovieColor {
+    float4 levels;
+    float4 coefficients;
+};
+
+static float4 sampleMovie(texture2d<float> image, texture2d<float> chroma, float2 uv, constant MovieColor &color) {
+    constexpr sampler sampling(coord::normalized, address::clamp_to_edge, filter::linear);
+    const float4 value = image.sample(sampling, uv);
+    if (color.levels.z == 0) return float4(value.rgb, 1); // Already BGRA.
+    const float y = (value.r - color.levels.x) * color.levels.z;
+    const float2 cbcr = (chroma.sample(sampling, uv).rg - color.levels.y) * color.levels.w;
+    return float4(y + color.coefficients.x * cbcr.y,
+                  y + dot(color.coefficients.yz, cbcr),
+                  y + color.coefficients.w * cbcr.x, 1);
+}
+
 fragment float4 sbsMovieFragment(SBSVaryings input [[stage_in]],
                                  texture2d<float> movie [[texture(0)]],
+                                 texture2d<float> chroma [[texture(1)]],
+                                 constant MovieColor &color [[buffer(1)]],
                                  constant float2 &region [[buffer(0)]]) {
-    constexpr sampler linearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
     // Clamp to actual texel centers. If a scaled frame is odd in width,
     // discard its ambiguous center column rather than sample the other eye.
     float width = float(movie.get_width());
     float sampleWidth = floor(width * region.y);
     float first = region.x == 0 ? 0 : width - sampleWidth;
-    float u = (first + clamp(input.movieUV.x * sampleWidth, 0.5f, sampleWidth - 0.5f)) / width;
-    return float4(movie.sample(linearSampler, float2(u, input.movieUV.y)).rgb, 1);
+    const float inset = min(0.5f * sampleWidth, 0.5f * width / float(chroma.get_width()));
+    float u = (first + clamp(input.movieUV.x * sampleWidth, inset, sampleWidth - inset)) / width;
+    return sampleMovie(movie, chroma, float2(u, input.movieUV.y), color);
 }
 
 struct VRMovieUniforms {
@@ -40,8 +58,9 @@ struct VRMovieUniforms {
 
 fragment float4 vrMovieFragment(SBSVaryings input [[stage_in]],
                                 texture2d<float> movie [[texture(0)]],
+                                texture2d<float> chroma [[texture(1)]],
+                                constant MovieColor &color [[buffer(1)]],
                                 constant VRMovieUniforms &vr [[buffer(0)]]) {
-    constexpr sampler sampling(coord::normalized, address::clamp_to_edge, filter::linear);
     constexpr float pi = 3.14159265358979323846f;
     const float2 screen = (input.movieUV - 0.5f) * float2(2.0f, -2.0f);
     // Inverse sampling of the generic Cardboard v1 screen, using the same
@@ -70,8 +89,8 @@ fragment float4 vrMovieFragment(SBSVaryings input [[stage_in]],
     }
     // Metal texture coordinates begin at the top-left. Keep interpolation
     // inside each eye, even when the two tiles meet at an odd pixel boundary.
-    const float2 inset = 0.5f / float2(movie.get_width(), movie.get_height());
+    const float2 inset = min(0.5f * (vr.eyeRect.zw - vr.eyeRect.xy), 0.5f / float2(chroma.get_width(), chroma.get_height()));
     const float2 coord = clamp(mix(vr.eyeRect.xy, vr.eyeRect.zw, uv),
                                vr.eyeRect.xy + inset, vr.eyeRect.zw - inset);
-    return float4(movie.sample(sampling, coord).rgb, 1);
+    return sampleMovie(movie, chroma, coord, color);
 }

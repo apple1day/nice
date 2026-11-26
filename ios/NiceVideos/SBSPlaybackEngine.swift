@@ -133,7 +133,8 @@ final class SBSPlaybackView: UIView {
 // VLC's native and callback-based outputs require separate decoder sessions.
 extension AppleFilePlaybackEngine: SwitchableVideoEngine {}
 
-final class SBSPlaybackEngine: LocalPlaybackEngine {
+final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting {
+    private let diagnostics: PlaybackDiagnostics
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private var session: SwitchableVideoEngine?
     private weak var hostView: SBSPlaybackView?
@@ -151,7 +152,18 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
     private var pendingSeek: Double?
     private var stopped = false
 
-    init(pickedFile: PickedVideoFile? = nil) { self.pickedFile = pickedFile }
+    init(pickedFile: PickedVideoFile? = nil) {
+        self.pickedFile = pickedFile
+        diagnostics = PlaybackDiagnostics(bytes: pickedFile?.byteCount)
+    }
+
+    @MainActor private var rendererStatus: String {
+        hostView?.renderer?.frameDiagnostics ?? "metal=inactive"
+    }
+
+    @MainActor func playbackDiagnosticReport() -> String? {
+        diagnostics.report { rendererStatus }
+    }
 
     func attach(to view: UIView) {
         guard !stopped else { return }
@@ -177,7 +189,9 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
         session = newSession
         newSession.onUpdate = { [weak self, weak newSession] snapshot in
             guard let self, !self.stopped, self.session === newSession else { return }
+            self.diagnostics.observe(snapshot) { MainActor.assumeIsolated { self.rendererStatus } }
             if self.currentOutput == .system, snapshot.phase == .failed, let host = self.hostView {
+                self.diagnostics.event("fallback system -> VLC (system session reported failure)")
                 self.systemFailed = true
                 // The failing input may be the first event, before it has a
                 // usable timestamp. Preserve the requested seek in that case.
@@ -229,19 +243,26 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
         if let session { return session }
         let newSession = VLCPlaybackEngine(frameHandler: nil, pickedFile: pickedFile)
         currentOutput = .vlcNative
+        newSession.diagnostics = diagnostics
+        diagnostics.setRoute(.vlcNative, mode: .standard)
         observe(newSession)
         return newSession
     }
 
     @MainActor private func frameHandler() -> (CVPixelBuffer) -> Void {
         { [weak self] pixelBuffer in
-            MainActor.assumeIsolated { self?.hostView?.renderer?.display(pixelBuffer) }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.currentOutput == .vlcFrames { self.diagnostics.decodedFrame(pixelBuffer, pts: nil) }
+                self.hostView?.renderer?.display(pixelBuffer)
+            }
         }
     }
 
     @MainActor private func reconcileOutput(_ host: SBSPlaybackView, attaching: Bool = false) {
         let system = host.standardOutput == .system && pickedFile != nil && !systemFailed
         let next: MovieOutput = system ? .system : (host.renderer == nil ? .vlcNative : .vlcFrames)
+        diagnostics.setRoute(next, mode: host.mode)
         if next == currentOutput, let session {
             if attaching && next != .vlcFrames { session.attach(to: host.drawableView) }
             if let apple = session as? AppleFilePlaybackEngine {
@@ -257,11 +278,14 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
         systemStereo = false
         if next == .system, let pickedFile {
             let apple = AppleFilePlaybackEngine(pickedFile: pickedFile)
+            apple.diagnostics = diagnostics
             observe(apple)
             apple.attach(to: host.drawableView)
             configureSystemStereo(apple, host: host)
         } else if next == .vlcFrames {
-            observe(VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile))
+            let vlc = VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile)
+            vlc.diagnostics = diagnostics
+            observe(vlc)
         } else {
             nativeSession().attach(to: host.drawableView)
         }
@@ -339,6 +363,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine {
     func seek(to position: Double) {
         guard position.isFinite else { return }
         seconds = max(0, position)
+        diagnostics.event("seek target=\(seconds)")
         if awaitingOutput {
             pendingSeek = seconds
         } else {

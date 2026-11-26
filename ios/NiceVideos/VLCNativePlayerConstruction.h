@@ -14,11 +14,19 @@ typedef void (^NICEVLCFrameHandler)(CVPixelBufferRef frame);
 @interface VLCMedia (NICEVLCTrackSource) <NICEVLCTrackSource>
 @end
 
+typedef struct {
+    uint64_t offered;
+    uint64_t delivered;
+    uint64_t coalesced;
+    uint64_t bufferMisses;
+} NICEVLCFrameStats;
+
 @interface NICEVLCFrameDelivery : NSObject
 // Assigned before starting the local media. The decoder thread reads its
 // track metadata once when negotiating a new video output format.
 @property (atomic, strong, nullable) id<NICEVLCTrackSource> sourceMedia;
 @property (atomic, readonly) BOOL hasDeliveredFrame;
+@property (atomic, readonly) NICEVLCFrameStats frameStats;
 // Called on the main queue when retiring playback, before VLC stops asynchronously.
 - (void)invalidate;
 - (instancetype)init NS_UNAVAILABLE;
@@ -26,6 +34,7 @@ typedef void (^NICEVLCFrameHandler)(CVPixelBufferRef frame);
 
 @interface NICEVLCNativeReference : NSObject
 @property (nonatomic, readonly) int64_t lengthMilliseconds;
+@property (nonatomic, readonly, nullable) NSString *videoStatistics;
 - (BOOL)loadFileWithByteCount:(uint64_t)byteCount
                       options:(NSArray<NSString *> *)options
                          read:(NICEVLCFileRead)reader NS_SWIFT_NAME(loadFile(byteCount:options:read:));

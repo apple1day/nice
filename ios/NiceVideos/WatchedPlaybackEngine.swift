@@ -2,7 +2,7 @@ import UIKit
 
 // Decorates the existing engine without changing decoding or seeking. Forward
 // the update first: PlaybackModel can reject a late playing event by pausing it.
-final class WatchedPlaybackEngine: LocalPlaybackEngine {
+final class WatchedPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private let base: LocalPlaybackEngine
     private let didPlay: () -> Void
@@ -22,6 +22,9 @@ final class WatchedPlaybackEngine: LocalPlaybackEngine {
                 self.didPlay()
             }
         }
+    }
+    @MainActor func playbackDiagnosticReport() -> String? {
+        (base as? PlaybackDiagnosticReporting)?.playbackDiagnosticReport()
     }
     func attach(to view: UIView) { if !stopped { base.attach(to: view) } }
     func load(fileURL: URL) throws { try base.load(fileURL: fileURL) }

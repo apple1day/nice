@@ -242,13 +242,23 @@ enum VRPinchResponse: String, CaseIterable {
     let sensorAvailable: Bool
     let decoder: String
     let details: String?
+    @State private var didCopyDiagnostics = false
     let decoderAction: String?
+    let onCopyDiagnostics: () -> Bool
     let onDecoderChange: () -> Void
     let onExit: () -> Void
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Button {
+                        didCopyDiagnostics = onCopyDiagnostics()
+                    } label: {
+                        Label(didCopyDiagnostics ? "已复制播放诊断" : "复制播放诊断", systemImage: "doc.on.doc")
+                    }
+                    .accessibilityIdentifier("copyPlaybackDiagnostics")
+                }
                 Section("当前影片") {
                     Picker("投影", selection: $profile.projection) {
                         ForEach(VRProjection.allCases, id: \.self) { Text($0.label).tag($0) }

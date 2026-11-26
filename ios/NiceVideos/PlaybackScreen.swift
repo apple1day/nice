@@ -150,6 +150,13 @@ final class PlaybackModel: ObservableObject {
         }
         savePosition()
     }
+    @MainActor func copyPlaybackDiagnostics() -> Bool {
+        guard let report = (engine as? PlaybackDiagnosticReporting)?.playbackDiagnosticReport() else { return false }
+        UIPasteboard.general.string = report
+        UIAccessibility.post(notification: .announcement, argument: "播放诊断已复制")
+        return true
+    }
+
     @MainActor func prepareOutputChange(to output: MovieOutput) {
         if phase == .failed {
             message = nil
@@ -404,6 +411,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     @State private var scrubber = PlaybackScrubController()
     @State private var showsPlaylist = false
     @State private var showsVideoFormats = false
+    @State private var diagnosticCopyNotice: UUID?
     @State private var showsVRSettings = false
     @StateObject private var camera: VRGestureCamera
     @State private var vrProfile: VRMoviePreferences
@@ -528,6 +536,18 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         }
         .sheet(isPresented: $showsPlaylist) { playlistSheet }
         .sheet(isPresented: $showsVRSettings) { immersiveSettings }
+        .overlay(alignment: .center) {
+            if diagnosticCopyNotice != nil {
+                Text("播放诊断已复制")
+                    .foregroundStyle(.white).padding().background(.black.opacity(0.8), in: Capsule())
+                    .allowsHitTesting(false)
+            }
+        }
+        .task(id: diagnosticCopyNotice) {
+            guard diagnosticCopyNotice != nil else { return }
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            diagnosticCopyNotice = nil
+        }
         .alert("操作提示", isPresented: Binding(
             get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } }
         )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
@@ -758,6 +778,9 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             if defaultOutput == .system && activeOutput != .system {
                 Button("切换到系统播放器") { selectOutput(.system) }
             }
+            Button("复制播放诊断") {
+                if model.copyPlaybackDiagnostics() { diagnosticCopyNotice = UUID() }
+            }
             Button("取消", role: .cancel) {}
         } message: {
             Text(["当前解码：\(activeOutput.title)。", model.videoDetails, "每只眼的画面被横向压缩时选半宽，保持原比例时选全宽。"].compactMap { $0 }.joined(separator: "\n"))
@@ -806,6 +829,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                              details: model.videoDetails,
                              decoderAction: activeOutput == .system ? "尝试 VLC 解码" :
                                 (defaultOutput == .system ? "恢复系统解码" : nil),
+                             onCopyDiagnostics: model.copyPlaybackDiagnostics,
                              onDecoderChange: { selectOutput(activeOutput == .system ? .vlcFrames : .system) },
                              onExit: { displayMode = .standard; revealControls() })
     }

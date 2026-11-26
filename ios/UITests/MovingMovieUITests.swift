@@ -129,6 +129,11 @@ final class MovingMovieUITests: XCTestCase {
         revealControls(surface)
         formats.tap()
         try require(app.navigationBars["VR 设置"].waitForExistence(timeout: 5), app.debugDescription)
+        let copy = app.buttons["copyPlaybackDiagnostics"]
+        try require(copy.waitForExistence(timeout: 5) && copy.isHittable, "Missing diagnostics action")
+        copy.tap()
+        let copied = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@", "已复制"), object: copy)
+        try require(XCTWaiter.wait(for: [copied], timeout: 4) == .completed, "Diagnostics did not copy")
         let exitVR = app.buttons["exitPanoramaVR"]
         // A landscape Form only materializes its visible rows. Scroll inside
         // the sheet until its exit action is on screen, as a viewer would.
@@ -145,7 +150,25 @@ final class MovingMovieUITests: XCTestCase {
                     "Leaving the VR settings did not restore ordinary playback")
     }
 
-    private func launchMovie(_ resource: String, fileExtension: String, samples: String? = nil) throws -> XCUIApplication {
+    func testResumed360HeadsetMovieContinuesChangingBothEyes() throws {
+        XCUIDevice.shared.orientation = .landscapeLeft
+        let app = try launchMovie("moving4k-index", fileExtension: "bin", samples: "moving4k-samples", resume360: true)
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
+        let surface = app.descendants(matching: .any)["playbackSurfaceToggle"]
+        try require(surface.waitForExistence(timeout: 20), app.debugDescription)
+
+        try assertChangingEyes(in: app, surface: surface, mode: "resumed 4K 360-degree headset")
+        revealControls(surface)
+        let elapsed = try seconds(app.staticTexts["playbackElapsedTime"])
+        try require(elapsed >= 142, "Expected a saved playback position near 02:23, got \(elapsed)")
+        let format = app.buttons["videoFormatButton"]
+        try require(format.value as? String == "360° 全景", app.debugDescription)
+        try assertChangingEyes(in: app, surface: surface, mode: "both projected eyes after resume")
+
+    }
+
+    private func launchMovie(_ resource: String, fileExtension: String, samples: String? = nil,
+                             resume360: Bool = false) throws -> XCUIApplication {
         let bundle = Bundle(for: Self.self)
         func encoded(_ name: String) throws -> String {
             let url = try XCTUnwrap(bundle.url(forResource: name, withExtension: fileExtension))
@@ -155,6 +178,7 @@ final class MovingMovieUITests: XCTestCase {
         }
         let app = XCUIApplication()
         app.launchArguments = ["--ui-test-moving-video"]
+        if resume360 { app.launchEnvironment["NICE_UI_TEST_RESUME_360"] = "1" }
         app.launchEnvironment["NICE_UI_TEST_MOVIE"] = try encoded(resource)
         if let samples { app.launchEnvironment["NICE_UI_TEST_SAMPLES"] = try encoded(samples) }
         app.launch()

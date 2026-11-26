@@ -94,7 +94,34 @@ private final class PickedFileReadStatus {
     }
 }
 
+// VLC's first displayed picture can remain on screen long after its audio clock
+// has moved on. Warn only after sustained wall time AND continuous media time.
+struct VLCFrameProgress {
+    private var anchor: (frames: UInt64, media: Double, host: TimeInterval)?
+    private var lastMedia: Double?
+
+    mutating func reset() {
+        anchor = nil
+        lastMedia = nil
+    }
+
+    mutating func stalled(frames: UInt64, media: Double, host: TimeInterval, playing: Bool) -> Bool {
+        guard playing, media.isFinite, host.isFinite else { reset(); return false }
+        let previous = lastMedia
+        lastMedia = media
+        guard let anchor, frames == anchor.frames, host >= anchor.host, let previous,
+              (0...2).contains(media - previous) else {
+            self.anchor = (frames, media, host)
+            return false
+        }
+        return media - anchor.media >= 12 && host - anchor.host >= 12
+    }
+}
+
 final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDelegate {
+    weak var diagnostics: PlaybackDiagnostics?
+    private var lastStatsTime = -Double.infinity
+    private var frameProgress = VLCFrameProgress()
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private static var lifetimeAssociationKey: UInt8 = 0
     private let playerResource: BackgroundPlaybackResource<VLCMediaPlayer>
@@ -147,6 +174,8 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     func load(fileURL: URL, startAt seconds: Double, paused: Bool) throws {
         guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
         guard let player else { throw ClientError("播放器初始化失败，请关闭后重新打开视频。") }
+        frameProgress.reset()
+        lastStatsTime = -.infinity
         var options: [String] = []
         if seconds.isFinite && seconds > 0 { options.append(":start-time=\(seconds)") }
         if paused { options.append(":start-paused") }
@@ -200,7 +229,10 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         player?.play()
         if waitForPausedFrame { scheduleTimePublish(after: 0.1) }
     }
-    func pause() { if loaded && !stopped { player?.pause() } }
+    func pause() {
+        frameProgress.reset()
+        if loaded && !stopped { player?.pause() }
+    }
     func seek(to seconds: Double) {
         guard !stopped, let player else { return }
         let duration = durationSeconds(player)
@@ -211,6 +243,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         let current = max(0, Double(player.time.intValue) / 1000)
         guard abs(current - seconds) >= 0.20 else { return }
 
+        frameProgress.reset()
         callbackLock.lock()
         seekGate.begin(target: seconds, now: ProcessInfo.processInfo.systemUptime)
         callbackLock.unlock()
@@ -305,15 +338,31 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         let now = ProcessInfo.processInfo.systemUptime
         callbackLock.lock()
         let displayedSeconds = seekGate.displayedSeconds(raw: rawSeconds, now: now)
+        let awaitingSeek = seekGate.target != nil
         callbackLock.unlock()
 
+        let stats = frameDelivery?.frameStats
+        if let diagnostics, now - lastStatsTime >= 2 {
+            lastStatsTime = now
+            var status = nativeLifetime?.resource?.videoStatistics ?? "stats=unavailable"
+            if let stats {
+                status += " offered=\(stats.offered) delivered=\(stats.delivered) coalesced=\(stats.coalesced) bufferMisses=\(stats.bufferMisses)"
+            }
+            MainActor.assumeIsolated { diagnostics.vlcStatus(status) }
+        }
+        var warning: String?
+        if let stats, frameProgress.stalled(frames: stats.delivered, media: rawSeconds, host: now,
+                playing: player.state == .playing && !awaitingSeek && pausedPreviewDeadline == nil &&
+                    MainActor.assumeIsolated { UIApplication.shared.applicationState == .active }) {
+            warning = "播放时间在前进，VLC 已有 12 秒没有送出新画面。请复制播放诊断，或退出 VR 对比普通播放。"
+        }
         return PlaybackSnapshot(
             phase: phase,
             seconds: displayedSeconds,
             duration: durationSeconds(player),
             seekable: player.isSeekable,
             hasVideo: frameDelivery?.hasDeliveredFrame ?? player.hasVideoOut,
-            error: phase == .failed ? "VLC 无法解码这个本地文件。请检查文件是否损坏、编码是否受支持，必要时重新下载。" : nil
+            error: phase == .failed ? "VLC 无法解码这个本地文件。请检查文件是否损坏、编码是否受支持，必要时重新下载。" : warning
         )
     }
     deinit { stop() }

@@ -82,6 +82,17 @@
 
 - (int64_t)lengthMilliseconds { return libvlc_media_player_get_length(_player); }
 
+- (NSString *)videoStatistics {
+    libvlc_media_t *media = libvlc_media_player_get_media(_player);
+    if (!media) { return nil; }
+    libvlc_media_stats_t stats = {0};
+    int available = libvlc_media_get_stats(media, &stats);
+    libvlc_media_release(media);
+    if (!available) { return nil; }
+    return [NSString stringWithFormat:@"decoded=%d displayed=%d lost=%d",
+            stats.i_decoded_video, stats.i_displayed_pictures, stats.i_lost_pictures];
+}
+
 - (BOOL)loadFileWithByteCount:(uint64_t)byteCount options:(NSArray<NSString *> *)options read:(NICEVLCFileRead)reader {
     libvlc_media_t *media = NICECreatePickedMedia((libvlc_instance_t *)_library.instance, byteCount, reader);
     if (!media) { return NO; }

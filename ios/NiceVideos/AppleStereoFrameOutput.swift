@@ -1,20 +1,29 @@
 import AVFoundation
 import UIKit
 
-// Pull the system decoder's frame for the upcoming display tick. The same
-// AVPlayerItem keeps the audio clock and seek position when switching to VR.
+// The same item supplies both audio and the frame for the upcoming display tick.
 final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     private weak var item: AVPlayerItem?
-    private var handler: ((CVPixelBuffer) -> Void)?
+    private var handler: ((CVPixelBuffer, Double?) -> Void)?
     private var onAttach: (() -> Void)?
+    private let preferBiPlanar: () -> Bool
+    private let recovery: Bool
     private var output: AVPlayerItemVideoOutput?
     private var displayLink: CADisplayLink?
     private var lastDelivery = CACurrentMediaTime()
+    private var continuousPull = false
+    private var newestDisplayTime: CMTime = .invalid
     private(set) var frameSequence: UInt64 = 0
-    var hasVideoFrame: Bool { frameSequence > 0 }
+    private(set) var hasVideoFrame = false
+    private(set) var requestDescription = "awaiting presentation size"
+    private(set) var ticks: UInt64 = 0
+    var isParked: Bool { displayLink?.isPaused == true }
 
-    init(item: AVPlayerItem, onAttach: @escaping () -> Void = {}, handler: @escaping (CVPixelBuffer) -> Void) {
+    init(item: AVPlayerItem, recovery: Bool, preferBiPlanar: @escaping () -> Bool,
+         onAttach: @escaping () -> Void = {}, handler: @escaping (CVPixelBuffer, Double?) -> Void) {
         self.item = item
+        self.preferBiPlanar = preferBiPlanar
+        self.recovery = recovery
         self.handler = handler
         self.onAttach = onAttach
         super.init()
@@ -26,49 +35,82 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
 
     private func attachOutputIfReady() {
         guard output == nil, let item else { return }
-        // At first the presentation size may still be zero. Giving the
-        // converter the final dimensions avoids allocating 8K BGRA surfaces.
         let size = item.presentationSize
-        guard size.width.isFinite, size.height.isFinite,
-              size.width > 0, size.height > 0 else { return }
-        let scale = min(1, 2560 / max(size.width, size.height))
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
+        let longest = max(size.width, size.height)
+        let scale = min(1, (recovery ? 1920 : 2560) / longest)
+        let biPlanar = (recovery || longest > 4096) && preferBiPlanar()
+        let format = biPlanar ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA
+        var width = max(2, Int((size.width * scale).rounded()))
+        var height = max(1, Int((size.height * scale).rounded()))
+        if biPlanar {
+            width -= width % 2
+            height = max(2, height - height % 2)
+        }
         let attributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: max(2, Int((size.width * scale).rounded())),
-            kCVPixelBufferHeightKey as String: max(1, Int((size.height * scale).rounded())),
+            kCVPixelBufferPixelFormatTypeKey as String: format,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferMetalCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
         ]
         let next = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
-        // Leave the native layer rendering behind the opaque stereo surface
-        // so exiting VR can reveal an up-to-date frame immediately.
         next.setDelegate(self, queue: .main)
         item.add(next)
         output = next
+        requestDescription = "\(biPlanar ? "420v" : "BGRA") \(width)x\(height)"
         onAttach?()
         onAttach = nil
     }
 
     @objc private func tick(_ link: CADisplayLink) {
         guard let handler else { return }
+        ticks &+= 1
         attachOutputIfReady()
         guard let output else { return }
         let hostTime = link.targetTimestamp
         let scheduled = output.itemTime(forHostTime: hostTime)
         let time = scheduled.isNumeric ? scheduled : (item?.currentTime() ?? .invalid)
+        var displayTime = CMTime.invalid
         if time.isNumeric, (!hasVideoFrame || output.hasNewPixelBuffer(forItemTime: time)),
-           let frame = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) {
+           let frame = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) {
             lastDelivery = hostTime
-            frameSequence &+= 1
-            handler(frame)
-        } else if hasVideoFrame, hostTime - lastDelivery > 0.5 {
-            link.isPaused = true
+            hasVideoFrame = true
+            // If the converter repeatedly returns the same PTS, the decoder
+            // has not advanced even though a new buffer object was acquired.
+            if !displayTime.isNumeric || !newestDisplayTime.isNumeric || displayTime > newestDisplayTime {
+                frameSequence &+= 1
+                if displayTime.isNumeric { newestDisplayTime = displayTime }
+            }
+            handler(frame, displayTime.isNumeric ? displayTime.seconds : nil)
+        } else if hasVideoFrame && !continuousPull && hostTime - lastDelivery > 0.5 {
+            // Only park in a quiescent state. A delayed decoded frame while
+            // the audio clock is running must not put the only consumer to sleep.
             output.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.05)
+            link.isPaused = true
         }
     }
 
-    func outputMediaDataWillChange(_ sender: AVPlayerItemOutput) { refresh() }
-    func outputSequenceWasFlushed(_ output: AVPlayerItemOutput) { refresh() }
+    func outputMediaDataWillChange(_ sender: AVPlayerItemOutput) {
+        guard sender === output else { return }
+        refresh()
+    }
+
+    func outputSequenceWasFlushed(_ sender: AVPlayerItemOutput) {
+        guard sender === output else { return }
+        refreshAfterSeek()
+    }
+
+    func refreshAfterSeek() {
+        newestDisplayTime = .invalid
+        refresh()
+    }
+
+    func setContinuousPull(_ enabled: Bool) {
+        guard enabled != continuousPull else { return }
+        continuousPull = enabled
+        if enabled { refresh() }
+    }
 
     func refresh() {
         lastDelivery = CACurrentMediaTime()
@@ -82,7 +124,7 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
         onAttach = nil
         if let output {
             output.setDelegate(nil, queue: nil)
-            item?.remove(output)
+            if let item, item.outputs.contains(where: { $0 === output }) { item.remove(output) }
         }
         output = nil
         item = nil

@@ -26,6 +26,49 @@ final class AppleFilePlaybackEngineTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(failure?.error).isEmpty)
     }
 
+    func testStalledProjectedOutputRecoversOnSamePlayingItemAfterItsFirstFrame() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "panorama-audio", withExtension: "mp4", subdirectory: "Fixtures"))
+        let source = try await PickedVideoFile.open(url)
+        let engine = AppleFilePlaybackEngine(pickedFile: source)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 220))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { engine.stop(); window.isHidden = true }
+        engine.attach(to: controller.view)
+        let layer = try XCTUnwrap(controller.view.subviews.last?.layer as? AVPlayerLayer)
+        let player = try XCTUnwrap(layer.player)
+        let initial = expectation(description: "Initial output delivers video")
+        let restored = expectation(description: "A fresh output delivers video from the same running item")
+        var lostOutput: AVPlayerItemVideoOutput?
+        var receivedInitial = false, receivedReplacement = false
+        engine.setVideoFrameHandler { _ in
+            if !receivedInitial {
+                receivedInitial = true
+                initial.fulfill()
+            } else if let lostOutput, !receivedReplacement,
+                      player.currentItem?.outputs.contains(where: { $0 is AVPlayerItemVideoOutput && $0 !== lostOutput }) == true {
+                receivedReplacement = true
+                restored.fulfill()
+            }
+        }
+        try engine.load(fileURL: url)
+        engine.play()
+        await fulfillment(of: [initial], timeout: 12)
+        let item = try XCTUnwrap(player.currentItem)
+        let original = try XCTUnwrap(item.outputs.compactMap { $0 as? AVPlayerItemVideoOutput }.first)
+        lostOutput = original
+        let before = item.currentTime().seconds
+        // Lose the frame feed while audio and the item clock keep running.
+        // The production watchdog, not the test, must create the replacement.
+        item.remove(original)
+        await fulfillment(of: [restored], timeout: 24)
+        XCTAssertTrue(player.currentItem === item)
+        XCTAssertGreaterThan(item.currentTime().seconds, before + 4)
+        XCTAssertEqual(player.rate, 1)
+        XCTAssertEqual(item.outputs.compactMap { $0 as? AVPlayerItemVideoOutput }.count, 1)
+    }
+
     func testPausedSeekAndStereoPrerollPreserveTheItemAndPositionAcrossHostChanges() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "offline", withExtension: "mp4", subdirectory: "Fixtures"))
         let source = try await PickedVideoFile.open(url)

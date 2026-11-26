@@ -79,7 +79,9 @@ struct NiceVideosApp: App {
                         }
                         return try (compressed as NSData).decompressed(using: .zlib) as Data
                     }
-                    let url = FileManager.default.temporaryDirectory.appendingPathComponent("moving-stereo.mp4")
+                    let resume360 = environment["NICE_UI_TEST_RESUME_360"] == "1"
+                    let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+                        resume360 ? "resume-stereo360.mp4" : "moving-stereo.mp4")
                     try fixtureData("NICE_UI_TEST_MOVIE").write(to: url, options: .atomic)
                     if environment["NICE_UI_TEST_SAMPLES"] != nil {
                         let handle = try FileHandle(forWritingTo: url)
@@ -88,7 +90,17 @@ struct NiceVideosApp: App {
                         try handle.write(contentsOf: fixtureData("NICE_UI_TEST_SAMPLES"))
                     }
                     let file = try await PickedVideoFile.open(url)
-                    try store.playPickedFile(file)
+                    if resume360 {
+                        // Reproduce a saved headset movie opened well beyond its first frame.
+                        let key = PlaybackRequest(pickedFile: file).key
+                        var profile = VRMoviePreferences()
+                        profile.projection = .vr360
+                        profile.eyes = .sideBySide
+                        profile.headset = true
+                        profile.save(key: key)
+                        UserDefaults.standard.set(143.0, forKey: "position." + key)
+                    }
+                    try store.playPickedFile(file, startsInVR: resume360)
                 } catch { store.errorMessage = error.localizedDescription }
             }
     }
