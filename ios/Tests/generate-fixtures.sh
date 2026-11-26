@@ -48,11 +48,14 @@ for pair in red-blue lime-yellow; do
     -i "color=$left:s=256x128:r=60000/1001,drawbox=x=128:y=0:w=128:h=128:c=$right:t=fill,scale=8192:4096:flags=neighbor" \
     -frames:v 6 -c:v libx265 -preset ultrafast -pix_fmt yuv420p -tag:v hvc1 \
     -x265-params 'pools=1:frame-threads=1:bframes=0:ref=1:keyint=6:log-level=error' "$pattern_dir/$pair.mp4"
-  for _ in {1..5}; do
-    echo "file '$pair.mp4'"
-    echo "duration 0.100100"
-  done >> "$pattern_dir/full8k.txt"
 done
+# Change both eyes after 6 or 12 frames so a slow decoder can expose motion
+# before either clock reaches EOF. The Main 10 keyframes at 0 and 30 also differ.
+for pair in red-blue lime-yellow red-blue red-blue lime-yellow \
+            lime-yellow red-blue lime-yellow lime-yellow red-blue; do
+  echo "file '$pair.mp4'"
+  echo "duration 0.100100"
+done > "$pattern_dir/full8k.txt"
 ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$pattern_dir/full8k.txt" \
   -c copy -tag:v hvc1 "$pattern_dir/full8k-cycle.mp4"
 ffmpeg -hide_banner -loglevel error -y -stream_loop 11 -i "$pattern_dir/full8k-cycle.mp4" \

@@ -21,9 +21,9 @@ import XCTest
                                      decoderPolicy: VLCDecoderPolicy = .automatic) async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: fixture, withExtension: "mp4", subdirectory: "Fixtures"))
-        // This tests decoder selection and sustained pixel changes. The Main 10
-        // fixture changes its eye pair every 30 source frames. Software decoding
-        // on a simulator can take well over 15 wall seconds to reach frame 90.
+        // Check real stereo motion even when software decoding on the simulator
+        // falls behind the audio clock. The chart alternates both eyes at
+        // irregular intervals to reduce aliasing in sampled output.
         let software = decoderPolicy == .software
         let requiredTransitions = software ? 3 : 2
         let timeout: TimeInterval = software ? 45 : 15
