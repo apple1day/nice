@@ -25,9 +25,11 @@ struct VLCFrameLossWatch {
              reducedLimit: UInt32, alreadyReduced: Bool) {
             if !active { self = .inactive }
             else if !seekable { self = .unseekable }
+            // The last two seconds block a decoder reopen. At the minimum
+            // there is nothing to reopen; keep measuring the current input.
+            else if alreadyReduced && outputEdge > 0 { self = .minimum }
             else if remaining <= 2 { self = .nearEnd }
             else if outputEdge == 0 { self = .awaitingFormat }
-            else if alreadyReduced { self = .minimum }
             else if outputEdge <= reducedLimit { self = .smallOutput }
             else { self = .monitoring }
         }

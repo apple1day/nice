@@ -84,6 +84,26 @@ final class PlaylistPlaybackTests: XCTestCase {
                                anchor: anchor, model: model, pool: pool, requests: requests)
     }
 
+    @MainActor func testCompatibleCopyOnlyOpensAfterTheOriginalPlayerCloses() async throws {
+        let f = try fixture(count: 1)
+        let url = f.disk.root.appendingPathComponent("4K-compat.mp4")
+        try Data([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]).write(to: url)
+        let file = try await PickedVideoFile.open(url)
+        let stale = PlaybackRequest(pickedFile: file)
+        XCTAssertThrowsError(try f.store.queueCompatibleCopy(file, replacing: stale))
+        try f.store.queueCompatibleCopy(file, replacing: f.anchor)
+        XCTAssertEqual(f.store.playback?.id, f.anchor.id)
+        f.model.close()
+        XCTAssertNil(f.store.playback)
+        f.store.openQueuedCompatibleCopy()
+        let replacement = try XCTUnwrap(f.store.playback)
+        XCTAssertTrue(replacement.pickedFile === file)
+        XCTAssertEqual(replacement.startMode, .afterglow)
+        f.store.playbackDidClose(replacement)
+        f.store.openQueuedCompatibleCopy()
+        XCTAssertNil(f.store.playback, "The queued choice is consumed just once")
+    }
+
     @MainActor private func finishQueuedCallbacks() async {
         let drained = expectation(description: "queued playback completion processed")
         DispatchQueue.main.async { drained.fulfill() }

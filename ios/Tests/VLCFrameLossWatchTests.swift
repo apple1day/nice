@@ -119,6 +119,26 @@ final class VLCFrameLossWatchTests: XCTestCase {
         XCTAssertEqual(state(1600, seekable: false), .unseekable)
     }
 
+    func testMinimumOutputStillRecognizesTheHeldFirstFrameInTheLastTwoSeconds() {
+        func sample(_ host: Double, _ clock: Double, _ decoded: Int32, _ lost: Int32) -> VLCFrameLossWatch.Sample {
+            .init(clock: clock, host: host, decoded: decoded, displayed: 1, lost: lost,
+                  offered: 1, delivered: 1, bufferMisses: 0, staleSource: 0, formatSetups: 1)
+        }
+        let duration = 15.05
+        func state(at time: Double, reduced: Bool) -> VLCFrameLossWatch.State {
+            .init(active: true, seekable: true, remaining: duration - time, outputEdge: reduced ? 1280 : 1600,
+                  reducedLimit: 1280, alreadyReduced: reduced)
+        }
+        var watch = VLCFrameLossWatch()
+        // Actual load #7 in build 17, including the clock slightly past duration.
+        XCTAssertEqual(state(at: 10.90, reduced: true), .minimum)
+        XCTAssertFalse(watch.needsSmallerOutput(sample(34.58, 10.90, 460, 112), nominalFrameRate: 59.94))
+        XCTAssertEqual(state(at: 15.08, reduced: true), .minimum)
+        XCTAssertTrue(watch.needsSmallerOutput(sample(38.85, 15.08, 825, 295), nominalFrameRate: 59.94))
+        XCTAssertEqual(watch.pattern, .frozen)
+        XCTAssertEqual(state(at: 15.08, reduced: false), .nearEnd, "The high-output route must not reopen near EOF")
+    }
+
     func testSeekAndPauseDiscardEarlierLossEvidence() {
         var watch = VLCFrameLossWatch()
         for second in 1...4 {

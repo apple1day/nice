@@ -15,33 +15,71 @@ struct PlaybackSnapshot {
     var videoOutput: MovieOutput?
     var videoDetails: String?
     var retryVLCWithSmallerFrames = false
+    var reopenVLCAtSeek: Double?
+    var suggestsCompatibleCopy = false
 }
 
-// Keeps the UI pinned to the user's requested position while VLC is still
-// reporting stale pre-seek timestamps. Once VLC reaches the target neighborhood
-// (or the short protection window expires), normal time updates resume.
+// One transaction owns the latest requested seek. A native stream may report
+// seekability, the original :start-time and eventually the requested clock in
+// different callbacks. Keep the target until an actual clock confirms it.
 struct SeekFeedbackGate {
+    enum Action: Equatable { case none, issue(Double), reopen(Double), reportFailure(Double) }
     private(set) var target: Double?
-    private(set) var deadline: TimeInterval = 0
+    private var issued = false
+    private var mayReopen = true
+    private var observedSeconds = 0.0
+    private var previous: TimeInterval?
+    private var firstMatch: (host: TimeInterval, raw: Double)?
 
-    mutating func begin(target: Double, now: TimeInterval, timeout: TimeInterval = 1.25) {
+    mutating func begin(target: Double, now: TimeInterval, verifyingReopen: Bool = false) {
         self.target = target
-        deadline = now + timeout
+        issued = verifyingReopen
+        mayReopen = !verifyingReopen
+        observedSeconds = 0
+        previous = now
+        firstMatch = nil
     }
 
-    mutating func displayedSeconds(raw: Double, now: TimeInterval, tolerance: Double = 1.0) -> Double {
-        guard let target else { return raw }
-        if abs(raw - target) <= tolerance || now >= deadline {
-            self.target = nil
-            return raw
+    mutating func update(raw: Double, duration: Double, seekable: Bool, playing: Bool,
+                         ended: Bool, foreground: Bool, now: TimeInterval) -> Action {
+        guard var target else { return .none }
+        guard foreground else { previous = nil; return .none }
+        if let previous, now > previous {
+            // Busy foreground callbacks still consume the budget. A suspended
+            // process cannot contribute an entire unobserved background interval.
+            observedSeconds += min(2, now - previous)
         }
-        return target
+        previous = now
+        if duration > 0, duration.isFinite {
+            target = min(target, max(0, duration - 0.1))
+            self.target = target
+        }
+        if issued, duration > 0, raw >= target - 0.65, raw <= target + (playing ? observedSeconds : 0) + 0.65 {
+            // A time event can briefly claim the target before a queued older
+            // seek wins. Confirm two observations, with clock motion during play.
+            if let firstMatch, now - firstMatch.host >= 0.15, !playing || raw > firstMatch.raw {
+                clear()
+                return .none
+            }
+            if firstMatch == nil { firstMatch = (now, raw) }
+        } else {
+            firstMatch = nil
+        }
+        if !issued, seekable, duration > 0, !ended {
+            issued = true
+            observedSeconds = 0
+            return .issue(target)
+        }
+        if observedSeconds >= (mayReopen ? 6 : 10) || (ended && duration > 0 && target < duration - 0.65) {
+            let action: Action = mayReopen ? .reopen(target) : .reportFailure(target)
+            clear()
+            return action
+        }
+        if ended && duration > 0 { clear() }
+        return .none
     }
 
-    mutating func clear() {
-        target = nil
-        deadline = 0
-    }
+    mutating func clear() { self = SeekFeedbackGate() }
 }
 
 // UIKit/VLC details are isolated; state/position/lifecycle tests use a fake engine.
@@ -125,7 +163,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     private var frameProgress = VLCFrameProgress()
     private var frameLossWatch = VLCFrameLossWatch()
     private var lossTimer: DispatchSourceTimer?
-    private var stalledAtMinimum = false
+    private var minimumLoss = VLCFrameLossWatch.Pattern.none
     private let reducedFrameOutput: Bool
     static let reducedLongEdge: UInt32 = 1280
     private var checkExistingPanoramaFormat = false
@@ -148,7 +186,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         }
         guard let player, player.isSeekable,
               player.state == .playing || player.state == .paused,
-              callbackLock.withLock({ seekGate.target == nil && unconfirmedSeek == nil }) else { return false }
+              callbackLock.withLock({ seekGate.target == nil }) else { return false }
         let clock = max(0, Double(player.time.intValue) / 1000)
         return durationSeconds(player) - clock > 2
     }
@@ -176,9 +214,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     private let callbackLock = NSLock()
     private var timePublishScheduled = false
     private var seekGate = SeekFeedbackGate()
-    // The UI's feedback timeout can elapse before a slow native seek lands.
-    // Do not replace its decoder for a quality adjustment during that gap.
-    private var unconfirmedSeek: (target: Double, host: TimeInterval)?
+    private var seekFailureUntil: TimeInterval = -.infinity
 
     override convenience init() { self.init(frameHandler: nil) }
 
@@ -217,8 +253,9 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         guard let player else { throw ClientError("播放器初始化失败，请关闭后重新打开视频。") }
         frameProgress.reset()
         frameLossWatch.reset()
-        callbackLock.withLock { unconfirmedSeek = nil }
-        stalledAtMinimum = false
+        callbackLock.withLock { seekGate.clear() }
+        seekFailureUntil = -.infinity
+        minimumLoss = .none
         stopLossTimer()
         lastStatsTime = -.infinity
         videoDetails = nil
@@ -305,32 +342,31 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         stopLossTimer()
         frameProgress.reset()
         frameLossWatch.reset()
-        stalledAtMinimum = false
+        minimumLoss = .none
         if loaded && !stopped { player?.pause() }
     }
     func seek(to seconds: Double) {
         guard !stopped, let player else { return }
+        guard seconds.isFinite else { return }
         let duration = durationSeconds(player)
-        guard player.isSeekable,
-              let seconds = PlaybackPosition.clamp(seconds, duration: duration) else { return }
+        let target = PlaybackPosition.clamp(seconds, duration: duration) ?? max(0, seconds)
+        startSeek(target, verifyingReopen: false)
+    }
 
-        // Do not issue a decoder seek for a sub-frame-sized correction.
-        let current = max(0, Double(player.time.intValue) / 1000)
-        guard abs(current - seconds) >= 0.20 else { return }
+    func verifyReopenedSeek(at seconds: Double) {
+        // This new media was opened with :start-time. Verify it without sending
+        // a competing seek or recursively reopening a persistently bad input.
+        startSeek(seconds, verifyingReopen: true)
+    }
 
+    private func startSeek(_ seconds: Double, verifyingReopen: Bool) {
         frameProgress.reset()
         frameLossWatch.reset()
-        stalledAtMinimum = false
-        callbackLock.lock()
-        let now = ProcessInfo.processInfo.systemUptime
-        seekGate.begin(target: seconds, now: now)
-        unconfirmedSeek = (seconds, now)
-        callbackLock.unlock()
-
-        // Fractional seeking avoids the Int32 millisecond limit for long media.
-        // VLCKit 3.x does not expose VLC 4's explicit fast-seek flag, so keep the
-        // proven position API and optimize callback pressure/UI stabilization here.
-        player.position = Float(seconds / duration)
+        minimumLoss = .none
+        seekFailureUntil = -.infinity
+        callbackLock.withLock {
+            seekGate.begin(target: seconds, now: ProcessInfo.processInfo.systemUptime, verifyingReopen: verifyingReopen)
+        }
         scheduleTimePublish(after: 0.04)
     }
     func stop() {
@@ -418,30 +454,43 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
 
         let rawSeconds = max(0, Double(player.time.intValue) / 1000)
         let now = ProcessInfo.processInfo.systemUptime
-        callbackLock.lock()
-        let displayedSeconds = seekGate.displayedSeconds(raw: rawSeconds, now: now)
-        if let seek = unconfirmedSeek {
-            // A busy decoder may publish its first post-seek tick several
-            // seconds into the requested interval. Paused seeks should land at
-            // the actual requested position.
-            let elapsed = phase == .playing ? max(0, now - seek.host) : 0
-            if rawSeconds >= seek.target - 1, rawSeconds <= seek.target + elapsed + 1 {
-                unconfirmedSeek = nil
-            }
+        let duration = durationSeconds(player)
+        let appState = MainActor.assumeIsolated { UIApplication.shared.applicationState }
+        let isSeekable = player.isSeekable
+        let (seekAction, waitingFor) = callbackLock.withLock {
+            if phase == .failed { seekGate.clear() }
+            let action = seekGate.update(raw: rawSeconds, duration: duration, seekable: isSeekable,
+                                         playing: phase == .playing, ended: phase == .ended,
+                                         foreground: appState != .background, now: now)
+            return (action, seekGate.target)
         }
-        let awaitingSeek = seekGate.target != nil || unconfirmedSeek != nil
-        callbackLock.unlock()
+        var reopenAt: Double?
+        switch seekAction {
+        case .issue(let target):
+            // The input's :start-time and this command both use VLC's timestamp
+            // control. VLCKit's fractional setter uses a separate control.
+            nativeLifetime?.resource?.seek(milliseconds: Int64((target * 1000).rounded()))
+            diagnostics?.event("VLC: issuing seek target=\(target)s")
+        case .reopen(let target):
+            reopenAt = target
+        case .reportFailure(let target):
+            diagnostics?.event("VLC: reopen did not reach seek target=\(target)s; clock=\(rawSeconds)s")
+            seekFailureUntil = now + 6
+        case .none: break
+        }
+        let awaitingSeek = waitingFor != nil
+        // Even a paused/buffering input without timeChanged callbacks must settle.
+        if awaitingSeek { scheduleTimePublish(after: 0.25) }
+        let displayedSeconds = waitingFor ?? reopenAt ?? rawSeconds
 
         if videoDetails == nil, phase == .playing || phase == .paused, now >= nextTrackCheck {
             nextTrackCheck = now + 2
             videoDetails = nativeLifetime?.resource?.videoTrackDescription(frameRate: &nominalFrameRate)
         }
         let stats = frameDelivery?.frameStats
-        let duration = durationSeconds(player)
         // VLCKit may still report buffering while isPlaying and the clock both
         // advance. The displayed phase and the loss monitor must agree. A
         // foreground-inactive transition alone cannot provide loss evidence.
-        let appState = MainActor.assumeIsolated { UIApplication.shared.applicationState }
         let gate = VLCFrameLossWatch.Gate(requested: continuousPlaybackRequested, preview: pausedPreviewDeadline != nil,
                                           seeking: awaitingSeek, playing: phase == .playing, background: appState == .background)
         let activelyPlaying = gate == .open
@@ -450,13 +499,19 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
             active: activelyPlaying, seekable: player.isSeekable, remaining: duration - rawSeconds,
             outputEdge: stats?.outputLongEdge ?? 0, reducedLimit: Self.reducedLongEdge, alreadyReduced: reducedFrameOutput)
         let canReduce = recoveryState == .monitoring
-        let monitorLoss = canReduce || recoveryState == .minimum
-        if !monitorLoss {
+        let endingMinimum = reducedFrameOutput && phase == .ended && continuousPlaybackRequested &&
+            !awaitingSeek && pausedPreviewDeadline == nil && appState != .background
+        // A final clock/counter sample can arrive with the terminal event. A
+        // reset-to-zero EOF clock must not erase an already confirmed warning.
+        let sampleEnd = endingMinimum && duration > 0 && rawSeconds >= duration - 2 &&
+            frameLossWatch.observedMediaSeconds > 0 && now > lastStatsTime
+        let monitorLoss = canReduce || recoveryState == .minimum || sampleEnd
+        if !monitorLoss && !endingMinimum {
             frameLossWatch.reset()
-            stalledAtMinimum = false
+            minimumLoss = .none
         }
         var retryWithSmallerFrames = false
-        if now - lastStatsTime >= 1 && (monitorLoss || diagnostics != nil) {
+        if (now - lastStatsTime >= 1 || sampleEnd) && (monitorLoss || diagnostics != nil) {
             lastStatsTime = now
             let native = nativeLifetime?.resource?.videoStatistics
             if monitorLoss, let stats, let native {
@@ -468,7 +523,9 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
                 retryWithSmallerFrames = canReduce && stalled
                 // A repeated native timestamp can defer a reopen. Keep a confirmed
                 // warning stable until new samples clear the underlying pattern.
-                stalledAtMinimum = reducedFrameOutput && frameLossWatch.pattern != .none
+                if reducedFrameOutput && (!sampleEnd || frameLossWatch.pattern != .none) {
+                    minimumLoss = frameLossWatch.pattern
+                }
             }
             if let diagnostics {
                 var status = "stats=unavailable"
@@ -478,7 +535,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
                 if let stats {
                     status += " offered=\(stats.offered) delivered=\(stats.delivered) coalesced=\(stats.coalesced) bufferMisses=\(stats.bufferMisses)"
                     status += " formatSetups=\(stats.formatSetups) staleSource=\(stats.staleSource)"
-                    status += " vmemCap=\(stats.negotiatedLimit) recovery=\(stalledAtMinimum ? "minimum-stalled" : recoveryState.rawValue)"
+                    status += " vmemCap=\(stats.negotiatedLimit) recovery=\(minimumLoss != .none ? "minimum-stalled" : recoveryState.rawValue)"
                     status += " gate=\(gate.rawValue) vlcState=\(nativeState.rawValue) appState=\(appState.rawValue)"
                     status += " lossPattern=\(frameLossWatch.pattern.rawValue) watchMediaSec=\(Int(frameLossWatch.observedMediaSeconds))"
                 }
@@ -486,12 +543,14 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
             }
         }
         var warning: String?
-        if stalledAtMinimum {
-            warning = "VLC 已把输出降至 1280 像素，但仍在丢帧。可使用较低分辨率或帧率的片源。"
+        if minimumLoss != .none {
+            let symptom = minimumLoss == .frozen ? "播放时间前进时，画面输出停住并持续丢帧。" : "播放时间前进时，出帧过慢并持续丢帧。"
+            warning = "VLC 已降至 1280 像素。" + symptom + "可打开已有的兼容副本，或返回「VR → 制作兼容副本」。"
         } else if let stats, frameProgress.stalled(frames: stats.delivered, media: rawSeconds, host: now,
                 playing: activelyPlaying) {
             warning = "播放时间在前进，VLC 已有 12 秒没有送出新画面。请复制播放诊断，或退出 VR 对比普通播放。"
         }
+        if now < seekFailureUntil { warning = "VLC 未能跳到指定位置，进度条已恢复为实际播放时间。" }
         return PlaybackSnapshot(
             phase: phase,
             seconds: displayedSeconds,
@@ -500,7 +559,9 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
             hasVideo: frameDelivery?.hasDeliveredFrame ?? player.hasVideoOut,
             error: phase == .failed ? "VLC 无法解码这个本地文件。请检查文件是否损坏、编码是否受支持，必要时重新下载。" : warning,
             videoDetails: videoDetails,
-            retryVLCWithSmallerFrames: retryWithSmallerFrames
+            retryVLCWithSmallerFrames: retryWithSmallerFrames,
+            reopenVLCAtSeek: reopenAt,
+            suggestsCompatibleCopy: minimumLoss != .none && phase != .failed
         )
     }
     deinit { stop() }

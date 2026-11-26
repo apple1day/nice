@@ -28,6 +28,7 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     private var usedBytesCache: Int64 = 0
     // Keep the lease until the engine closes, including cover dismissal.
     private var playbackSession: PlaybackRequest?
+    private var queuedCompatibleCopy: PickedVideoFile?
     private var catalogs: [String: [Video]] = [:]
     private var active: [String: URLSessionDownloadTask] = [:]
     private var lastProgress: [String: Date] = [:]
@@ -335,6 +336,22 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             throw ClientError("已有视频正在播放，请先关闭播放器。")
         }
         presentPlayback(PlaybackRequest(pickedFile: file, startMode: startMode))
+    }
+
+    // The picker holds its security-scoped grant and open descriptor across the
+    // animation. Present the validated file only after the old player has closed.
+    func queueCompatibleCopy(_ file: PickedVideoFile, replacing request: PlaybackRequest) throws {
+        guard playback != nil, playbackSession?.id == request.id else {
+            throw ClientError("播放器已切换，请重新选择兼容副本。")
+        }
+        queuedCompatibleCopy = file
+    }
+
+    func openQueuedCompatibleCopy() {
+        guard let file = queuedCompatibleCopy else { return }
+        queuedCompatibleCopy = nil
+        do { try playPickedFile(file, startMode: .afterglow) }
+        catch { errorMessage = error.localizedDescription }
     }
 
     private func presentPlayback(_ request: PlaybackRequest) {

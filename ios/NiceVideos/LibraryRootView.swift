@@ -51,7 +51,7 @@ struct LibraryRootView: View {
         .background { SigningLifecycleView() }
         .fullScreenCover(item: Binding(
             get: { presentation.playback }, set: { store.playback = $0 }
-        )) { request in
+        ), onDismiss: store.openQueuedCompatibleCopy) { request in
             PlaybackScreen(request: request).environmentObject(store)
         }
         .alert("提示", isPresented: Binding(

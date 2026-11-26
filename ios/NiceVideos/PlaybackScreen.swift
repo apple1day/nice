@@ -12,6 +12,7 @@ final class PlaybackModel: ObservableObject {
     @Published private(set) var videoOutput: MovieOutput?
     @Published private(set) var videoDetails: String?
     @Published private(set) var message: String?
+    @Published private(set) var suggestsCompatibleCopy = false
     var onPlaybackEnded: (() -> Void)?
     private let request: PlaybackRequest
     private let engine: LocalPlaybackEngine
@@ -211,6 +212,7 @@ final class PlaybackModel: ObservableObject {
         if duration != nextDuration { duration = nextDuration }
         if seekable != nextSeekable { seekable = nextSeekable }
         if message != snapshot.error { message = snapshot.error }
+        if suggestsCompatibleCopy != snapshot.suggestsCompatibleCopy { suggestsCompatibleCopy = snapshot.suggestsCompatibleCopy }
         if manageAudioSession {
             let disabled = phase == .playing ? true : previousIdleTimer
             if UIApplication.shared.isIdleTimerDisabled != disabled {
@@ -422,6 +424,10 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     @State private var showsVideoFormats = false
     @State private var diagnosticCopyNotice: UUID?
     @State private var showsVRSettings = false
+    @State private var showsCompatiblePicker = false
+    @State private var compatibleSelection: PickedVideoFile.Selection?
+    @State private var preparingCompatibleCopy: Task<Void, Never>?
+    @State private var resumeAfterCopyPicker = false
     @StateObject private var camera: VRGestureCamera
     @State private var vrProfile: VRMoviePreferences
     @AppStorage("vr.viewer.gyro") private var followHead = false
@@ -469,7 +475,8 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist || showsVideoFormats || showsVRSettings }
     private var isLibraryVideo: Bool { request.pickedFile == nil }
     private var showsPause: Bool { model.phase == .playing || model.phase == .opening }
-    private var canInteract: Bool { scenePhase == .active && store.errorMessage == nil && !showsPlaylist && !showsVRSettings }
+    private var canInteract: Bool { scenePhase == .active && store.errorMessage == nil && !showsPlaylist && !showsVRSettings &&
+        !showsCompatiblePicker && preparingCompatibleCopy == nil }
     private var transportButtonStyle: PlaybackTransportButtonStyle {
         PlaybackTransportButtonStyle { token, pressed in
             controls.setControlPressed(token, pressed: pressed, at: now)
@@ -563,6 +570,12 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         }
         .sheet(isPresented: $showsPlaylist) { playlistSheet }
         .sheet(isPresented: $showsVRSettings) { immersiveSettings }
+        .sheet(isPresented: $showsCompatiblePicker, onDismiss: resolveCompatibleSelection) {
+            VideoDocumentPicker { selection in
+                compatibleSelection = selection
+                showsCompatiblePicker = false
+            }
+        }
         .overlay(alignment: .center) {
             if diagnosticCopyNotice != nil {
                 Text("播放诊断已复制")
@@ -666,6 +679,19 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             if let message = model.message {
                 Text(message).font(.caption).foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if model.suggestsCompatibleCopy {
+                Button("打开兼容副本…", systemImage: "folder") {
+                    cancelProgressInteraction()
+                    resumeAfterCopyPicker = showsPause
+                    if resumeAfterCopyPicker { model.pause() }
+                    showsCompatiblePicker = true
+                }
+                .disabled(!canInteract)
+                .accessibilityIdentifier("openCompatibleCopy")
+            }
+            if preparingCompatibleCopy != nil {
+                ProgressView("正在打开所选副本…").tint(.white).font(.caption)
             }
             if let notice = playlist.notice ?? store.deletionNotice {
                 Text(notice).font(.caption).lineLimit(2)
@@ -978,7 +1004,35 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         }
     }
     private func revealControls() { controls.interacted(at: now) }
+    private func resolveCompatibleSelection() {
+        let resume = resumeAfterCopyPicker
+        resumeAfterCopyPicker = false
+        guard let selection = compatibleSelection else {
+            if resume && scenePhase == .active && model.phase == .paused { model.toggle() }
+            return
+        }
+        compatibleSelection = nil
+        let old = request
+        preparingCompatibleCopy = Task { @MainActor in
+            defer { preparingCompatibleCopy = nil }
+            do {
+                let file = try await PickedVideoFile.open(selection)
+                try Task.checkCancellation()
+                guard request.id == old.id else { return }
+                try store.queueCompatibleCopy(file, replacing: old)
+                preparingCompatibleCopy = nil
+                closePlayback()
+                dismiss()
+            } catch {
+                guard !Task.isCancelled, request.id == old.id else { return }
+                store.errorMessage = error.localizedDescription
+                if resume && scenePhase == .active && model.phase == .paused { model.toggle() }
+            }
+        }
+    }
+
     private func closePlayback() {
+        preparingCompatibleCopy?.cancel()
         camera.connect(to: nil, followHead: false)
         cancelProgressInteraction()
         controls.stop()

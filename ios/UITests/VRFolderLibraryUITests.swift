@@ -115,6 +115,28 @@ final class VRFolderLibraryUITests: XCTestCase {
         XCTAssertTrue(subfolder.exists)
     }
 
+    func testCompatibleCopyFormOpensBeforePlaybackAndRequiresBothLocations() {
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-test-vr-folder"]
+        app.launchEnvironment["NICE_VR_FOLDER_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let tab = app.tabBars.buttons["vrFolderTab"]
+        (tab.exists ? tab : app.tabBars.buttons["VR"]).tap()
+        let entry = app.buttons["makeCompatibleCopy"]
+        XCTAssertTrue(entry.waitForExistence(timeout: 8), app.debugDescription)
+        entry.tap()
+        XCTAssertTrue(app.buttons["compatibleCopySource"].waitForExistence(timeout: 8), app.debugDescription)
+        XCTAssertTrue(app.buttons["compatibleCopyDestination"].isHittable)
+        XCTAssertFalse(app.buttons["startCompatibleCopy"].isEnabled)
+        XCTAssertFalse(app.buttons["playGeneratedCopy"].exists)
+        attachVRScreen("Compatible copy source and destination")
+        app.buttons["closeCompatibleCopy"].tap()
+        XCTAssertTrue(entry.waitForExistence(timeout: 8))
+    }
+
     func testAfterglowPresetAppliesBeforeFolderMovieAndSurvivesRelaunch() throws {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait

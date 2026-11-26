@@ -218,6 +218,20 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
                 MainActor.assumeIsolated { self.reconcileOutput(host) }
                 return
             }
+            if let retry = snapshot.reopenVLCAtSeek, newSession is VLCPlaybackEngine, let host = self.hostView {
+                MainActor.assumeIsolated {
+                    let target = self.pendingSeek ?? retry
+                    self.seconds = target
+                    self.phase = .opening
+                    self.diagnostics.event("VLC: seek not confirmed; reopening once at \(target)s")
+                    self.retireSession()
+                    if self.currentOutput == .vlcFrames { self.installVLCFrameSession() }
+                    else { self.nativeSession().attach(to: host.drawableView) }
+                    self.reopenAfterOutputChange(host)
+                    (self.session as? VLCPlaybackEngine)?.verifyReopenedSeek(at: target)
+                }
+                return
+            }
             if snapshot.retryVLCWithSmallerFrames, self.currentOutput == .vlcFrames,
                !self.reducedVLCFrameOutput, self.wantsPlayback, !self.awaitingOutput, !self.openingPaused,
                self.pendingSeek == nil, self.phase != .ended, self.phase != .failed, let host = self.hostView {
@@ -463,7 +477,13 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         guard position.isFinite else { return }
         seconds = max(0, position)
         diagnostics.event("seek target=\(seconds)")
-        if awaitingOutput {
+        if awaitingOutput, session is VLCPlaybackEngine {
+            // VLC owns this request even before the replacement stream reports
+            // seekable. Its bounded seek acknowledgement also covers this case.
+            awaitingOutput = false
+            pendingSeek = nil
+            session?.seek(to: seconds)
+        } else if awaitingOutput {
             pendingSeek = seconds
         } else {
             session?.seek(to: seconds)

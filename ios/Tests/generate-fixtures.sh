@@ -59,6 +59,15 @@ ffmpeg -hide_banner -loglevel error -y -stream_loop 11 -i "$pattern_dir/full8k-c
   -f lavfi -i 'anullsrc=sample_rate=48000:channel_layout=mono' -map 0:v:0 -map 1:a:0 \
   -t 12 -c:v copy -tag:v hvc1 -c:a aac -b:a 32k -movflags +faststart stereo8k60-full.mp4
 python3 ../../tools/make_large_mp4_fixture.py stereo8k60-full.mp4 full8k-co64
+# The offline converter must accept Main 10 tagged hev1, retain the packed eyes
+# and preserve real audio. Encode one short cycle and reuse its closed GOPs.
+ffmpeg -hide_banner -loglevel error -y -i "$pattern_dir/full8k-cycle.mp4" \
+  -c:v libx265 -preset ultrafast -pix_fmt yuv420p10le -profile:v main10 \
+  -x265-params 'pools=2:frame-threads=2:keyint=30:min-keyint=30:open-gop=0:scenecut=0:log-level=error' \
+  -tag:v hev1 "$pattern_dir/main10-cycle.mp4"
+ffmpeg -hide_banner -loglevel error -y -stream_loop 7 -i "$pattern_dir/main10-cycle.mp4" \
+  -f lavfi -i 'sine=frequency=440:sample_rate=48000' -map 0:v:0 -map 1:a:0 \
+  -t 8 -c:v copy -tag:v hev1 -c:a aac -b:a 64k -movflags +faststart vr8k-main10-hev1.mp4
 # A directional stereo panorama with independent eye colors, video motion and
 # a continuous audible tone. Encode a short GOP once and reuse it in the UI test.
 ffmpeg -hide_banner -loglevel error -y -f lavfi \

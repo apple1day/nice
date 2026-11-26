@@ -80,6 +80,8 @@
     return self;
 }
 
+- (void)seekToMilliseconds:(int64_t)milliseconds { libvlc_media_player_set_time(_player, milliseconds); }
+
 - (int64_t)lengthMilliseconds { return libvlc_media_player_get_length(_player); }
 
 - (NSString *)videoTrackDescriptionWithFrameRate:(double *)rate {

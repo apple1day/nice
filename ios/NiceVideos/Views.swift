@@ -28,7 +28,7 @@ struct RootView: View {
             NavigationStack { SettingsView() }
                 .tabItem { Label("设置", systemImage: "gearshape") }
         }
-        .fullScreenCover(item: $store.playback) { request in
+        .fullScreenCover(item: $store.playback, onDismiss: store.openQueuedCompatibleCopy) { request in
             PlaybackScreen(request: request).environmentObject(store)
         }
         .alert("提示", isPresented: Binding(

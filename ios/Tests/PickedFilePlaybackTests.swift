@@ -1,3 +1,4 @@
+import AVFoundation
 import Metal
 import UIKit
 import XCTest
@@ -76,6 +77,59 @@ final class PickedFilePlaybackTests: XCTestCase {
         try await checkPackedPlayback(prefix: "full8k-co64", allowVLCFallback: true)
     }
 
+    func testOfflineCopyOfFull8KMain10PreservesAudioAndMovingPanoramaAfterSeeking() async throws {
+        let bundle = Bundle(for: Self.self)
+        let original = try XCTUnwrap(bundle.url(forResource: "vr8k-main10-hev1", withExtension: "mp4", subdirectory: "Fixtures"))
+        let fm = FileManager.default
+        let directory = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? fm.removeItem(at: directory) }
+        // For a Files import, keep reading its retained descriptor if the provider replaces its URL.
+        let file = directory.appendingPathComponent("原片 10bit.mp4")
+        try fm.copyItem(at: original, to: file)
+        let input = try await PickedVideoFile.open(file)
+        try Data("replacement".utf8).write(to: file, options: .atomic)
+        let destination = directory.appendingPathComponent("双眼 兼容.mp4")
+        var lastProgress = 0.0
+        let result = try await VRCompatibleCopy.generate(fileURL: file, pickedFile: input, destination: destination) {
+            lastProgress = $0
+        }
+        XCTAssertEqual(result, destination)
+        XCTAssertEqual(lastProgress, 1)
+        let output = AVURLAsset(url: result)
+        let videoTracks = try await output.loadTracks(withMediaType: .video)
+        let video = try XCTUnwrap(videoTracks.first)
+        let size = try await video.load(.naturalSize)
+        XCTAssertEqual(size, CGSize(width: 1920, height: 960))
+        let descriptions = try await video.load(.formatDescriptions)
+        let format = try XCTUnwrap(descriptions.first)
+        XCTAssertEqual(CMFormatDescriptionGetMediaSubType(format), kCMVideoCodecType_H264)
+        let duration = try await output.load(.duration)
+        XCTAssertEqual(duration.seconds, 8, accuracy: 0.30)
+        let audio = try await output.loadTracks(withMediaType: .audio)
+        XCTAssertEqual(audio.count, 1)
+        let reader = try AVAssetReader(asset: output)
+        let audioOutput = AVAssetReaderTrackOutput(track: try XCTUnwrap(audio.first), outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 16
+        ])
+        reader.add(audioOutput)
+        XCTAssertTrue(reader.startReading())
+        var foundTone = false
+        while let buffer = audioOutput.copyNextSampleBuffer(), !foundTone {
+            guard let block = CMSampleBufferGetDataBuffer(buffer) else { continue }
+            let length = CMBlockBufferGetDataLength(block)
+            var bytes = [UInt8](repeating: 0, count: length)
+            let status = bytes.withUnsafeMutableBytes { destination in
+                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: destination.baseAddress!)
+            }
+            XCTAssertEqual(status, noErr)
+            foundTone = bytes.contains { $0 != 0 }
+        }
+        reader.cancelReading()
+        XCTAssertTrue(foundTone, "Converted track must contain decoded non-silent PCM")
+        try await checkMovingEyes(url: result, input: try await PickedVideoFile.open(result), allowVLCFallback: false)
+    }
+
     private func checkPackedPlayback(prefix: String, allowVLCFallback: Bool) async throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
@@ -86,6 +140,10 @@ final class PickedFilePlaybackTests: XCTestCase {
         // File providers may replace the URL after it is opened. The player must
         // continue to read the original (sparse) document through its descriptor.
         try Data("replacement".utf8).write(to: url, options: .atomic)
+        try await checkMovingEyes(url: url, input: source, allowVLCFallback: allowVLCFallback)
+    }
+
+    private func checkMovingEyes(url: URL, input source: PickedVideoFile, allowVLCFallback: Bool) async throws {
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
         let controller = UIViewController()
         window.rootViewController = controller

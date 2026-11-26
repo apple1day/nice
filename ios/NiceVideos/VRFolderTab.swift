@@ -10,6 +10,8 @@ import UIKit
 
     @State private var picker: PickerTarget?
     @State private var showsAfterglowSettings = false
+    @State private var showsCopyCreator = false
+    @State private var finishedCopy: PickedVideoFile?
     @State private var pendingVideo: (PickedVideoFile.Selection, PlaybackStartMode)?
     @State private var restored = false
     @State private var pendingRemoval: VRFolderRoot?
@@ -42,6 +44,16 @@ import UIKit
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 afterglowActions
+                Button {
+                    cancelOpen()
+                    showsCopyCreator = true
+                } label: {
+                    Label("制作兼容副本", systemImage: "film.stack")
+                        .font(.subheadline).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).padding(.horizontal, 16)
+                .accessibilityIdentifier("makeCompatibleCopy")
                 if library.currentRoot == nil { sources }
                 if library.currentRoot != nil { folderHeader }
                 if let message = library.errorMessage {
@@ -93,6 +105,17 @@ import UIKit
             }
         }
         .sheet(isPresented: $showsAfterglowSettings) { AfterglowPresetView() }
+        .sheet(isPresented: $showsCopyCreator, onDismiss: {
+            if let file = finishedCopy {
+                finishedCopy = nil
+                onPlay(file, .afterglow)
+            }
+        }) {
+            VRCompatibleCopySheet { file in
+                finishedCopy = file
+                showsCopyCreator = false
+            }
+        }
         .alert("无法打开视频", isPresented: Binding(get: { playbackError != nil },
                                                set: { if !$0 { playbackError = nil } })) {
             Button("好", role: .cancel) {}
@@ -300,7 +323,7 @@ import UIKit
     }
 }
 
-private struct VRDirectoryPicker: UIViewControllerRepresentable {
+struct VRDirectoryPicker: UIViewControllerRepresentable {
     let onPick: (URL?) -> Void
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         let finish: (URL?) -> Void

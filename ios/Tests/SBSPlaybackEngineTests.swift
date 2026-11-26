@@ -60,6 +60,56 @@ final class SBSPlaybackEngineTests: XCTestCase {
         XCTAssertTrue(capture().contains("loadID=2"), capture())
     }
 
+    func testVLCChangesPositionToLastScrubAsReopenedPanoramaStarts() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "panorama-audio", withExtension: "mp4", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        let mode = SBSDisplayMode.immersive(.vr360, .sideBySide, headset: true)
+        host.configure(mode: mode, standardOutput: .afterglow)
+        let engine = SBSPlaybackEngine()
+        var snapshot = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { snapshot = $0 }
+        defer { engine.stop(); window.isHidden = true }
+        engine.attach(to: host)
+        try engine.load(fileURL: file)
+        engine.play()
+
+        func waitFor(_ predicate: () -> Bool) async throws -> Bool {
+            let deadline = Date().addingTimeInterval(18)
+            while Date() < deadline && !predicate() { try await Task.sleep(nanoseconds: 50_000_000) }
+            return predicate()
+        }
+        let started = try await waitFor { snapshot.hasVideo && snapshot.seekable }
+        XCTAssertTrue(started)
+        guard started else { return }
+        engine.seek(to: 18.2)
+        let positioned = try await waitFor { (18.4...23).contains(snapshot.seconds) }
+        XCTAssertTrue(positioned)
+        guard positioned else { return }
+        host.configure(mode: mode, standardOutput: .vlcFrames)
+        for target in [34.3, 45.85, 27.25, 53.25] { engine.seek(to: target) }
+        let renderer = try XCTUnwrap(host.renderer)
+        // A displayed seek target alone cannot pass. Require a VLC clock that
+        // has advanced past it, then another picture and continuing clock motion.
+        let reached = try await waitFor {
+            snapshot.videoOutput == .vlcFrames && snapshot.seekable && snapshot.hasVideo &&
+                snapshot.phase == .playing && (53.6...57).contains(snapshot.seconds)
+        }
+        XCTAssertTrue(reached, engine.playbackDiagnosticReport() ?? "")
+        guard reached else { return }
+        let firstFrame = renderer.acceptedFrameID
+        let media = snapshot.seconds
+        let moving = try await waitFor {
+            snapshot.seconds > media + 0.25 && renderer.acceptedFrameID >= firstFrame + 2
+        }
+        XCTAssertTrue(moving, engine.playbackDiagnosticReport() ?? "")
+    }
+
     func testAfterglowFailureReturnsToVLCAtTheLatestSeekWithoutRetrying() async throws {
         // VideoLAN accepts this Matroska payload; AVFoundation cannot open it.
         let source = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "offline", withExtension: "mkv", subdirectory: "Fixtures"))
