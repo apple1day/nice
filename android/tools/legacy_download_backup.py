@@ -31,6 +31,7 @@ def require(condition, message):
 class Device:
     def __init__(self, serial):
         self.adb = ["adb"] + (["-s", serial] if serial else [])
+        self.external = self.run
 
     def run(self, command, **kwargs):
         # -T keeps binary streams intact. Shell v2 also propagates device exit status.
@@ -39,8 +40,28 @@ class Device:
     def app(self, script, **kwargs):
         return self.run("run-as " + PACKAGE + " sh -c " + shlex.quote(script), **kwargs)
 
-    def text(self, script):
-        return self.app(script, stdout=subprocess.PIPE).stdout.decode().strip()
+    def file_command(self, path, script, **kwargs):
+        # Private preferences require run-as. USB shell and run-as can see different
+        # emulated-storage mounts even though both are addressing the owner profile.
+        method = self.external if path.startswith(MOVIES.rsplit("/", 1)[0] + "/") else self.app
+        return method(script, **kwargs)
+
+    def text(self, script, path=""):
+        return self.file_command(path, script, stdout=subprocess.PIPE).stdout.decode().strip()
+
+    def select_movies_access(self, restoring):
+        parent = MOVIES.rsplit("/", 1)[0]
+        for probe in (MOVIES,) if restoring else (MOVIES, parent):
+            for method in (self.run, self.app):
+                try:
+                    method(f"test -d {probe} && ls -A {probe} >/dev/null",
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except subprocess.CalledProcessError:
+                    continue
+                self.external = method
+                return
+        raise ValueError("USB debugging cannot read the app's Movies directory: " + MOVIES
+                         + ". Verify the Android owner profile and keep the original installation.")
 
     def stop(self, restoring):
         owner = self.run("am get-current-user", stdout=subprocess.PIPE).stdout.strip()
@@ -56,7 +77,7 @@ class Device:
     def digest(self, path):
         # Paths passed here consist exclusively of locally constructed, allowlisted names.
         raw = self.text("if [ -L {0} ]; then exit 1; elif [ -f {0} ]; then "
-                        "stat -c %s {0} && sha256sum {0}; elif [ -e {0} ]; then exit 1; fi".format(path))
+                        "stat -c %s {0} && sha256sum {0}; elif [ -e {0} ]; then exit 1; fi".format(path), path)
         if not raw:
             return None
         lines = raw.splitlines()
@@ -67,7 +88,7 @@ class Device:
         # 'test -d' alone reports false on EACCES too. Require a readable parent
         # before accepting an absent Movies directory as empty.
         result = self.text(f"if [ -d {MOVIES} ]; then ls -A1 {MOVIES}; "
-                           f"else ls -A {parent} >/dev/null; fi")
+                           f"else ls -A {parent} >/dev/null; fi", MOVIES + "/")
         names = result.splitlines()
         require(all(MOVIE.fullmatch(n) for n in names),
                 "Unexpected files in the old Movies directory. Inspect them before backing up.")
@@ -135,7 +156,7 @@ def pull(device, remote, local, expected):
     require(not temporary.is_symlink(), f"Unsafe temporary path: {temporary}")
     try:
         with temporary.open("wb") as out:
-            device.app("cat " + remote, stdout=out)
+            device.file_command(remote, "cat " + remote, stdout=out)
             out.flush()
             os.fsync(out.fileno())
         require(file_digest(temporary) == expected, f"Copy did not match phone: {local.name}")
@@ -163,6 +184,7 @@ def backup(device, root):
         ensure_dir(root / name)
 
     device.stop(restoring=False)
+    device.select_movies_access(restoring=False)
     names = device.movies()
     info = {"format": FORMAT, "package": PACKAGE, "Movies": {}, "prefs": {}}
     for name in PREFS:
@@ -175,7 +197,7 @@ def backup(device, root):
     catalog = root / "prefs/video_library.xml"
     if "video_library.xml" in info["prefs"]:
         # Reject active downloads before reading multi-GB files.
-        sizes = {n: {"bytes": int(device.text("stat -c %s " + MOVIES + "/" + n))} for n in names}
+        sizes = {n: {"bytes": int(device.text("stat -c %s " + MOVIES + "/" + n, MOVIES + "/" + n))} for n in names}
         check_catalog(catalog.read_bytes(), sizes)
     for i, name in enumerate(names, 1):
         print(f"[{i}/{len(names)}] Verify and back up {name}", flush=True)
@@ -235,16 +257,16 @@ def upload(device, directory, name, expected, source=None, data=None, replace_em
         script = f"umask 077; cat > {temp}"
         if source is not None:
             with source.open("rb") as stream:
-                device.app(script, stdin=stream)
+                device.file_command(temp, script, stdin=stream)
         else:
-            device.app(script, input=data)
+            device.file_command(temp, script, input=data)
         require(device.digest(temp) == expected, f"Device copy failed verification: {name}")
         # Refuse to clobber files that appeared or changed after preflight.
         require(device.digest(path) == current, f"Destination changed during restore: {name}")
-        device.app(("mv -f " if current else "mv -n ") + temp + " " + path)
+        device.file_command(path, ("mv -f " if current else "mv -n ") + temp + " " + path)
         require(device.digest(path) == expected, f"Restored file failed verification: {name}")
     finally:
-        device.app("rm -f " + temp)
+        device.file_command(temp, "rm -f " + temp)
 
 
 def restore(device, root):
@@ -272,7 +294,8 @@ def restore(device, root):
     device.run("am start -W -n " + PACKAGE + "/com.anxiong.nicevideos.MainActivity "
                "-a com.anxiong.nicevideos.PREPARE_RESTORE", stdout=subprocess.DEVNULL)
     device.run("am force-stop " + PACKAGE)
-    device.app("test -d " + MOVIES + " && mkdir -p shared_prefs")
+    device.select_movies_access(restoring=True)
+    device.app("mkdir -p shared_prefs")
     require(set(device.movies()) <= set(info["Movies"]), "Target contains other videos. Start with a fresh installation.")
     missing_bytes = 0
     for name, expected in info["Movies"].items():
@@ -282,9 +305,9 @@ def restore(device, root):
             # A disconnected run can leave its partial transfer in staging. The
             # bytes will be released when cat truncates that same staging file.
             stage = MOVIES.rsplit("/", 1)[0] + "/.nice-restore-" + name + ".part"
-            stage_size = int(device.text(f"if [ -f {stage} ]; then stat -c %s {stage}; else echo 0; fi"))
+            stage_size = int(device.text(f"if [ -f {stage} ]; then stat -c %s {stage}; else echo 0; fi", stage))
             missing_bytes += max(0, expected["bytes"] - stage_size)
-    free = device.text("df -k " + MOVIES).splitlines()[-1].split()
+    free = device.text("df -k " + MOVIES, MOVIES + "/").splitlines()[-1].split()
     require(int(free[-3]) * 1024 >= missing_bytes, "Not enough space to restore the videos.")
     for i, (name, item) in enumerate(info["Movies"].items(), 1):
         print(f"[{i}/{len(info['Movies'])}] Restore {name}", flush=True)
