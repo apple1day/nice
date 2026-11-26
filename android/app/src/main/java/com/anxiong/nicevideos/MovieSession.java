@@ -20,6 +20,7 @@ import androidx.media3.common.VideoSize;
 import androidx.media3.datasource.DefaultDataSource;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.ExoPlaybackException;
 import androidx.media3.exoplayer.analytics.AnalyticsListener;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
@@ -49,6 +50,11 @@ final class MovieSession implements Player.Listener {
     private final Handler decoder;
     private volatile boolean closed;
     private volatile int audioUnderruns;
+    private volatile String trackReport = "视频轨道  等待识别";
+    private volatile float fps = Format.NO_VALUE;
+    private volatile String errorCode = "";
+    private Format sourceFormat;
+    private int formatSupport = -1;
     private ExoPlayer player;
     private boolean failed;
     private boolean softwareOnly;
@@ -63,6 +69,11 @@ final class MovieSession implements Player.Listener {
     }
 
     int audioUnderruns() { return audioUnderruns; }
+    float frameRate() { return fps; }
+    String diagnostics() {
+        return trackReport + "\n本次播放音频缓冲耗尽  " + audioUnderruns + " 次"
+                + (errorCode.isEmpty() ? "" : "\n播放错误  " + errorCode);
+    }
 
     private void deliver(Runnable callback) {
         main.post(() -> { if (!closed) callback.run(); });
@@ -120,7 +131,8 @@ final class MovieSession implements Player.Listener {
                 player.setPlayWhenReady(play);
                 player.prepare();
             } catch (RuntimeException e) {
-                fail("无法打开视频：" + e.getLocalizedMessage());
+                errorCode = e.getClass().getSimpleName();
+                fail("无法打开视频，请确认文件仍可读取。");
             }
         });
     }
@@ -149,11 +161,12 @@ final class MovieSession implements Player.Listener {
         deliver(() -> listener.onBuffering(state == Player.STATE_BUFFERING));
         if (state == Player.STATE_READY) {
             Tracks tracks = player.getCurrentTracks();
+            updateTrack(tracks);
             if (!tracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) {
                 if (softwareOnly) {
                     fail("设备上的软件解码器无法播放这条视频轨道。请在「片源信息」恢复自动解码。");
                 } else if (tracks.containsType(C.TRACK_TYPE_VIDEO)) {
-                    fail("当前解码器无法处理该视频轨道，请在片源信息中切换解码方式。");
+                    fail("设备未能解码这条视频轨道。可在「片源信息」查看原片规格或尝试软件解码。");
                 } else {
                     fail("所选文件没有可播放的视频轨道。");
                 }
@@ -177,19 +190,77 @@ final class MovieSession implements Player.Listener {
         publishFormat();
     }
 
+    @Override public void onTracksChanged(Tracks tracks) {
+        if (closed || failed) return;
+        updateTrack(tracks);
+        publishFormat();
+    }
+
+    private void updateTrack(Tracks tracks) {
+        Format candidate = null;
+        int support = -1;
+        for (Tracks.Group group : tracks.getGroups()) {
+            if (group.getType() != C.TRACK_TYPE_VIDEO) continue;
+            for (int i = 0; i < group.length; i++) {
+                int available = group.getTrackSupport(i);
+                if (group.isTrackSelected(i)) {
+                    sourceFormat = group.getTrackFormat(i);
+                    formatSupport = available;
+                    return;
+                }
+                if (candidate == null || available > support) {
+                    candidate = group.getTrackFormat(i);
+                    support = available;
+                }
+            }
+        }
+        if (candidate != null) { sourceFormat = candidate; formatSupport = support; }
+    }
+
+    private static String supportDescription(int support) {
+        switch (support) {
+            case C.FORMAT_HANDLED: return "设备声明支持";
+            case C.FORMAT_EXCEEDS_CAPABILITIES: return "超出设备声明能力";
+            case C.FORMAT_UNSUPPORTED_SUBTYPE: return "设备未提供该编码的兼容解码器";
+            case C.FORMAT_UNSUPPORTED_DRM: return "设备未支持此加密格式";
+            case C.FORMAT_UNSUPPORTED_TYPE: return "设备未支持此轨道类型";
+            default: return "尚未报告";
+        }
+    }
+
     private void publishFormat() {
-        if (closed || failed || player == null || player.getPlaybackState() != Player.STATE_READY) return;
-        Format format = player.getVideoFormat();
+        if (closed || failed || player == null) return;
+        Format activeFormat = player.getVideoFormat();
+        Format format = activeFormat != null ? activeFormat : sourceFormat;
         StringBuilder details = new StringBuilder();
         if (format != null) {
-            if (format.sampleMimeType != null) details.append(format.sampleMimeType);
-            if (format.frameRate > 0) details.append(String.format(Locale.ROOT, " · %.1f fps", format.frameRate));
+            if (format.sampleMimeType != null && format.sampleMimeType.matches("[A-Za-z0-9/+.\\-]{1,80}"))
+                details.append(format.sampleMimeType);
+            if (format.codecs != null && format.codecs.matches("[A-Za-z0-9.,_ \\-]{1,100}"))
+                details.append(" · ").append(format.codecs);
+            if (format.width > 0 && format.height > 0)
+                details.append(" · ").append(format.width).append(" × ").append(format.height);
+            fps = format.frameRate;
+            if (fps > 0) details.append(String.format(Locale.ROOT, " · %.1f fps", fps));
+            if (format.colorInfo != null) {
+                String transfer = null;
+                switch (format.colorInfo.colorTransfer) {
+                    case C.COLOR_TRANSFER_ST2084: transfer = "PQ"; break;
+                    case C.COLOR_TRANSFER_HLG: transfer = "HLG"; break;
+                    case C.COLOR_TRANSFER_SDR: transfer = "SDR"; break;
+                }
+                if (transfer != null) details.append(" · ").append(transfer);
+                if (format.colorInfo.lumaBitdepth > 0) details.append(" · ").append(format.colorInfo.lumaBitdepth).append(" bit");
+            }
         }
-        if (details.length() == 0) details.append("视频轨道");
-        if (codecName != null) details.append(" · ").append(codecName);
-        if (softwareOnly) details.append("（软件）");
-        long duration = Math.max(0, player.getDuration());
+        if (details.length() == 0) details.append("暂未识别");
+        details.append("\n设备声明能力  ").append(supportDescription(formatSupport));
+        details.append("\n解码器  ").append(codecName == null ? "尚未启动" : codecName);
+        if (codecName != null && softwareOnly) details.append("（软件）");
         String info = details.toString();
+        trackReport = "视频轨道  " + info;
+        if (player.getPlaybackState() != Player.STATE_READY || !player.getCurrentTracks().isTypeSelected(C.TRACK_TYPE_VIDEO)) return;
+        long duration = Math.max(0, player.getDuration());
         if (duration != lastDuration || !info.equals(lastInfo)) {
             lastDuration = duration;
             lastInfo = info;
@@ -209,6 +280,24 @@ final class MovieSession implements Player.Listener {
     }
 
     @Override public void onPlayerError(PlaybackException error) {
+        if (closed || failed) return;
+        updateTrack(player.getCurrentTracks());
+        if (error instanceof ExoPlaybackException) {
+            ExoPlaybackException failure = (ExoPlaybackException) error;
+            if (failure.rendererFormat != null && MimeTypes.isVideo(failure.rendererFormat.sampleMimeType)) {
+                sourceFormat = failure.rendererFormat;
+                formatSupport = failure.rendererFormatSupport;
+            }
+        }
+        publishFormat();
+        errorCode = error.getErrorCodeName();
+        for (Throwable cause = error.getCause(); cause != null; cause = cause.getCause()) {
+            if (cause instanceof android.media.MediaCodec.CodecException) {
+                String code = ((android.media.MediaCodec.CodecException) cause).getDiagnosticInfo();
+                if (code != null && code.matches("[A-Za-z0-9_.-]{1,100}")) errorCode += " · " + code;
+                break;
+            }
+        }
         String reason;
         if (error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND
                 || error.errorCode == PlaybackException.ERROR_CODE_IO_NO_PERMISSION) {
@@ -225,6 +314,7 @@ final class MovieSession implements Player.Listener {
 
     private void fail(String message) {
         if (closed || failed) return;
+        publishFormat();
         failed = true;
         Log.w("NiceVideos-session", message);
         decoder.removeCallbacks(ticker);

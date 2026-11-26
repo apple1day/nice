@@ -6,7 +6,7 @@
     <application
         android:allowBackup="false"
         android:icon="@drawable/nice_logo"
-        android:label="Nice 视频 VR 1.2"
+        android:label="${niceAppLabel}"
         android:theme="@style/NiceTheme"
         android:usesCleartextTraffic="true">
         <activity android:name=".MainActivity" android:exported="true">

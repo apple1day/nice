@@ -66,3 +66,21 @@ ffmpeg -nostdin -v error -y -i "$work/sbs.mp4" -t 2 -c:v libvpx-vp9 -threads 2 \
   -deadline realtime -cpu-used 7 -g 8 -crf 26 -b:v 0 -pix_fmt yuv420p -c:a copy "$work/vp9.mp4"
 ffmpeg -nostdin -v error -y -stream_loop 29 -i "$work/vp9.mp4" -t 60 -c copy \
   -movflags +faststart "$dest/vr-chart-vp9.mp4"
+
+# Match the iPhone replay case: each eye changes color once per second. Both
+# streams have the same 8-second clock and audio; the 8K one needs a suitable codec.
+for kind in replay-hd replay-8k; do
+  if [[ "$kind" == replay-8k ]]; then
+    dimensions=8192:2048
+    codec=(-c:v libx265 -tag:v hvc1 -x265-params 'pools=2:frame-threads=2:keyint=24:min-keyint=24:scenecut=0:log-level=error')
+  else
+    dimensions=1920:480
+    codec=(-c:v libx264 -g 24 -bf 0)
+  fi
+  ffmpeg -nostdin -v error -y -f lavfi \
+    -i "color=red:size=512x128:rate=24,drawbox=x=256:w=256:h=128:c=blue:t=fill,drawbox=x=0:w=256:h=128:c=lime:t=fill:enable='gte(t,1)',drawbox=x=256:w=256:h=128:c=yellow:t=fill:enable='gte(t,1)',scale=$dimensions:flags=neighbor" \
+    -t 2 "${codec[@]}" -threads 2 -preset ultrafast -pix_fmt yuv420p "$work/$kind.mp4"
+  ffmpeg -nostdin -v error -y -stream_loop 3 -i "$work/$kind.mp4" -f lavfi \
+    -i 'sine=frequency=440:sample_rate=48000' -map 0:v:0 -map 1:a:0 -t 8 -c:v copy \
+    -c:a aac -movflags +faststart "$dest/vr-chart-$kind.mp4"
+done

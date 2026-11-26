@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
@@ -39,17 +41,19 @@ import java.util.Locale;
 import java.util.UUID;
 
 public final class PlayerActivity extends Activity implements MovieSurface.Listener, MovieSession.Listener {
+    static final String EXTRA_START_IN_VR = "startInVr";
     private static final int STEPS = 10000;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable hide = () -> showControls(false);
-    private final Runnable firstFrameCheck = this::checkFirstFrame;
+    private final VideoFrameWatch frameWatch = new VideoFrameWatch();
     private final BroadcastReceiver noisy = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
             if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(i.getAction())) pause();
         }
     };
     private MovieSurface movie;
-    private Surface surface;
+    private Surface surface, replaceAfterRelease;
+    private boolean needFreshOutput;
     private MovieSession session;
     private VrLookControls look;
     private VrFormat vrFormat;
@@ -64,12 +68,15 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     private SeekBar bar;
     private Uri uri;
     private SharedPreferences bookmarks;
-    private String bookmarkKey, videoMime;
+    private String bookmarkKey;
+    private String lastTrackReport = "视频轨道  等待识别";
+    private String outputEvent = "首次打开";
+    private long framesAtOpen;
+    private int inputNumber;
     private int width, height;
     private long duration, position, lastSave;
     private long scrubTarget = -1, discreteTarget = -1, displayedSecond = -1;
     private final Runnable commitDiscreteSeek = () -> jump(discreteTarget);
-    private long observedSamples = -1, samplePosition, sampleWallTime;
     private boolean stalledPicture, playBeforeFailure;
     private boolean active, prepared, failed, ended, firstFrame, playing, wantsPlay = true;
     private boolean hasFocus, resumeOnGain, dragging, controlsVisible = true, dialogOpen, userFullscreen;
@@ -87,9 +94,11 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         bookmarkKey = UUID.nameUUIDFromBytes(uri.toString().getBytes(StandardCharsets.UTF_8)).toString();
         position = Math.max(0, bookmarks.getLong(bookmarkKey, 0));
         readVrSettings();
+        if (state == null && getIntent().getBooleanExtra(EXTRA_START_IN_VR, false)) inVr = true;
         if (state != null) {
             position = state.getLong("position", position);
             wantsPlay = state.getBoolean("wantsPlay", false);
+            inVr = state.getBoolean("inVr", inVr);
             softwareDecoder = state.getBoolean("softwareDecoder", false);
             userFullscreen = state.getBoolean("fullscreen", false);
         }
@@ -119,9 +128,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setSingleLine(true);
         title.setEllipsize(TextUtils.TruncateAt.END);
-        String name = getIntent().getStringExtra("title");
-        if (name == null) name = "file".equals(uri.getScheme()) ? new File(uri.getPath()).getName() : "本地视频";
-        title.setText(name);
+        title.setText(displayTitle());
         LinearLayout heading = new LinearLayout(this);
         heading.setOrientation(LinearLayout.VERTICAL);
         heading.addView(title);
@@ -266,10 +273,10 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         }
     }
 
-    private void checkFirstFrame() {
-        if (active && prepared && playing && !firstFrame && !ended && !failed) {
-            status("尚未显示视频画面。可在上方「片源信息」查看分辨率和解码器。", false);
-        }
+    private String displayTitle() {
+        String title = getIntent().getStringExtra("title");
+        if (title != null) return title;
+        return "file".equals(uri.getScheme()) ? new File(uri.getPath()).getName() : "本地视频";
     }
     private int dp(int v) { return Math.round(getResources().getDisplayMetrics().density * v); }
     private TextView label(int size) {
@@ -286,7 +293,8 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
 
     private void readVrSettings() {
         String key = "vr." + bookmarkKey + ".";
-        VrFormat.Projection projection = VrFormat.Projection.EQUIRECT_180;
+        VrFormat.Projection projection = getIntent().getBooleanExtra(EXTRA_START_IN_VR, false)
+                ? VrFormat.initialProjection(displayTitle()) : VrFormat.Projection.EQUIRECT_180;
         VrFormat.Layout layout = VrFormat.Layout.SBS_FULL;
         try {
             projection = VrFormat.Projection.valueOf(bookmarks.getString(key + "projection", projection.name()));
@@ -346,19 +354,36 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         dialog.show();
     }
 
+    String playbackReport() {
+        String phase = failed ? "失败" : ended ? "已结束" : stalledPicture ? "等待新画面"
+                : !prepared ? "正在打开" : playing ? "播放中" : "已暂停";
+        String mode = inVr ? VrOptionsDialog.projectionName(vrFormat.projection) + " · "
+                + VrOptionsDialog.layoutName(vrFormat) + " · " + (vrFormat.headset ? "双眼" : "单屏") : "原始画面";
+        int glLimit = movie.maxTextureSize();
+        return "播放器  Media3 ExoPlayer · Android " + Build.VERSION.RELEASE + " · " + Build.MODEL
+                + "\n" + (session == null ? lastTrackReport : session.diagnostics())
+                + "\n解码偏好  " + (softwareDecoder ? "软件解码" : "自动选择")
+                + "\n输出  " + mode + (glLimit > 0 ? " · GL 纹理上限 " + glLimit : "")
+                + "\n显示尺寸  " + (width > 0 && height > 0 ? width + " × " + height : "尚无画面尺寸")
+                + "\n播放状态  " + phase + " · " + time(ended ? duration : position) + " / " + time(duration)
+                + "\n本次输入  " + inputNumber + " · GL 已提交新帧 " + Math.max(0, movie.presentedSamples() - framesAtOpen)
+                + "\n输出事件  " + outputEvent;
+    }
+
     private void showDetails() {
         if (!active || isFinishing()) return;
-        String dims = width > 0 && height > 0 ? width + " × " + height : "暂未识别";
-        String info = "分辨率  " + dims + "\n视频轨道  " + (videoMime == null ? "暂未识别" : videoMime)
-                + "\n播放器  Media3 ExoPlayer · Android 解码器"
-                + "\n解码偏好  " + (softwareDecoder ? "软件解码" : "自动选择")
-                + (session == null ? "" : "\n本次播放音频缓冲耗尽  " + session.audioUnderruns() + " 次");
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("片源信息").setMessage(info)
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("片源信息").setMessage(playbackReport())
                 .setPositiveButton("关闭", null)
+                .setNegativeButton("复制诊断", (d, w) -> {
+                    ClipboardManager clipboard = getSystemService(ClipboardManager.class);
+                    if (clipboard != null) clipboard.setPrimaryClip(ClipData.newPlainText("Nice 视频播放诊断", playbackReport()));
+                })
                 .setNeutralButton(softwareDecoder ? "恢复自动解码" : "尝试软件解码", (d, w) -> {
                     boolean resume = failed ? playBeforeFailure : wantsPlay;
                     softwareDecoder = !softwareDecoder;
-                    retireSession();
+                    frameWatch.newPlayback();
+                    outputEvent = softwareDecoder ? "手动切换到软件解码" : "手动恢复自动解码";
+                    retireSession(true);
                     failed = false;
                     ended = false;
                     wantsPlay = resume;
@@ -381,13 +406,28 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         retry.setVisibility(canRetry ? View.VISIBLE : View.GONE);
     }
     private void restart() {
-        retireSession(); failed = false; ended = false; wantsPlay = true; startIfReady();
+        frameWatch.newPlayback();
+        outputEvent = "手动重新打开";
+        retireSession(true); failed = false; ended = false; wantsPlay = true; startIfReady();
     }
     private void startIfReady() {
-        if (!active || releasingSession || session != null || surface == null || !surface.isValid()
-                || failed || isFinishing() || isDestroyed()) return;
+        if (!active || releasingSession || session != null || failed || isFinishing() || isDestroyed()) return;
+        if (needFreshOutput) {
+            needFreshOutput = false;
+            boolean replace = surface == null || surface == replaceAfterRelease;
+            replaceAfterRelease = null;
+            if (replace) {
+                surface = null;
+                movie.requestFreshDecoderSurface();
+                return;
+            }
+        }
+        if (surface == null || !surface.isValid()) return;
         if (wantsPlay && !acquireFocus()) wantsPlay = false;
-        prepared = false; playing = false; firstFrame = false; videoMime = null;
+        prepared = false; playing = false; firstFrame = false;
+        width = 0; height = 0; movie.setVideoSize(0, 0);
+        framesAtOpen = movie.presentedSamples(); inputNumber++;
+        lastTrackReport = "视频轨道  等待识别";
         resetPictureWatch();
         status("正在打开视频…", false);
         movie.expectNewDecoderFrame();
@@ -401,11 +441,12 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     }
     @Override public void onRenderError(String detail) { onError("无法初始化视频画面。\n" + detail); }
     @Override public void onFirstFrameDrawn() {
-        firstFrame = true; main.removeCallbacks(firstFrameCheck);
+        if (session == null) return;
+        firstFrame = true;
         if (!failed) status(null, false);
     }
     @Override public void onPrepared(long length, String mime) {
-        duration = length; videoMime = mime; prepared = true; bar.setEnabled(duration > 0);
+        duration = length; prepared = true; bar.setEnabled(duration > 0);
         total.setText(time(duration));
         if (firstFrame || !wantsPlay) status(null, false);
         refresh();
@@ -417,7 +458,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     }
 
     private void resetPictureWatch() {
-        observedSamples = -1;
+        frameWatch.interrupt();
         if (stalledPicture) {
             stalledPicture = false;
             if (!failed) status(null, false);
@@ -425,34 +466,39 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         }
     }
 
-    private void checkPictureMotion(long current, boolean moving) {
-        if (!moving || !firstFrame || !prepared || failed) {
+    private boolean checkPictureMotion(long current, boolean moving) {
+        if (!moving || !prepared || failed || dragging || session == null || !active
+                || (duration > 0 && duration - current < 900)) {
             resetPictureWatch();
-            return;
+            return false;
         }
-        long samples = movie.presentedSamples();
-        long now = SystemClock.elapsedRealtime();
-        if (samples != observedSamples || current < samplePosition) {
-            resetPictureWatch();
-            observedSamples = samples;
-            samplePosition = current;
-            sampleWallTime = now;
-        } else if (!stalledPicture && current - samplePosition >= 10000 && now - sampleWallTime >= 10000) {
+        VideoFrameWatch.Action action = frameWatch.sample(current, SystemClock.elapsedRealtime(),
+                movie.presentedSamples(), firstFrame, session.frameRate());
+        if (action == VideoFrameWatch.Action.RECONNECT) {
+            outputEvent = "播放时钟前进但没有新画面，在 " + time(current) + " 自动重连一次";
+            retireSession(true);
+            status("正在从 " + time(current) + " 重连视频输出…", false);
+            startIfReady();
+            return true;
+        }
+        if (action == VideoFrameWatch.Action.REPORT) {
             stalledPicture = true;
-            String action = softwareDecoder ? "恢复自动解码" : "尝试软件解码";
-            status("播放进度仍在走，但已超过 10 秒没有新画面。可在「片源信息」" + action + "。", false);
+            status("已重连一次，播放时钟仍前进但画面没有更新。请在「片源信息」查看解码能力或切换解码方式。", false);
             showControls(true);
+        } else if (stalledPicture && !frameWatch.reported()) {
+            stalledPicture = false;
+            status(null, false);
+            armControls();
         }
+        return false;
     }
+
     @Override public void onProgress(long current, boolean motion) {
         boolean changed = playing != motion; playing = motion; position = current;
-        checkPictureMotion(current, motion);
+        if (checkPictureMotion(current, motion)) return;
         if (!dragging && discreteTarget < 0) showTimeline(current);
         if (playing && SystemClock.elapsedRealtime() - lastSave >= 5000) saveBookmark();
-        if (changed) {
-            refresh(); main.removeCallbacks(firstFrameCheck);
-            if (playing && !firstFrame) main.postDelayed(firstFrameCheck, 8000);
-        }
+        if (changed) refresh();
     }
     @Override public void onEnded() {
         ended = true; playing = false; wantsPlay = false; position = 0;
@@ -513,16 +559,31 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         cancelDiscreteSeek();
         if (!prepared || session == null || duration <= 0) return;
         resetPictureWatch();
-        ended = false; position = Math.min(duration, Math.max(0, target));
-        showTimeline(position); session.seek(position); armControls();
+        position = Math.min(duration, Math.max(0, target));
+        showTimeline(position);
+        if (ended) {
+            ended = false;
+            frameWatch.newPlayback();
+            outputEvent = "片尾定位后重建视频输出";
+            retireSession(true);
+            startIfReady();
+        } else session.seek(position);
+        armControls();
     }
     private void requestPlay() {
         if (failed) { restart(); return; }
         if (!acquireFocus()) { status("其他应用正在使用音频，请稍后再点播放。", false); return; }
-        if (ended) position = 0;
+        if (ended) {
+            position = 0;
+            frameWatch.newPlayback();
+            outputEvent = "重播时重建视频输出";
+            retireSession(true);
+            showTimeline(0);
+        }
         ended = false; wantsPlay = true; resumeOnGain = false;
         if (firstFrame) status(null, false);
         if (session != null) session.setPlaying(true);
+        else startIfReady();
         refresh();
     }
     private void pause() {
@@ -550,11 +611,15 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
             if (session != null) session.setPlaying(false); showControls(true); refresh();
         }
     }
-    private void retireSession() {
+    private void retireSession() { retireSession(false); }
+
+    private void retireSession(boolean freshOutput) {
+        if (freshOutput) { needFreshOutput = true; replaceAfterRelease = surface; }
         cancelDiscreteSeek();
         endScrub(false);
         if (session != null) {
             MovieSession old = session;
+            lastTrackReport = old.diagnostics();
             session = null;
             releasingSession = true;
             old.close(() -> {
@@ -564,7 +629,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         }
         prepared = false; playing = false;
         resetPictureWatch();
-        bar.setEnabled(false); main.removeCallbacks(firstFrameCheck); main.removeCallbacks(hide);
+        bar.setEnabled(false); main.removeCallbacks(hide);
     }
     private void saveBookmark() {
         lastSave = SystemClock.elapsedRealtime();
@@ -589,7 +654,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     }
     @Override protected void onSaveInstanceState(Bundle out) {
         super.onSaveInstanceState(out); out.putLong("position", position); out.putBoolean("wantsPlay", wantsPlay);
-        out.putBoolean("softwareDecoder", softwareDecoder); out.putBoolean("fullscreen", userFullscreen);
+        out.putBoolean("inVr", inVr); out.putBoolean("softwareDecoder", softwareDecoder); out.putBoolean("fullscreen", userFullscreen);
     }
     static String time(long ms) {
         long s = Math.max(0, ms) / 1000;

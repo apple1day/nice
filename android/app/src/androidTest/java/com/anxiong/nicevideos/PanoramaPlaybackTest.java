@@ -308,6 +308,60 @@ public final class PanoramaPlaybackTest {
         } finally { file.delete(); }
     }
 
+    @Test public void stereo360ShowsMovingEyesAgainAfterNaturalEnd() throws Exception {
+        verifyVrReplay("replay-hd");
+    }
+
+    @Test public void eightKStereo360ReplaysMovingEyesOnCapableDecoder() throws Exception {
+        MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, 8192, 2048);
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, 24);
+        Assume.assumeTrue("Device has no advertised 8192×2048 HEVC decoder at 24 fps",
+                new MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(format) != null);
+        verifyVrReplay("replay-8k");
+    }
+
+    @Test public void eightKReportIdentifiesSourceEvenWhenDecoderCannotPlayIt() throws Exception {
+        File file = fixture("replay-8k");
+        try (ActivityScenario<PlayerActivity> player = open(file)) {
+            AtomicReference<String> report = new AtomicReference<>("");
+            await("Missing 8K source details", () -> {
+                player.onActivity(a -> report.set(a.playbackReport()));
+                return report.get().contains("8192 × 2048") && report.get().contains("video/hevc");
+            });
+            assertFalse("Diagnostic output included the private filename", report.get().contains(file.getName()));
+        } finally { file.delete(); }
+    }
+
+    private void verifyVrReplay(String asset) throws Exception {
+        File file = fixture(asset);
+        Uri uri = Uri.fromFile(file);
+        String key = "vr." + java.util.UUID.nameUUIDFromBytes(uri.toString().getBytes(
+                java.nio.charset.StandardCharsets.UTF_8)) + ".";
+        android.content.SharedPreferences preferences = app.getSharedPreferences("video_positions", Context.MODE_PRIVATE);
+        preferences.edit().putString(key + "projection", "EQUIRECT_360")
+                .putBoolean(key + "headset", true).commit();
+        Intent intent = new Intent(app, PlayerActivity.class).setData(uri)
+                .putExtra(PlayerActivity.EXTRA_START_IN_VR, true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try (ActivityScenario<PlayerActivity> player = ActivityScenario.launch(intent)) {
+            MovieSurface movie = surface(player);
+            try (Screen screen = new Screen(movie)) {
+                screen.stereoColorCycle("first pass");
+                await("The eight-second clip did not reach natural end", () -> {
+                    AtomicReference<String> label = new AtomicReference<>();
+                    player.onActivity(a -> label.set(((TextView) control(a, "播放或暂停")).getText().toString()));
+                    return "重播".equals(label.get());
+                });
+                long firstPassSamples = movie.presentedSamples();
+                press(player, "播放或暂停");
+                screen.stereoColorCycle("replay");
+                assertTrue("Replay did not consume fresh decoded samples", movie.presentedSamples() > firstPassSamples);
+            }
+        } finally {
+            preferences.edit().remove(key + "projection").remove(key + "headset").apply();
+            file.delete();
+        }
+    }
+
     @Test public void switchingAvcDecoderKeepsThePlayheadOrAllowsRecovery() throws Exception {
         exerciseSoftwareSwitch("sbs", softwareDecoders(MimeTypes.VIDEO_H264, 384, 192, 8));
     }
@@ -584,6 +638,17 @@ public final class PanoramaPlaybackTest {
         final Bitmap bitmap = Bitmap.createBitmap(192, 96, Bitmap.Config.ARGB_8888);
         final Handler main = new Handler(Looper.getMainLooper());
         Screen(MovieSurface movie) { this.movie = movie; }
+
+        void stereoColorCycle(String pass) throws Exception {
+            boolean[] seen = new boolean[2];
+            until(pass + " must display changing, correctly ordered left and right eyes", (c, l, r) -> {
+                if (Color.red(l) > 160 && Color.green(l) < 80 && Color.blue(r) > 160 && Color.red(r) < 80)
+                    seen[0] = true;
+                if (Color.green(l) > 160 && Color.red(l) < 80 && Color.red(r) > 160 && Color.green(r) > 160)
+                    seen[1] = true;
+                return seen[0] && seen[1];
+            });
+        }
 
         void frontMotion() throws Exception {
             boolean[] seen = new boolean[2];

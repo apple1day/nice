@@ -39,6 +39,14 @@ adb exec-out "run-as $package cat shared_prefs/video_library.xml" | cmp "$work/o
 adb exec-out "run-as $package cat shared_prefs/video_positions.xml" | cmp "$work/original-positions.xml" -
 echo "Verified the shared export, repeat export, occupied filename, and unchanged old catalog and bookmarks."
 adb shell -T "rm '$shared/Upgrade test.mp4' '$shared/Upgrade test (1).mp4'"
+echo "Checking that the VR player installs alongside the original app"
+vr_package="$package.vrplayer"
+adb install -r NiceVideos-VR.apk
+adb shell am start -W -n "$vr_package/com.anxiong.nicevideos.MainActivity"
+adb shell pm path "$vr_package" | grep -q 'package:'
+adb shell pm path "$package" | grep -q 'package:'
+adb exec-out "run-as $package cat shared_prefs/video_library.xml" | cmp "$work/original-library.xml" -
+adb shell am force-stop "$vr_package"
 echo "Verifying the backup and restore of DownloadManager job $job"
 python3 tools/legacy_download_backup.py backup "$work/backup"
 cmp "$fixture" "$work/backup/Movies/$disk"

@@ -2,6 +2,7 @@ package com.anxiong.nicevideos;
 
 import android.content.Context;
 import android.graphics.SurfaceTexture;
+import android.opengl.EGL14;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
@@ -45,6 +46,7 @@ public final class MovieSurface extends GLSurfaceView {
     private volatile boolean active = true;
     private volatile long decoderGeneration;
     private volatile long presentedSamples;
+    private volatile int maxTextureSize;
     private static final int VR_LONG_EDGE = 1920;
     private boolean limitedVrResolution;
     private int fixedWidth, fixedHeight;
@@ -56,7 +58,25 @@ public final class MovieSurface extends GLSurfaceView {
     // 16 ms allows normal 60 Hz vsync jitter. Decoder and layout changes bypass this limit.
     private static final long POSE_INTERVAL_NS = 16_000_000L;
 
+    // Successful GL submissions of distinct decoder timestamps, not screen refreshes.
     long presentedSamples() { return presentedSamples; }
+    int maxTextureSize() { return maxTextureSize; }
+
+    /**
+     * The old decoder must have been released. A new buffer queue separates replay or
+     * stalled-output recovery from callbacks and images belonging to the retired producer.
+     * The listener receives the replacement Surface through the usual onSurfaceReady path.
+     */
+    void requestFreshDecoderSurface() {
+        Surface old = renderer.decoderSurface;
+        if (!active) return;
+        queueEvent(() -> {
+            // A failed producer allocation can leave a live context but no Surface. Permit retry in
+            // that case; before initialization or after EGL loss, onSurfaceCreated does the work.
+            if (active && old == renderer.decoderSurface && renderer.program != 0
+                    && !EGL14.EGL_NO_CONTEXT.equals(EGL14.eglGetCurrentContext())) renderer.replaceProducer();
+        });
+    }
 
     public MovieSurface(Context context, Listener listener) {
         super(context);
@@ -204,7 +224,7 @@ public final class MovieSurface extends GLSurfaceView {
     }
 
     private final class VideoRenderer implements Renderer {
-        private final AtomicLong pendingGeneration = new AtomicLong(-1);
+        private AtomicLong pendingGeneration = new AtomicLong(-1);
         private final FloatBuffer quad = ByteBuffer.allocateDirect(8 * Float.BYTES)
                 .order(ByteOrder.nativeOrder()).asFloatBuffer();
         private final float[] transform = new float[16];
@@ -215,6 +235,8 @@ public final class MovieSurface extends GLSurfaceView {
         private int position, texMatrix, poseMatrix, projectionId, fit, lens, rayExtent, fisheyeDisc, eyeRect, inset;
         private long imageGeneration = -1, announcedGeneration = -1;
         private long imageTimestamp, presentedTimestamp;
+        private volatile long producerEpoch;
+        private long reportedErrorGeneration = -1;
 
         VideoRenderer() {
             quad.put(new float[] {-1, -1, 1, -1, -1, 1, 1, 1}).position(0);
@@ -222,8 +244,13 @@ public final class MovieSurface extends GLSurfaceView {
 
         @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
             releaseProducer();
-            imageGeneration = announcedGeneration = -1;
+            // This is a new context. Names in the discarded context were already reclaimed.
+            textureName = program = 0;
+            reportedErrorGeneration = -1;
             try {
+                int[] limit = new int[1];
+                GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, limit, 0);
+                maxTextureSize = limit[0];
                 program = createProgram(readFragmentShader());
                 position = GLES20.glGetAttribLocation(program, "pos");
                 texMatrix = GLES20.glGetUniformLocation(program, "textureTransform");
@@ -236,28 +263,51 @@ public final class MovieSurface extends GLSurfaceView {
                 eyeRect = GLES20.glGetUniformLocation(program, "eyeRect");
                 inset = GLES20.glGetUniformLocation(program, "texelInset");
 
-                int[] textures = new int[1];
-                GLES20.glGenTextures(1, textures, 0);
-                textureName = textures[0];
-                int target = GLES11Ext.GL_TEXTURE_EXTERNAL_OES;
-                GLES20.glBindTexture(target, textureName);
-                GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
-                GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
-                GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
-                GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
-                SurfaceTexture image = new SurfaceTexture(textureName);
-                decoderTexture = image;
-                image.setOnFrameAvailableListener(frame -> {
-                    if (active && decoderTexture == frame) {
-                        pendingGeneration.set(decoderGeneration);
-                        queueDraw(true);
-                    }
-                }, main);
-                Surface surface = new Surface(image);
-                decoderSurface = surface;
-                main.post(() -> {
-                    if (active && decoderSurface == surface) listener.onSurfaceReady(surface);
-                });
+                createProducer();
+            } catch (RuntimeException e) {
+                releaseProducer();
+                reportError(e);
+            }
+        }
+
+        private void createProducer() {
+            imageGeneration = announcedGeneration = reportedErrorGeneration = -1;
+            int[] textures = new int[1];
+            GLES20.glGenTextures(1, textures, 0);
+            textureName = textures[0];
+            int target = GLES11Ext.GL_TEXTURE_EXTERNAL_OES;
+            GLES20.glBindTexture(target, textureName);
+            GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+            GLES20.glTexParameteri(target, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+            checkGl();
+            SurfaceTexture image = new SurfaceTexture(textureName);
+            decoderTexture = image;
+            AtomicLong pending = new AtomicLong(-1);
+            pendingGeneration = pending;
+            image.setOnFrameAvailableListener(frame -> {
+                if (active && decoderTexture == frame) {
+                    // A callback racing with release can write only to its own producer's slot.
+                    pending.set(decoderGeneration);
+                    queueDraw(true);
+                }
+            }, main);
+            Surface surface = new Surface(image);
+            decoderSurface = surface;
+            main.post(() -> {
+                if (active && decoderSurface == surface) listener.onSurfaceReady(surface);
+            });
+        }
+
+        /** Runs on the GL thread while the existing EGL context is current. */
+        void replaceProducer() {
+            releaseProducer();
+            if (textureName != 0) GLES20.glDeleteTextures(1, new int[]{textureName}, 0);
+            textureName = 0;
+            try {
+                createProducer();
+                queueDraw(true);
             } catch (RuntimeException e) {
                 releaseProducer();
                 reportError(e);
@@ -265,6 +315,7 @@ public final class MovieSurface extends GLSurfaceView {
         }
 
         void releaseProducer() {
+            producerEpoch++;
             Surface surface = decoderSurface;
             SurfaceTexture image = decoderTexture;
             decoderSurface = null;
@@ -322,8 +373,16 @@ public final class MovieSurface extends GLSurfaceView {
                 drawEye(0, split, selected, false, width, height);
                 drawEye(split, viewWidth - split, selected, true, width, height);
             }
-            // Camera and HUD redraws reuse the same decoder sample.
+            if (!active || generation != decoderGeneration || decoderTexture != image) return;
+            // A draw accepted by GL is not proof the panel presented it. Pose-only redraws
+            // reuse the cached decoder image, so they cannot keep the picture watchdog alive.
             if (announcedGeneration != generation || imageTimestamp != presentedTimestamp) {
+                try {
+                    checkGl();
+                } catch (RuntimeException e) {
+                    reportError(e);
+                    return;
+                }
                 presentedTimestamp = imageTimestamp;
                 presentedSamples++;
             }
@@ -370,9 +429,20 @@ public final class MovieSurface extends GLSurfaceView {
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         }
 
+        private void checkGl() {
+            int error = GLES20.glGetError();
+            if (error != GLES20.GL_NO_ERROR)
+                throw new IllegalStateException("OpenGL ES 0x" + Integer.toHexString(error));
+        }
+
         private void reportError(RuntimeException error) {
+            long generation = decoderGeneration;
+            if (reportedErrorGeneration == generation) return;
+            reportedErrorGeneration = generation;
+            long epoch = producerEpoch;
             main.post(() -> {
-                if (active) listener.onRenderError("无法绘制视频画面：" + error.getMessage());
+                if (active && producerEpoch == epoch && decoderGeneration == generation)
+                    listener.onRenderError("无法绘制视频画面：" + error.getMessage());
             });
         }
     }

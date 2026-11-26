@@ -12,6 +12,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
+import android.os.CancellationSignal;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -29,7 +30,15 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
-    private static final int PICK = 30, WRITE_DOWNLOADS = 31, EXPORT_FOLDER = 32;
+    private static final int PICK = 30, WRITE_DOWNLOADS = 31, EXPORT_FOLDER = 32, PICK_VR_FOLDER = 33, PICK_VR_FILE = 34;
+    private enum Tab { LOCAL, VR, SERVER }
+    private Tab tab = Tab.LOCAL;
+    private VrFolderLibrary vrFolders;
+    private Uri vrRoot;
+    private final ArrayList<String> vrIds = new ArrayList<>(), vrNames = new ArrayList<>();
+    private List<VrFolderLibrary.Item> vrItems = new ArrayList<>();
+    private CancellationSignal vrRead;
+    private String vrStatus = "";
     private static final String MIGRATION_REQUESTED = "migrateLegacyDownloads";
     private MovieExportTask exports;
     private String pendingExportId; // Empty string selects all completed downloads.
@@ -55,7 +64,7 @@ public final class MainActivity extends Activity {
     private LinearLayout panel;
     private TextView feedback;
     private String serverError = "";
-    private boolean server, loading, checking, resumed;
+    private boolean loading, checking, resumed;
     private int filter, fetchGeneration, pickGeneration;
 
     @Override public void onCreate(Bundle state) {
@@ -73,7 +82,17 @@ public final class MainActivity extends Activity {
         exports = (MovieExportTask) getLastNonConfigurationInstance();
         if (exports == null) exports = new MovieExportTask(library);
         if (state != null) pendingExportId = state.getString("exportId");
-        if (state != null) { server = state.getBoolean("server"); filter = state.getInt("filter"); }
+        vrFolders = new VrFolderLibrary(this);
+        if (getResources().getBoolean(R.bool.start_in_vr_library)) tab = Tab.VR;
+        if (state != null) {
+            tab = Tab.valueOf(state.getString("tab", state.getBoolean("server") ? "SERVER" : "LOCAL"));
+            filter = state.getInt("filter");
+            String root = state.getString("vrRoot");
+            if (root != null) {
+                vrRoot = Uri.parse(root);
+                vrIds.addAll(state.getStringArrayList("vrIds")); vrNames.addAll(state.getStringArrayList("vrNames"));
+            }
+        }
         if (state != null && state.containsKey("downloadUrl")) {
             requestedDownload = new ServerVideos.Movie(state.getString("downloadName"),
                     state.getLong("downloadBytes"), state.getString("downloadUrl"));
@@ -83,13 +102,17 @@ public final class MainActivity extends Activity {
         getWindow().setNavigationBarColor(BG);
         build();
         exports.listen(() -> { updatePanel(); refreshRows(); });
-        if (server && !address().isEmpty()) fetch();
+        if (tab == Tab.SERVER && !address().isEmpty()) fetch();
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
         state.putString("exportId", pendingExportId);
-        state.putBoolean("server", server); state.putInt("filter", filter);
+        state.putString("tab", tab.name()); state.putInt("filter", filter);
+        if (vrRoot != null) {
+            state.putString("vrRoot", vrRoot.toString()); state.putStringArrayList("vrIds", new ArrayList<>(vrIds));
+            state.putStringArrayList("vrNames", new ArrayList<>(vrNames));
+        }
         if (requestedDownload != null) {
             state.putString("downloadName", requestedDownload.name);
             state.putString("downloadUrl", requestedDownload.url);
@@ -136,8 +159,9 @@ public final class MainActivity extends Activity {
         LinearLayout header = row();
         root.addView(header, -1, dp(56));
         header.addView(text("Nice 视频", 25, INK, true), fillWidth(-1));
-        header.addView(pill("本地", !server, () -> tab(false))); gap(header);
-        header.addView(pill("服务器", server, () -> tab(true)));
+        header.addView(pill("本地", tab == Tab.LOCAL, () -> select(Tab.LOCAL))); gap(header);
+        header.addView(pill("VR", tab == Tab.VR, () -> select(Tab.VR))); gap(header);
+        header.addView(pill("服务器", tab == Tab.SERVER, () -> select(Tab.SERVER)));
         panel = column(); panel.setPadding(0, dp(8), 0, dp(8)); root.addView(panel);
         feedback = text("", 14, MUTED, false);
         feedback.setPadding(dp(2), dp(9), dp(2), dp(9)); root.addView(feedback);
@@ -148,18 +172,35 @@ public final class MainActivity extends Activity {
         updatePanel(); refreshRows();
     }
 
-    private void tab(boolean next) {
-        if (next == server) return;
-        server = next; build();
-        if (server && remote.isEmpty() && !loading && !address().isEmpty()) fetch();
+    private void select(Tab next) {
+        if (next == tab) return;
+        if (vrRead != null) { vrRead.cancel(); vrRead = null; }
+        tab = next; build();
+        if (tab == Tab.VR) loadVrFolder();
+        if (tab == Tab.SERVER && remote.isEmpty() && !loading && !address().isEmpty()) fetch();
     }
 
     private void updatePanel() {
         exportAll = null;
         panel.removeAllViews();
         LinearLayout heading = row(); panel.addView(heading, -1, dp(50));
-        heading.addView(text(server ? "服务器影片" : "本地影片", 21, INK, true), fillWidth(-1));
-        if (server) {
+        if (tab == Tab.VR) {
+            heading.addView(text("VR 片库", 21, INK, true), fillWidth(-1));
+            heading.addView(pill("添加文件夹", false, this::pickVrFolder)); gap(heading);
+            heading.addView(pill("打开影片", true, () -> pick(PICK_VR_FILE)));
+            if (vrRoot != null) {
+                LinearLayout navigation = row();
+                panel.addView(navigation, -1, dp(48));
+                navigation.addView(pill("上一级", false, this::upVrFolder)); gap(navigation);
+                TextView path = text(TextUtils.join(" / ", vrNames), 14, MUTED, false);
+                path.setSingleLine(); path.setEllipsize(TextUtils.TruncateAt.START);
+                navigation.addView(path, fillWidth(-1)); gap(navigation);
+                navigation.addView(pill("刷新", false, this::loadVrFolder));
+            }
+            return;
+        }
+        heading.addView(text(tab == Tab.SERVER ? "服务器影片" : "本地影片", 21, INK, true), fillWidth(-1));
+        if (tab == Tab.SERVER) {
             if (!address().isEmpty()) { heading.addView(pill("刷新", false, this::fetch)); gap(heading); }
             heading.addView(pill("设置地址", true, this::editServer));
             if (!address().isEmpty()) {
@@ -169,7 +210,7 @@ public final class MainActivity extends Activity {
         } else {
             exportAll = pill("导出全部", false, () -> pickExportFolder(""));
             heading.addView(exportAll); gap(heading);
-            heading.addView(pill("打开文件", true, this::pick));
+            heading.addView(pill("打开文件", true, () -> pick(PICK)));
             LinearLayout chips = row(); chips.setPadding(0, dp(7), 0, 0); panel.addView(chips);
             String[] names = {"全部", "收藏", "已下载"};
             for (int i = 0; i < names.length; i++) {
@@ -192,11 +233,16 @@ public final class MainActivity extends Activity {
         for (VideoLibrary.Entry e : library.all()) {
             if (e.downloaded()) sources.put(e.source, e);
             hasExport |= MovieExporter.eligible(e) && !missing.contains(e.id);
-            if (!server && (filter == 0 || (filter == 1 && e.favorite) || (filter == 2 && e.downloaded()))) rows.add(e);
+            if (tab == Tab.LOCAL && (filter == 0 || (filter == 1 && e.favorite) || (filter == 2 && e.downloaded()))) rows.add(e);
         }
-        if (server) rows.addAll(remote);
+        if (tab == Tab.SERVER) rows.addAll(remote);
         String message = "";
-        if (server) {
+        if (tab == Tab.VR) {
+            rows.addAll(vrRoot == null ? vrFolders.roots() : vrItems);
+            message = vrStatus;
+            if (rows.isEmpty() && message.isEmpty())
+                message = vrRoot == null ? "添加保存 VR 影片的文件夹，或直接打开一部影片。" : "此目录没有视频或子文件夹。";
+        } else if (tab == Tab.SERVER) {
             if (address().isEmpty()) message = "输入运行 Nice 视频服务的地址，即可下载影片到本机。";
             else if (loading) message = "正在获取影片…";
             else if (!serverError.isEmpty()) message = serverError;
@@ -210,17 +256,79 @@ public final class MainActivity extends Activity {
             exportAll.setEnabled(enabled);
             exportAll.setAlpha(enabled ? 1f : .5f);
         }
-        if (!server && !migrationStatus.isEmpty()) message = migrationStatus;
-        if (!server && !exports.status().isEmpty() && !migrating) message = exports.status();
+        if (tab == Tab.LOCAL && !migrationStatus.isEmpty()) message = migrationStatus;
+        if (tab == Tab.LOCAL && !exports.status().isEmpty() && !migrating) message = exports.status();
         feedback.setText(message); feedback.setVisibility(message.isEmpty() ? View.GONE : View.VISIBLE);
         adapter.notifyDataSetChanged();
     }
 
-    private void pick() {
+    private void pickVrFolder() {
+        Intent choose = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try { startActivityForResult(choose, PICK_VR_FOLDER); }
+        catch (ActivityNotFoundException ex) { toast("系统文件夹选择器不可用。"); }
+    }
+
+    private void enterVrFolder(VrFolderLibrary.Item folder) {
+        if (vrRoot == null) {
+            vrRoot = folder.uri;
+            vrIds.add(DocumentsContract.getTreeDocumentId(vrRoot));
+        } else {
+            String child = DocumentsContract.getDocumentId(folder.uri);
+            if (vrIds.contains(child)) return;
+            vrIds.add(child);
+        }
+        vrNames.add(folder.name);
+        updatePanel(); loadVrFolder();
+    }
+
+    private void resetVrPath() {
+        vrRoot = null; vrIds.clear(); vrNames.clear();
+    }
+
+    private void upVrFolder() {
+        if (vrIds.size() <= 1) resetVrPath();
+        else { vrIds.remove(vrIds.size() - 1); vrNames.remove(vrNames.size() - 1); }
+        updatePanel(); loadVrFolder();
+    }
+
+    @Override public void onBackPressed() {
+        if (tab == Tab.VR && vrRoot != null) upVrFolder();
+        else super.onBackPressed();
+    }
+
+    private void loadVrFolder() {
+        if (vrRead != null) vrRead.cancel();
+        vrRead = null;
+        vrItems = new ArrayList<>(); vrStatus = vrRoot == null ? "" : "正在读取文件夹…";
+        refreshRows();
+        if (vrRoot == null) return;
+        final Uri tree = vrRoot;
+        final String parent = vrIds.get(vrIds.size() - 1);
+        final CancellationSignal read = new CancellationSignal();
+        vrRead = read;
+        documents.execute(() -> {
+            List<VrFolderLibrary.Item> items = Collections.emptyList();
+            String problem = "";
+            try { items = vrFolders.children(tree, parent, read); }
+            catch (SecurityException ex) { problem = "文件夹授权已失效，请点「添加文件夹」重新选择。"; }
+            catch (IllegalArgumentException ex) { problem = "文件夹已移动或不可用，请返回上一级或重新选择。"; }
+            catch (IOException | RuntimeException ex) { problem = error(ex); }
+            List<VrFolderLibrary.Item> result = items;
+            String message = problem;
+            main.post(() -> {
+                if (!live() || read != vrRead || tab != Tab.VR) return;
+                vrRead = null; vrItems = result; vrStatus = message;
+                refreshRows();
+            });
+        });
+    }
+
+    private void pick(int request) {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
                 .setType("*/*").putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"video/*", "application/octet-stream", "application/x-matroska"})
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-        try { startActivityForResult(intent, PICK); }
+        try { startActivityForResult(intent, request); }
         catch (ActivityNotFoundException ex) { toast("系统文件选择器不可用。"); }
     }
 
@@ -255,7 +363,22 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int code, int result, Intent data) {
         super.onActivityResult(code, result, data);
         if (code == EXPORT_FOLDER) { acceptExportFolder(result, data); return; }
-        if (code != PICK || result != RESULT_OK || data == null || data.getData() == null) return;
+        if (code == PICK_VR_FOLDER) {
+            if (result != RESULT_OK || data == null || data.getData() == null) return;
+            Uri tree = data.getData();
+            documents.execute(() -> {
+                try {
+                    VrFolderLibrary.Item root = vrFolders.add(tree);
+                    main.post(() -> {
+                        if (live() && tab == Tab.VR) { resetVrPath(); enterVrFolder(root); }
+                    });
+                } catch (IOException | RuntimeException ex) {
+                    main.post(() -> { if (live()) { toast("无法保存文件夹授权：" + error(ex)); refreshRows(); } });
+                }
+            });
+            return;
+        }
+        if ((code != PICK && code != PICK_VR_FILE) || result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         if (!"content".equals(uri.getScheme())) { toast("请选择系统文件提供方中的视频。"); return; }
         boolean durable;
@@ -287,17 +410,24 @@ public final class MainActivity extends Activity {
                     toast("请选择影片文件，播放列表需要单独的媒体分片。"); return;
                 }
                 if (remember) library.remember(uri, title, size);
-                refreshRows(); play(uri, title);
+                refreshRows(); play(uri, title, code == PICK_VR_FILE);
             });
         });
     }
 
-    private void play(Uri uri, String title) {
+    private void play(Uri uri, String title, boolean startInVr) {
         startActivity(new Intent(this, PlayerActivity.class).setData(uri).putExtra("title", title)
+                .putExtra(PlayerActivity.EXTRA_START_IN_VR, startInVr)
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION));
     }
 
     private void activate(Object item) {
+        if (item instanceof VrFolderLibrary.Item) {
+            VrFolderLibrary.Item entry = (VrFolderLibrary.Item)item;
+            if (entry.folder) enterVrFolder(entry);
+            else play(entry.uri, entry.name, true);
+            return;
+        }
         if (item instanceof ServerVideos.Movie) {
             ServerVideos.Movie m = (ServerVideos.Movie) item;
             VideoLibrary.Entry existing = sources.get(m.url);
@@ -315,7 +445,7 @@ public final class MainActivity extends Activity {
                 return;
             }
             VideoLibrary.Entry current = library.touch(e.id);
-            if (current != null) play(library.uri(current), current.name);
+            if (current != null) play(library.uri(current), current.name, false);
         } else if (VideoLibrary.FAILED.equals(e.state)) download(new ServerVideos.Movie(e.name, e.bytes, e.source), e);
         else confirmRemove(e);
     }
@@ -337,6 +467,13 @@ public final class MainActivity extends Activity {
 
     private void actions(View anchor, VideoLibrary.Entry e) {
         PopupMenu menu = new PopupMenu(this, anchor);
+        if (VideoLibrary.READY.equals(e.state) && !missing.contains(e.id)) {
+            menu.getMenu().add("以 VR 模式播放").setOnMenuItemClickListener(item -> {
+                VideoLibrary.Entry current = library.touch(e.id);
+                if (current != null) play(library.uri(current), current.name, true);
+                return true;
+            });
+        }
         menu.getMenu().add(e.favorite ? "取消收藏" : "加入收藏").setOnMenuItemClickListener(item -> {
             library.toggleFavorite(e.id);
             refreshRows();
@@ -500,12 +637,16 @@ public final class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume(); resumed = true;
-        if (library != null) { updatePanel(); refreshRows(); poll(); checkPublicFiles(); startMigration(); }
+        if (library != null) {
+            updatePanel(); refreshRows(); poll(); checkPublicFiles(); startMigration();
+            if (tab == Tab.VR) loadVrFolder();
+        }
     }
     @Override protected void onPause() { resumed = false; main.removeCallbacks(pollLater); super.onPause(); }
     @Override public Object onRetainNonConfigurationInstance() { return exports; }
 
     @Override protected void onDestroy() {
+        if (vrRead != null) vrRead.cancel();
         if (exports != null) {
             exports.listen(null);
             if (!isChangingConfigurations()) exports.close();
@@ -591,7 +732,24 @@ public final class MainActivity extends Activity {
             } else cell = (LinearLayout) recycled;
             TextView[] fields = (TextView[])cell.getTag();
             Object item = rows.get(position);
-            if (item instanceof VideoLibrary.Entry) {
+            if (item instanceof VrFolderLibrary.Item) {
+                VrFolderLibrary.Item e = (VrFolderLibrary.Item)item;
+                boolean root = vrRoot == null;
+                fields[0].setText(e.name);
+                fields[1].setText(e.folder ? "文件夹" : size(e.bytes));
+                fields[2].setText(root ? "⋮" : e.folder ? "打开" : "VR 播放");
+                fields[2].setTextSize(root ? 23 : 14);
+                fields[2].setContentDescription(e.name + (root ? "，文件夹操作" : e.folder ? "，打开" : "，VR 播放"));
+                fields[2].setOnClickListener(v -> {
+                    if (!root) { activate(e); return; }
+                    PopupMenu menu = new PopupMenu(MainActivity.this, v);
+                    menu.getMenu().add("打开文件夹").setOnMenuItemClickListener(m -> { enterVrFolder(e); return true; });
+                    menu.getMenu().add("从 VR 片库移除").setOnMenuItemClickListener(m -> {
+                        vrFolders.forget(e.uri); refreshRows(); return true;
+                    });
+                    menu.show();
+                });
+            } else if (item instanceof VideoLibrary.Entry) {
                 VideoLibrary.Entry e = (VideoLibrary.Entry)item;
                 fields[0].setText(e.name); fields[1].setText(description(e));
                 fields[2].setText("⋮"); fields[2].setTextSize(23); fields[2].setContentDescription(e.name + "，更多操作");

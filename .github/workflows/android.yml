@@ -5,11 +5,13 @@ on:
     paths:
       - 'android/**'
       - '!android/NiceVideos.apk'
+      - '!android/NiceVideos-VR.apk'
       - '.github/workflows/android.yml'
   pull_request:
     paths:
       - 'android/**'
       - '!android/NiceVideos.apk'
+      - '!android/NiceVideos-VR.apk'
       - '.github/workflows/android.yml'
   workflow_dispatch:
 
@@ -35,20 +37,25 @@ jobs:
           fi
       - name: Assemble app and tests
         working-directory: android
-        run: ./gradlew --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest
+        run: ./gradlew --stacktrace :app:assembleDebug :app:assembleVrPreview :app:assembleDebugAndroidTest :app:testDebugUnitTest
       - name: Verify the installable APK
         id: verify_apk
         working-directory: android
         run: |
           set -euo pipefail
           cp app/build/outputs/apk/debug/app-debug.apk NiceVideos.apk
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs NiceVideos.apk
-          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging NiceVideos.apk | sed -n '1,15p'
-          sha256sum NiceVideos.apk
+          cp app/build/outputs/apk/vrPreview/app-vrPreview.apk NiceVideos-VR.apk
+          for apk in NiceVideos.apk NiceVideos-VR.apk; do
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk"
+            "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$apk" | sed -n '1,15p'
+            sha256sum "$apk"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: NiceVideos-Android
-          path: android/NiceVideos.apk
+          path: |
+            android/NiceVideos.apk
+            android/NiceVideos-VR.apk
       - name: Enable KVM for Android Emulator
         run: sudo chmod 666 /dev/kvm
       - name: Test installed APK on Android
@@ -76,6 +83,7 @@ jobs:
         working-directory: android
         run: |
           cmp NiceVideos.apk app/build/outputs/apk/debug/app-debug.apk
+          cmp NiceVideos-VR.apk app/build/outputs/apk/vrPreview/app-vrPreview.apk
           python3 - <<'PY'
           from pathlib import Path
           import xml.etree.ElementTree as ET
@@ -110,9 +118,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY' | gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq '.sha'
-          import base64, json, pathlib
-          data = pathlib.Path("NiceVideos.apk").read_bytes()
+          set -euo pipefail
+          for apk in NiceVideos.apk NiceVideos-VR.apk; do
+            echo "Registering $apk"
+            python3 - "$apk" <<'PY' | gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq '.sha'
+          import base64, json, pathlib, sys
+          data = pathlib.Path(sys.argv[1]).read_bytes()
           print(json.dumps({"content": base64.b64encode(data).decode("ascii"), "encoding": "base64"}))
           PY
-          sha256sum NiceVideos.apk
+            sha256sum "$apk"
+          done
