@@ -3,6 +3,7 @@ import CoreMotion
 
 enum AfterglowPreset {
     private static let profileKey = "vr.afterglow.profile"
+    static let decoderKey = "vr.decoderPolicy"
     static let gyroKey = "vr.afterglow.gyro"
     static let renderScaleKey = "vr.afterglow.renderScalePercent"
     static let frameRateKey = "vr.afterglow.targetFrameRate"
@@ -23,6 +24,7 @@ struct AfterglowPresetView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var profile = AfterglowPreset.load()
     @AppStorage(AfterglowPreset.gyroKey) private var followHead = true
+    @AppStorage(AfterglowPreset.decoderKey) private var decoderPolicy: VLCDecoderPolicy = .automatic
     @State private var sensorAvailable = CMMotionManager().isDeviceMotionAvailable
 
     var body: some View {
@@ -30,6 +32,7 @@ struct AfterglowPresetView: View {
             Form {
                 Section("打开影片时使用") {
                     VRProjectionFields(profile: $profile)
+                    VRDecoderPolicyPicker(selection: $decoderPolicy)
                 }
                 Section("观看设置") {
                     if profile.projection != .flat {
@@ -51,6 +54,18 @@ struct AfterglowPresetView: View {
                 }
             }
         }
+    }
+}
+
+struct VRDecoderPolicyPicker: View {
+    @Binding var selection: VLCDecoderPolicy
+
+    var body: some View {
+        Picker("全景视频解码", selection: $selection) {
+            Text("自动选择").tag(VLCDecoderPolicy.automatic)
+            Text("VLC 软件解码").tag(VLCDecoderPolicy.software)
+        }
+        .accessibilityIdentifier("vrDecoderPolicy")
     }
 }
 

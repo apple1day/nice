@@ -4,6 +4,11 @@ import CoreVideo
 import MobileVLCKit
 import ObjectiveC
 
+// Each policy belongs to a single libVLC instance, including seek and replay reopens.
+enum VLCDecoderPolicy: String {
+    case automatic, software
+}
+
 enum PlaybackPhase: Equatable { case idle, opening, playing, paused, ended, failed }
 struct PlaybackSnapshot {
     var phase: PlaybackPhase
@@ -165,6 +170,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     private var lossTimer: DispatchSourceTimer?
     private var minimumLoss = VLCFrameLossWatch.Pattern.none
     private let reducedFrameOutput: Bool
+    let decoderPolicy: VLCDecoderPolicy
     static let reducedLongEdge: UInt32 = 1280
     private var checkExistingPanoramaFormat = false
     var preferSmallerPanoramaFrames: Bool {
@@ -219,11 +225,19 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     override convenience init() { self.init(frameHandler: nil) }
 
     init(frameHandler: ((CVPixelBuffer) -> Void)?, pickedFile: PickedVideoFile? = nil,
-         reducedFrameOutput: Bool = false, preferSmallerPanoramaFrames: Bool = false) {
+         reducedFrameOutput: Bool = false, preferSmallerPanoramaFrames: Bool = false,
+         decoderPolicy: VLCDecoderPolicy = .automatic) {
         self.pickedFile = pickedFile
         self.reducedFrameOutput = reducedFrameOutput
+        let panoramaOutput = frameHandler != nil && preferSmallerPanoramaFrames
+        self.decoderPolicy = panoramaOutput ? decoderPolicy : .automatic
         var options = ["--no-video-title-show", "--no-metadata-network-access"]
-        if frameHandler != nil && preferSmallerPanoramaFrames {
+        if panoramaOutput && decoderPolicy == .software {
+            // MobileVLCKit 3.7.3 registers a stand-alone VideoToolbox decoder.
+            // Disabling only avcodec hardware acceleration leaves that decoder eligible.
+            options.append(contentsOf: ["--no-videotoolbox", "--avcodec-hw=none"])
+        }
+        if panoramaOutput {
             // VLC 3 drops a picture already half a frame late before vmem can
             // offer it. At 59.94 fps that leaves about 8 ms. Keep the decoded
             // panorama available for presentation, with at most one pending
@@ -268,6 +282,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
     func load(fileURL: URL, startAt seconds: Double, paused: Bool) throws {
         guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
         guard let player else { throw ClientError("播放器初始化失败，请关闭后重新打开视频。") }
+        if preferSmallerPanoramaFrames { nativeLifetime?.resource?.observeVideoDecoderForNewInput() }
         frameProgress.reset()
         frameLossWatch.reset()
         callbackLock.withLock { seekGate.clear() }
@@ -552,6 +567,11 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
                 var status = "stats=unavailable"
                 if let native, native.decoded >= 0 {
                     status = "decoded=\(native.decoded) displayed=\(native.displayed) lost=\(native.lost)"
+                }
+                status += " decoderPolicy=\(decoderPolicy.rawValue)"
+                if preferSmallerPanoramaFrames {
+                    let module = nativeLifetime?.resource?.observedVideoDecoder ?? "unreported"
+                    status += " observedVideoDecoder=\(module)"
                 }
                 if let stats {
                     status += " offered=\(stats.offered) delivered=\(stats.delivered) coalesced=\(stats.coalesced) bufferMisses=\(stats.bufferMisses)"

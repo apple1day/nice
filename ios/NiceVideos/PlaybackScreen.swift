@@ -162,11 +162,12 @@ final class PlaybackModel: ObservableObject {
         return true
     }
 
-    @MainActor func prepareOutputChange(to output: MovieOutput) {
+    @MainActor func prepareOutputChange(to output: MovieOutput, retry: Bool = true) {
         if phase == .failed {
             message = nil
             phase = .opening
         }
+        guard retry else { return }
         if output == .system { (engine as? SystemOutputRetrying)?.retrySystemOutput() }
         if output == .afterglow { (engine as? SystemOutputRetrying)?.retryAfterglowOutput() }
     }
@@ -302,6 +303,7 @@ private struct MovieVideoSurface: UIViewRepresentable {
     let model: PlaybackModel
     let mode: SBSDisplayMode
     let standardOutput: MovieOutput
+    let decoderPolicy: VLCDecoderPolicy
     let camera: VRGestureCamera
     let followHead: Bool
     let wakeGesture: VRWakeGesture
@@ -310,7 +312,7 @@ private struct MovieVideoSurface: UIViewRepresentable {
     let targetFrameRate: Int
 
     @MainActor private func configure(_ view: SBSPlaybackView) {
-        view.configure(mode: mode, standardOutput: standardOutput)
+        view.configure(mode: mode, standardOutput: standardOutput, decoderPolicy: decoderPolicy)
         if let renderer = view.renderer {
             if renderer.nativeResolution != nativeResolution { renderer.nativeResolution = nativeResolution }
             if renderer.renderScalePercent != renderScalePercent { renderer.renderScalePercent = renderScalePercent }
@@ -435,6 +437,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     @AppStorage("vr.viewer.wakeGesture") private var wakeGesture: VRWakeGesture = .off
     @AppStorage("vr.viewer.doubleTap") private var doubleTap: VRDoubleTapAction = .recenter
     @AppStorage("vr.viewer.pinch") private var pinchResponse: VRPinchResponse = .regular
+    @AppStorage(AfterglowPreset.decoderKey) private var vrDecoderPolicy: VLCDecoderPolicy = .automatic
     @AppStorage(AfterglowPreset.gyroKey) private var afterglowGyro = true
     @AppStorage(AfterglowPreset.renderScaleKey) private var afterglowRenderScale = 75
     @AppStorage(AfterglowPreset.frameRateKey) private var afterglowFrameRate = 30
@@ -489,6 +492,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                 ZStack {
                     Color.black.ignoresSafeArea()
                     MovieVideoSurface(model: model, mode: displayMode, standardOutput: standardOutput,
+                                      decoderPolicy: immersive ? vrDecoderPolicy : .automatic,
                                       camera: camera, followHead: isPanorama && (afterglowViewing ? afterglowGyro : followHead) && scenePhase == .active && !showsVRSettings,
                                       wakeGesture: vrProfile.headset && canInteract && !hasMessage ? wakeGesture : .off,
                                       nativeResolution: nativeResolution,
@@ -810,8 +814,8 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         displayMode = .standard
     }
 
-    private func selectOutput(_ output: MovieOutput) {
-        model.prepareOutputChange(to: output)
+    private func selectOutput(_ output: MovieOutput, retry: Bool = true) {
+        model.prepareOutputChange(to: output, retry: retry)
         outputOverride = output
     }
 
@@ -858,7 +862,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     }
     private func enterAfterglow() {
         afterglowViewing = true
-        selectOutput(.afterglow)
+        selectOutput(.afterglow, retry: false)
         enterPanorama()
     }
 
@@ -902,11 +906,20 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         }
     }
 
+    private func changeVRDecoder(_ policy: VLCDecoderPolicy) {
+        guard vrDecoderPolicy != policy else { return }
+        vrDecoderPolicy = policy
+        // Returning to automatic is an explicit retry of the preferred path.
+        let preferred: MovieOutput = afterglowViewing ? .afterglow : defaultOutput
+        model.prepareOutputChange(to: preferred, retry: policy == .automatic)
+        outputOverride = afterglowViewing ? .afterglow : nil
+    }
+
     private var immersiveSettings: some View {
         let appleActive = activeOutput == .system || activeOutput == .afterglow
         let retryOutput: MovieOutput = afterglowViewing ? .afterglow : .system
         let retryTitle = afterglowViewing ? "重试 Afterglow XR" : "恢复系统解码"
-        let fallback = outputOverride == .afterglow && activeOutput == .vlcFrames
+        let fallback = vrDecoderPolicy == .automatic && outputOverride == .afterglow && activeOutput == .vlcFrames
         var details = model.videoDetails
         if fallback {
             details = "Afterglow XR 已回退到 VLC。" + (details.map { " " + $0 } ?? "")
@@ -917,8 +930,10 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         let profile = Binding<VRMoviePreferences>(get: { vrProfile }, set: { applyProfile($0) })
         return VRViewerSettingsView(profile: profile, followHead: gyro, nativeResolution: $nativeResolution,
                              doubleTap: $doubleTap, pinchResponse: $pinchResponse, wakeGesture: $wakeGesture,
-                             sensorAvailable: camera.sensorAvailable, decoder: model.videoOutput?.title ?? "正在打开…",
-                             details: details, decoderAction: action,
+                             decoderPolicy: Binding(get: { vrDecoderPolicy }, set: changeVRDecoder),
+                             sensorAvailable: camera.sensorAvailable, decoder: vrDecoderPolicy == .software && model.videoOutput == .vlcFrames
+                                ? "VLC 软件解码" : (model.videoOutput?.title ?? "正在打开…"),
+                             details: details, decoderAction: vrDecoderPolicy == .automatic ? action : nil,
                              onCopyDiagnostics: model.copyPlaybackDiagnostics,
                              onDecoderChange: { selectOutput(appleActive ? .vlcFrames : retryOutput) },
                              usesAfterglowPreset: afterglowViewing,

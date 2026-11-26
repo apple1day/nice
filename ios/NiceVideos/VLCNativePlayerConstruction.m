@@ -8,6 +8,8 @@
 #import <MobileVLCKit/vlc/libvlc_picture.h>
 #import <MobileVLCKit/vlc/libvlc_media.h>
 #import <MobileVLCKit/vlc/libvlc_media_player.h>
+#include <stdatomic.h>
+#include <string.h>
 
 @implementation VLCMedia (NICEVLCTrackSource)
 @end
@@ -60,10 +62,33 @@
                  frameDelivery:(NICEVLCFrameDelivery *)delivery;
 @end
 
+typedef enum {
+    NICEDecoderUnknown, NICEDecoderAVCodec, NICEDecoderVideoToolbox, NICEDecoderOther
+} NICEDecoderModule;
+
+static void NICEObserveVideoDecoder(void *opaque, int level, const libvlc_log_t *context,
+                                    const char *format, va_list args) {
+    // VLC 3 announces the selected module after successful initialization.
+    // Do not format, retain or forward arbitrary messages from decoder threads.
+    if (level != LIBVLC_DEBUG || strcmp(format, "using %s module \"%s\"") != 0) { return; }
+    va_list values;
+    va_copy(values, args);
+    const char *capability = va_arg(values, const char *);
+    const char *name = va_arg(values, const char *);
+    va_end(values);
+    if (strcmp(capability, "video decoder") != 0) { return; }
+    NICEDecoderModule module = NICEDecoderOther;
+    if (strcmp(name, "avcodec") == 0) { module = NICEDecoderAVCodec; }
+    else if (strcmp(name, "videotoolbox") == 0) { module = NICEDecoderVideoToolbox; }
+    atomic_store_explicit((atomic_int *)opaque, module, memory_order_relaxed);
+}
+
 @implementation NICEVLCNativeReference {
     libvlc_media_player_t *_player;
     VLCLibrary *_library;
     NICEVLCFrameDelivery *_delivery;
+    atomic_int _observedVideoDecoder;
+    BOOL _observesVideoDecoder;
 }
 
 - (instancetype)initWithPlayer:(libvlc_media_player_t *)player library:(VLCLibrary *)library
@@ -72,12 +97,29 @@
     if (self) {
         libvlc_media_player_retain(player);
         _player = player;
+        atomic_init(&_observedVideoDecoder, NICEDecoderUnknown);
         // Keep the ObjC library's log teardown and instance release on the same
         // background path, after the native player's worker has finished.
         _library = library;
         _delivery = delivery;
     }
     return self;
+}
+
+- (void)observeVideoDecoderForNewInput {
+    atomic_store_explicit(&_observedVideoDecoder, NICEDecoderUnknown, memory_order_relaxed);
+    if (_observesVideoDecoder) { return; }
+    _observesVideoDecoder = YES;
+    libvlc_log_set((libvlc_instance_t *)_library.instance, NICEObserveVideoDecoder, &_observedVideoDecoder);
+}
+
+- (NSString *)observedVideoDecoder {
+    switch (atomic_load_explicit(&_observedVideoDecoder, memory_order_relaxed)) {
+        case NICEDecoderAVCodec: return @"avcodec";
+        case NICEDecoderVideoToolbox: return @"videotoolbox";
+        case NICEDecoderOther: return @"other";
+        default: return nil;
+    }
 }
 
 - (int64_t)timeMilliseconds { return libvlc_media_player_get_time(_player); }
@@ -147,6 +189,10 @@
 }
 
 - (void)dealloc {
+    if (_observesVideoDecoder) {
+        // This public API joins in-flight log callbacks before freeing their storage.
+        libvlc_log_unset((libvlc_instance_t *)_library.instance);
+    }
     libvlc_media_player_release(_player);
     // libvlc joins its vout in the final release. Only now may the opaque
     // pointer originally passed to libvlc_video_set_callbacks be destroyed.

@@ -35,6 +35,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private var wantsPlayback = false
     private var ended = false
     private var stopped = false
+    private(set) var foundNoDecodableVideoTrack = false
     private var failure: String?
     private var frameWatch = AppleVideoFrameWatch()
     private var videoTimeRange: CMTimeRange?
@@ -251,6 +252,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                 }
                 guard !Task.isCancelled, let self,
                       self.player.currentItem === item || self.preparingItem === item else { return }
+                self.foundNoDecodableVideoTrack = true
                 self.diagnostics?.event("AV: no decodable video track")
                 self.failure = "系统播放器没有找到可解码的视频轨道。"
                 self.publish()
@@ -484,6 +486,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     }
 
     private func retireItem() {
+        foundNoDecodableVideoTrack = false
         stopFirstPictureTimer()
         firstPictureWatch = AfterglowFirstPictureWatch()
         preparingItem = nil

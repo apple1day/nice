@@ -156,8 +156,28 @@ final class VRFolderLibraryUITests: XCTestCase {
             XCTAssertTrue(tab.waitForExistence(timeout: 10))
             tab.tap()
         }
+        func chooseDecoder(_ label: String) {
+            let picker = control("vrDecoderPolicy")
+            XCTAssertTrue(picker.waitForExistence(timeout: 6) && picker.isHittable, app.debugDescription)
+            picker.tap()
+            let option = app.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch
+            XCTAssertTrue(option.waitForExistence(timeout: 6), app.debugDescription)
+            option.tap()
+        }
+        // The decoder preset uses standard app preferences. Restore it even if
+        // the real player fails partway through this test.
+        var restoreDecoder = false
+        addTeardownBlock { @MainActor in
+            if restoreDecoder {
+                app.terminate()
+                openTab()
+                control("afterglowOpenSettings").tap()
+                chooseDecoder("自动选择")
+            }
+            app.terminate()
+            XCUIDevice.shared.orientation = .portrait
+        }
         openTab()
-        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
         XCTAssertTrue(control("afterglowOpenVideo").exists)
         attachVRScreen("Afterglow XR entry")
         control("afterglowOpenSettings").tap()
@@ -170,6 +190,8 @@ final class VRFolderLibraryUITests: XCTestCase {
         let singleScreen = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '0'"), object: headset)
         XCTAssertEqual(XCTWaiter.wait(for: [singleScreen], timeout: 5), .completed)
         XCTAssertTrue(control("afterglowFrameRate").exists)
+        restoreDecoder = true
+        chooseDecoder("VLC 软件解码")
         control("afterglowSettingsDone").tap()
         app.terminate()
         openTab()
@@ -199,7 +221,16 @@ final class VRFolderLibraryUITests: XCTestCase {
             app.swipeUp()
         }
         XCTAssertTrue(decoder.exists && decoder.isHittable, app.debugDescription)
+        XCTAssertEqual(decoder.value as? String, "VLC 软件解码", app.debugDescription)
+
+        // The route above is reported by the running engine. Return this same
+        // paused movie to its normal Afterglow decoder using the player sheet.
+        chooseDecoder("自动选择")
+        let automatic = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "Afterglow XR"),
+                                                   object: decoder)
+        XCTAssertEqual(XCTWaiter.wait(for: [automatic], timeout: 12), .completed, app.debugDescription)
         XCTAssertEqual(decoder.value as? String, "Afterglow XR", app.debugDescription)
+        restoreDecoder = false
     }
 
     private func attachVRScreen(_ name: String) {

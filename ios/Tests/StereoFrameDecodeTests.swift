@@ -11,8 +11,14 @@ import XCTest
         try await checkMovingPanorama("stereo8k60-full", width: 1600, height: 800, startAt: 0, reduced: false)
     }
 
+    func testForcedSoftwareDecodesMain10FullHeight8KWithMovingStereoEyes() async throws {
+        try await checkMovingPanorama("vr8k-main10-hev1", width: 1600, height: 800, startAt: 0,
+                                      reduced: false, decoderPolicy: .software)
+    }
+
     private func checkMovingPanorama(_ fixture: String, width expectedWidth: Int, height expectedHeight: Int,
-                                     startAt: Double, reduced: Bool) async throws {
+                                     startAt: Double, reduced: Bool,
+                                     decoderPolicy: VLCDecoderPolicy = .automatic) async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: fixture, withExtension: "mp4", subdirectory: "Fixtures"))
         let ready = expectation(description: "VLC output contains both moving eyes at the negotiated size")
@@ -49,7 +55,7 @@ import XCTest
                 finished = true
                 ready.fulfill()
             }
-        }, reducedFrameOutput: reduced, preferSmallerPanoramaFrames: true)
+        }, reducedFrameOutput: reduced, preferSmallerPanoramaFrames: true, decoderPolicy: decoderPolicy)
         engine.diagnostics = diagnostics
         engine.onUpdate = { snapshot in
             clock = snapshot.seconds
@@ -59,7 +65,11 @@ import XCTest
         try engine.load(fileURL: url, startAt: startAt, paused: false)
         engine.play()
         await fulfillment(of: [ready], timeout: 15)
-        XCTAssertTrue(finished, "Eye-pair changes=\(transitions). " + diagnostics.report { "" })
+        let report = diagnostics.report { "" }
+        XCTAssertTrue(finished, "Eye-pair changes=\(transitions). " + report)
+        if decoderPolicy == .software {
+            XCTAssertTrue(report.contains("decoderPolicy=software observedVideoDecoder=avcodec"), report)
+        }
     }
 
     func testSBSFramePreservesBothEyesInMetalCompatibleBGRA() async throws {

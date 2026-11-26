@@ -4,6 +4,108 @@ import UIKit
 
 @MainActor
 final class SBSPlaybackEngineTests: XCTestCase {
+    private func waitForRoute(_ predicate: () -> Bool) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(15)
+        while !predicate(), Date() < deadline { try await Task.sleep(nanoseconds: 50_000_000) }
+        return predicate()
+    }
+
+    func testKnownUndecodableAppleTrackSkipsSecondAutomaticOpenButAllowsRetryAndNextFile() async throws {
+        let bundle = Bundle(for: Self.self)
+        let unsupported = try XCTUnwrap(bundle.url(forResource: "audio-only", withExtension: "mp4", subdirectory: "Fixtures"))
+        let supported = try XCTUnwrap(bundle.url(forResource: "panorama-audio", withExtension: "mp4", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        let engine = SBSPlaybackEngine()
+        defer { engine.stop(); window.isHidden = true }
+        var snapshot = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { snapshot = $0 }
+        host.configure(mode: .standard, standardOutput: .system)
+        engine.attach(to: host)
+        try engine.load(fileURL: unsupported)
+        engine.play()
+
+        let rejected = try await waitForRoute { engine.currentOutput == .vlcNative }
+        XCTAssertTrue(rejected, engine.playbackDiagnosticReport() ?? "")
+        guard rejected else { return }
+        let mode = SBSDisplayMode.immersive(.vr360, .sideBySide, headset: true)
+        host.configure(mode: mode, standardOutput: .afterglow)
+        XCTAssertEqual(engine.currentOutput, .vlcFrames)
+        XCTAssertFalse((engine.playbackDiagnosticReport() ?? "").contains("output afterglow"))
+        engine.retryAfterglowOutput()
+        XCTAssertEqual(engine.currentOutput, .afterglow)
+        let retried = try await waitForRoute { engine.currentOutput == .vlcFrames }
+        XCTAssertTrue(retried, engine.playbackDiagnosticReport() ?? "")
+        guard retried else { return }
+
+        try engine.load(fileURL: supported)
+        XCTAssertEqual(engine.currentOutput, .afterglow)
+        engine.play()
+        let resumed = try await waitForRoute {
+            snapshot.videoOutput == .afterglow && snapshot.phase == .playing &&
+                snapshot.hasVideo && (host.renderer?.acceptedFrameID ?? 0) >= 2
+        }
+        XCTAssertTrue(resumed, engine.playbackDiagnosticReport() ?? "")
+    }
+
+    func testSoftwareDecoderPolicyKeepsPositionAndPauseWhenReturningToAutomaticVLC() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "panorama-audio", withExtension: "mp4", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        let mode = SBSDisplayMode.immersive(.vr360, .sideBySide, headset: true)
+        host.configure(mode: mode, standardOutput: .afterglow, decoderPolicy: .software)
+        let engine = SBSPlaybackEngine()
+        defer { engine.stop(); window.isHidden = true }
+        var snapshot = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { snapshot = $0 }
+        engine.attach(to: host)
+        try engine.load(fileURL: url)
+        engine.play()
+
+        let renderer = try XCTUnwrap(host.renderer)
+        let running = try await waitForRoute {
+            snapshot.videoOutput == .vlcFrames && snapshot.phase == .playing && snapshot.seekable &&
+                renderer.acceptedFrameID >= 2
+        }
+        XCTAssertTrue(running, engine.playbackDiagnosticReport() ?? "")
+        guard running else { return }
+        XCTAssertTrue((engine.playbackDiagnosticReport() ?? "").contains("decoderPolicy=software"))
+        engine.seek(to: 17)
+        let sought = try await waitForRoute { (17.3...24).contains(snapshot.seconds) }
+        XCTAssertTrue(sought, engine.playbackDiagnosticReport() ?? "")
+        guard sought else { return }
+        engine.pause()
+        let paused = try await waitForRoute { snapshot.phase == .paused }
+        XCTAssertTrue(paused)
+        guard paused else { return }
+        let before = snapshot.seconds
+
+        host.configure(mode: mode, standardOutput: .vlcFrames)
+        host.mode = .immersive(.vr180, .sideBySide, headset: false)
+        XCTAssertEqual(host.effectiveDecoderPolicy, .software)
+        XCTAssertFalse((engine.playbackDiagnosticReport() ?? "").contains("open loadID=2"))
+        host.configure(mode: mode, standardOutput: .vlcFrames, decoderPolicy: .automatic)
+        let freshFrame = renderer.acceptedFrameID
+        let restored = try await waitForRoute {
+            snapshot.videoOutput == .vlcFrames && snapshot.phase == .paused && snapshot.seekable &&
+                snapshot.hasVideo && renderer.acceptedFrameID > freshFrame && abs(snapshot.seconds - before) < 0.6
+        }
+        let report = engine.playbackDiagnosticReport() ?? ""
+        XCTAssertTrue(restored, report)
+        XCTAssertTrue(report.contains("open loadID=2"), report)
+        XCTAssertTrue(report.contains("decoderPolicy=automatic"), report)
+        XCTAssertFalse(report.contains("open loadID=3"), report)
+    }
+
     func testRunningVLCMemoryOutputRenegotiatesFullHeight8KOnlyWhenEnteringPanorama() async throws {
         let file = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "stereo8k60-full", withExtension: "mp4", subdirectory: "Fixtures"))

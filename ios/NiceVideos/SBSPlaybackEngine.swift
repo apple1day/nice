@@ -1,6 +1,6 @@
 import UIKit
 
-enum MovieOutput: Equatable {
+enum MovieOutput: Hashable {
     case system, afterglow, vlcNative, vlcFrames
 
     var usesAVPlayer: Bool { self == .system || self == .afterglow }
@@ -33,15 +33,22 @@ final class SBSPlaybackView: UIView {
     var onOutputChange: (() -> Void)?
     private var format: SBSDisplayMode = .standard
     private(set) var standardOutput: MovieOutput?
+    private(set) var decoderPolicy: VLCDecoderPolicy = .automatic
+    var effectiveDecoderPolicy: VLCDecoderPolicy {
+        if case .immersive = format { return decoderPolicy }
+        return .automatic
+    }
     var mode: SBSDisplayMode {
         get { format }
         set { configure(mode: newValue, standardOutput: standardOutput) }
     }
 
-    func configure(mode: SBSDisplayMode, standardOutput: MovieOutput?) {
-        guard mode != format || standardOutput != self.standardOutput else { return }
+    func configure(mode: SBSDisplayMode, standardOutput: MovieOutput?, decoderPolicy: VLCDecoderPolicy? = nil) {
+        let policy = decoderPolicy ?? self.decoderPolicy
+        guard mode != format || standardOutput != self.standardOutput || policy != self.decoderPolicy else { return }
         format = mode
         self.standardOutput = standardOutput
+        self.decoderPolicy = policy
         let needsFrames = mode != .standard || standardOutput == .vlcFrames
         if needsFrames && renderer == nil {
             let view = SBSMetalView(frame: bounds)
@@ -146,7 +153,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     private var session: SwitchableVideoEngine?
     private weak var hostView: SBSPlaybackView?
     private(set) var currentOutput: MovieOutput?
-    private var failedAppleOutput: MovieOutput?
+    private var failedAppleOutputs: Set<MovieOutput> = []
     private var reducedVLCFrameOutput = false
     private var systemStereo = false
     private let pickedFile: PickedVideoFile?
@@ -206,7 +213,14 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             guard let self, !self.stopped, self.session === newSession else { return }
             self.diagnostics.observe(snapshot) { MainActor.assumeIsolated { self.rendererStatus } }
             if let output = self.currentOutput, output.usesAVPlayer, snapshot.phase == .failed, let host = self.hostView {
-                self.failedAppleOutput = output
+                self.failedAppleOutputs.insert(output)
+                // Both routes use the same AVFoundation asset and video tracks.
+                // Cache this specific discovery for this file. An output stall
+                // or transient AV error only disqualifies the route that failed.
+                if output == .system, (newSession as? AppleFilePlaybackEngine)?.foundNoDecodableVideoTrack == true {
+                    self.failedAppleOutputs.insert(.afterglow)
+                    self.diagnostics.event("AV: skipping automatic Afterglow retry for this input; no decodable video track")
+                }
                 // A scrub while an output opens wins, including a seek to zero.
                 // Otherwise keep the AV clock (or its active seek target). An
                 // opening failure with no usable clock retains the launch time.
@@ -309,7 +323,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     @MainActor private func installVLCFrameSession() {
         let vlc = VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile,
                                     reducedFrameOutput: reducedVLCFrameOutput,
-                                    preferSmallerPanoramaFrames: hostView.map { $0.mode != .standard } ?? false)
+                                    preferSmallerPanoramaFrames: hostView.map { $0.mode != .standard } ?? false,
+                                    decoderPolicy: hostView?.effectiveDecoderPolicy ?? .automatic)
         vlc.diagnostics = diagnostics
         observe(vlc)
     }
@@ -317,10 +332,12 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     @MainActor private func reconcileOutput(_ host: SBSPlaybackView, attaching: Bool = false) {
         // A bare playback surface can be attached before the local URL is known.
         guard let output = host.standardOutput else { return }
-        let useRequestedOutput = output.usesAVPlayer && failedAppleOutput != output
+        let policy = host.effectiveDecoderPolicy
+        let useRequestedOutput = policy == .automatic && output.usesAVPlayer && !failedAppleOutputs.contains(output)
         let next: MovieOutput = useRequestedOutput ? output : (host.renderer == nil ? .vlcNative : .vlcFrames)
+        let needsNewDecoder = (session as? VLCPlaybackEngine).map { $0.decoderPolicy != policy } ?? false
         diagnostics.setRoute(next, mode: host.mode)
-        if next == currentOutput, let session {
+        if next == currentOutput, !needsNewDecoder, let session {
             if let vlc = session as? VLCPlaybackEngine, next == .vlcFrames {
                 vlc.preferSmallerPanoramaFrames = host.mode != .standard
                 if reopenOversizedPanorama(vlc, host: host) { return }
@@ -383,8 +400,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     }
 
     @MainActor private func retry(_ output: MovieOutput) {
-        guard failedAppleOutput == output else { return }
-        failedAppleOutput = nil
+        guard failedAppleOutputs.remove(output) != nil else { return }
         if let hostView, hostView.standardOutput == output { reconcileOutput(hostView) }
     }
 
@@ -402,7 +418,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             if resume { session.play(waitForPausedFrame: openingPaused) }
         } catch {
             if let output = currentOutput, output.usesAVPlayer {
-                failedAppleOutput = output
+                failedAppleOutputs.insert(output)
                 reconcileOutput(host)
                 return
             }
@@ -419,7 +435,17 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     func load(fileURL: URL) throws {
         guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
         let differentFile = file != fileURL
+        seconds = 0
+        phase = .idle
+        openingPaused = false
+        awaitingOutput = false
+        pendingSeek = nil
+        hasStarted = false
         if differentFile {
+            // Route the new asset without reopening the previous asset at its
+            // old position. The selected session is loaded exactly once below.
+            file = nil
+            failedAppleOutputs.removeAll()
             reducedVLCFrameOutput = false
             let size = pickedFile?.byteCount ?? (fileURL.isFileURL
                 ? (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { UInt64(exactly: $0) }
@@ -427,8 +453,12 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             diagnostics.setFileByteCount(size)
         }
         MainActor.assumeIsolated {
-            if let host = hostView, host.standardOutput == nil {
-                host.configure(mode: host.mode, standardOutput: MovieOutput.defaultOutput(for: fileURL, pickedFile: pickedFile))
+            if let host = hostView {
+                if host.standardOutput == nil {
+                    host.configure(mode: host.mode, standardOutput: MovieOutput.defaultOutput(for: fileURL, pickedFile: pickedFile))
+                } else if differentFile {
+                    reconcileOutput(host)
+                }
             }
         }
         if currentOutput == .vlcFrames, let vlc = session as? VLCPlaybackEngine, vlc.loaded {
@@ -442,19 +472,13 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             }
         }
         file = fileURL
-        seconds = 0
-        phase = .idle
-        openingPaused = false
-        awaitingOutput = false
-        pendingSeek = nil
-        hasStarted = false
         do {
             let player = nativeSession()
             diagnostics.beginInput(at: 0, differentFile: differentFile)
             try player.load(fileURL: fileURL)
         } catch {
             guard let output = currentOutput, output.usesAVPlayer, let hostView else { throw error }
-            failedAppleOutput = output
+            failedAppleOutputs.insert(output)
             MainActor.assumeIsolated { reconcileOutput(hostView) }
         }
     }

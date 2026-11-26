@@ -247,6 +247,7 @@ enum VRPinchResponse: String, CaseIterable {
     @Binding var doubleTap: VRDoubleTapAction
     @Binding var pinchResponse: VRPinchResponse
     @Binding var wakeGesture: VRWakeGesture
+    @Binding var decoderPolicy: VLCDecoderPolicy
     let sensorAvailable: Bool
     let decoder: String
     let details: String?
@@ -296,6 +297,7 @@ enum VRPinchResponse: String, CaseIterable {
                     }
                 }
                 Section("片源信息") {
+                    VRDecoderPolicyPicker(selection: $decoderPolicy)
                     LabeledContent("当前解码", value: decoder)
                         .accessibilityElement(children: .ignore)
                         .accessibilityLabel("当前解码")

@@ -51,6 +51,10 @@ typedef struct {
 @property (nonatomic, readonly) int64_t lengthMilliseconds;
 @property (nonatomic, readonly) int64_t timeMilliseconds;
 - (void)seekToMilliseconds:(int64_t)milliseconds NS_SWIFT_NAME(seek(milliseconds:));
+// Observes the pinned libVLC instance's actual "using video decoder module"
+// announcement. Names are whitelisted; media paths and other messages are ignored.
+- (void)observeVideoDecoderForNewInput;
+@property (nonatomic, readonly, nullable) NSString *observedVideoDecoder;
 - (nullable NSString *)videoTrackDescriptionWithFrameRate:(double *)rate NS_SWIFT_NAME(videoTrackDescription(frameRate:));
 // Unavailable counters are -1.
 @property (nonatomic, readonly) NICEVLCVideoStats videoStatistics;
