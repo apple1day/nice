@@ -4,6 +4,10 @@
 
 ## 已经安装了仓库发布的 83 KB 原版
 
+**在 Mac 上双击导出**
+
+下载 [NiceVideos-Classic-Export-Mac.zip](./tools/NiceVideos-Classic-Export-Mac.zip) 并解压。在平板开发者选项开启「USB 调试」，用数据线连上 Mac，在平板上允许这台电脑调试，然后在 Mac 上双击文件夹中的 `导出视频.command`。看到「导出完成」后，在平板「文件管理 → 内部存储 → Download → NiceVideos」找视频。需要 Python 3 和 Android SDK Platform Tools，启动时会检查这两个工具。
+
 请保留手机上的原 App。仓库先后发布过两份同样大小的 1.0.0 APK，各自使用构建机生成的调试签名，构建流程只保存了 APK 和测试结果。更新已安装的 App 需要与手机上那份 APK 匹配的签名私钥。当前分支的 `NiceVideos.apk` 是存档的 1.0.0。`NiceVideos-1.0.1-classic-export-unsigned.apk` 是供原签名持有人签署的 1.0.1。
 
 **只要把现有视频导出到手机公共目录**，可在 Mac 上下载 [export_classic.py](./tools/export_classic.py)，用 USB 数据线连接手机，在开发者选项开启「USB 调试」，并在手机上确认允许这台电脑调试。工具需要 Python 3 以及 Android SDK Platform Tools。使用 Homebrew 的 Mac 可用 `brew install --cask android-platform-tools` 安装后者。假设脚本保存到了 Mac 的「下载」：
