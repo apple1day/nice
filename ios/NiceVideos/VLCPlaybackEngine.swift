@@ -452,7 +452,10 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         default: phase = player.isPlaying ? .playing : .opening
         }
 
-        let rawSeconds = max(0, Double(player.time.intValue) / 1000)
+        // Delegate changes can arrive late during a seek. Read the native input
+        // clock on every seek poll, including while VLC has stopped emitting ticks.
+        let nativeMS = nativeLifetime?.resource?.timeMilliseconds ?? -1
+        let rawSeconds = max(0, nativeMS >= 0 ? Double(nativeMS) / 1000 : Double(player.time.intValue) / 1000)
         let now = ProcessInfo.processInfo.systemUptime
         let duration = durationSeconds(player)
         let appState = MainActor.assumeIsolated { UIApplication.shared.applicationState }
