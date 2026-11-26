@@ -1,12 +1,17 @@
 package com.anxiong.nicevideos;
 
+import android.app.Instrumentation;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Environment;
+import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
+import android.provider.DocumentsContract;
 import android.provider.MediaStore;
+import android.view.accessibility.AccessibilityNodeInfo;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.filters.SdkSuppress;
@@ -16,6 +21,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import org.json.JSONObject;
 import org.junit.Test;
@@ -29,6 +35,7 @@ public final class LegacyDownloadMigrationTest {
     private final VideoLibrary library = new VideoLibrary(app);
     private final LegacyDownloadMigration migration = new LegacyDownloadMigration(library);
     private static final String RELATIVE_PATH = Environment.DIRECTORY_DOWNLOADS + "/NiceVideos/";
+    private final Instrumentation instrumentation = InstrumentationRegistry.getInstrumentation();
 
     /** A record serialized with the 1.2.0 schema, before public location fields existed. */
     private VideoLibrary.Entry legacy(String name, byte[] data, long expectedSize) throws Exception {
@@ -100,7 +107,111 @@ public final class LegacyDownloadMigrationTest {
         }
     }
 
-    @Test public void openingLibraryAutomaticallyMigratesCompletedDownloadsAndLeavesImportedUriInPlace() throws Exception {
+    private void clickControl(String label) {
+        long timeout = SystemClock.elapsedRealtime() + 15000;
+        do {
+            AccessibilityNodeInfo root = instrumentation.getUiAutomation().getRootInActiveWindow();
+            if (root != null) {
+                for (AccessibilityNodeInfo item : root.findAccessibilityNodeInfosByText(label)) {
+                    if (item.getText() != null && label.equalsIgnoreCase(item.getText().toString()) &&
+                            item.isEnabled() && item.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return;
+                }
+            }
+            SystemClock.sleep(100);
+        } while (SystemClock.elapsedRealtime() < timeout);
+        fail("Missing enabled UI control: " + label);
+    }
+
+    private boolean exportedFileExists(Uri document) throws IOException {
+        try (InputStream in = app.getContentResolver().openInputStream(document)) {
+            return in != null;
+        } catch (java.io.FileNotFoundException | SecurityException notReady) {
+            // DocumentsUI may still be returning the grant or the export may still be copying.
+            return false;
+        }
+    }
+
+    @Test public void bulkExportToSystemSelectedFolderKeepsBothSourcesAndReusesVerifiedCopy() throws Exception {
+        String folder = "NiceExport-" + UUID.randomUUID();
+        String folderId = "primary:Download/" + folder;
+        String authority = "com.android.externalstorage.documents";
+        Uri initial = DocumentsContract.buildDocumentUri(authority, folderId);
+        Uri tree = DocumentsContract.buildTreeDocumentUri(authority, folderId);
+        String privateName = "Private #.mp4";
+        String publicName = "Public-" + UUID.randomUUID() + ".mp4";
+        byte[] original = "old".getBytes(StandardCharsets.UTF_8);
+        byte[] modern = {6, 7, 8, 9};
+        VideoLibrary.Entry old = legacy(privateName, original, original.length);
+        VideoLibrary.Entry publicEntry = legacy(publicName, modern, modern.length);
+        Uri occupied = null;
+        Instrumentation.ActivityMonitor picker = new Instrumentation.ActivityMonitor() {
+            @Override public Instrumentation.ActivityResult onStartActivity(Intent intent) {
+                if (Intent.ACTION_OPEN_DOCUMENT_TREE.equals(intent.getAction())) {
+                    // Start the real DocumentsUI in a unique folder; it grants the URI to the app.
+                    intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, initial);
+                }
+                return null;
+            }
+        };
+        try {
+            assertTrue(migration.migrate(publicEntry.id));
+            String oldRecord = library.prefs.getString("movie." + old.id, null);
+            String publicRecord = library.prefs.getString("movie." + publicEntry.id, null);
+            ContentValues occupiedValues = new ContentValues();
+            occupiedValues.put(MediaStore.MediaColumns.DISPLAY_NAME, privateName);
+            occupiedValues.put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4");
+            occupiedValues.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/" + folder + "/");
+            occupied = app.getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, occupiedValues);
+            assertNotNull(occupied);
+            try (OutputStream out = app.getContentResolver().openOutputStream(occupied)) {
+                assertNotNull(out);
+                out.write("new".getBytes(StandardCharsets.UTF_8));
+            }
+            try (ActivityScenario<MainActivity> ignored = ActivityScenario.launch(MainActivity.class)) {
+                instrumentation.addMonitor(picker);
+                try {
+                    clickControl("导出全部");
+                    clickControl("Use this folder");
+                    clickControl("Allow");
+                } finally {
+                    instrumentation.removeMonitor(picker);
+                }
+                String copy = "Private # (1).mp4";
+                Uri copied = DocumentsContract.buildDocumentUriUsingTree(tree, folderId + "/" + copy);
+                Uri copiedPublic = DocumentsContract.buildDocumentUriUsingTree(tree, folderId + "/" + publicName);
+                long timeout = SystemClock.elapsedRealtime() + 15000;
+                while ((!exportedFileExists(copied) || !exportedFileExists(copiedPublic)) &&
+                        SystemClock.elapsedRealtime() < timeout)
+                    SystemClock.sleep(100);
+                assertBytes(occupied, "new".getBytes(StandardCharsets.UTF_8));
+                assertBytes(copied, original);
+                assertBytes(copiedPublic, modern);
+                MovieExporter.Result repeated = new MovieExporter(library).export(old.id, tree);
+                assertTrue(repeated.existing);
+                assertEquals(copy, repeated.name);
+                Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, folderId);
+                try (Cursor files = app.getContentResolver().query(children,
+                        new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
+                    assertNotNull(files);
+                    assertEquals(3, files.getCount());
+                }
+                assertBytes(library.uri(publicEntry), modern);
+                assertArrayEquals(original, Files.readAllBytes(library.file(old).toPath()));
+                assertEquals(oldRecord, library.prefs.getString("movie." + old.id, null));
+                assertEquals(publicRecord, library.prefs.getString("movie." + publicEntry.id, null));
+            }
+        } finally {
+            library.remove(library.find(old.id));
+            library.remove(library.find(publicEntry.id));
+            if (occupied != null) app.getContentResolver().delete(occupied, null, null);
+            try (InputStream done = new ParcelFileDescriptor.AutoCloseInputStream(
+                    instrumentation.getUiAutomation().executeShellCommand("rm -r /sdcard/Download/" + folder))) {
+                while (done.read() != -1) { /* wait for the disposable test directory to be removed */ }
+            }
+        }
+    }
+
+    @Test public void openingLibraryPreservesPrivateMovieUntilUserConfirmsMigration() throws Exception {
         byte[] bytes = {1, 1, 2, 3, 5};
         VideoLibrary.Entry old = legacy("自动迁移-" + UUID.randomUUID() + ".mp4", bytes, bytes.length);
         File source = library.file(old);
@@ -108,6 +219,12 @@ public final class LegacyDownloadMigrationTest {
         Uri importedUri = Uri.parse("content://example.document/" + UUID.randomUUID());
         library.remember(importedUri, "外部文件.mp4", 5L);
         try (ActivityScenario<MainActivity> ignored = ActivityScenario.launch(MainActivity.class)) {
+            clickControl("迁移历史下载");
+            clickControl("取消");
+            assertArrayEquals(bytes, Files.readAllBytes(source.toPath()));
+            assertFalse(library.find(old.id).publicDownload);
+            clickControl("迁移历史下载");
+            clickControl("开始迁移");
             long timeout = SystemClock.elapsedRealtime() + 20000;
             while (source.exists() && SystemClock.elapsedRealtime() < timeout) SystemClock.sleep(50);
             assertFalse("Home did not migrate the legacy file", source.exists());

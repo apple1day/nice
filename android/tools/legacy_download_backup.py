@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Back up/restore Nice VR 1.2 downloads on your own USB-debugging device (Android owner profile)."""
+"""Export or back up/restore Nice VR 1.2 downloads on your own USB-debugging device (Android owner profile)."""
 import argparse
 import hashlib
 import json
@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 
 PACKAGE = "com.anxiong.nicevideos.vr.preview"
 MOVIES = "/sdcard/Android/data/" + PACKAGE + "/files/Movies"
+PUBLIC = "/sdcard/Download/NiceVideos"
 STAGING = "files/legacy_download_restore"
 PREFS = ("video_positions.xml", "vr_gestures.xml", "video_library.xml")  # Commit catalog last.
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -70,7 +71,7 @@ class Device:
                 return True
         return False
 
-    def stop(self, restoring):
+    def check_installation(self, restoring):
         owner = self.run("am get-current-user", stdout=subprocess.PIPE).stdout.strip()
         require(owner == b"0", "Switch to the Android owner profile (user 0).")
         self.app("true")
@@ -79,6 +80,9 @@ class Device:
         require(version, "Cannot determine the installed Nice app version.")
         require(int(version[1]) >= 4 if restoring else int(version[1]) == 3,
                 "Backup needs the old 1.2.0 trial (code 3); restore needs the updated app (code 4 or newer).")
+
+    def stop(self, restoring):
+        self.check_installation(restoring)
         self.run("am force-stop " + PACKAGE)
 
     def digest(self, path):
@@ -353,15 +357,152 @@ def restore(device, root):
     print("Verified restore complete. Open the updated Nice app to migrate the historical downloads.")
 
 
+def export_title(title, private_name):
+    # Match the app's public naming rules. Leave space within NAME_MAX for collision suffixes.
+    name = re.sub(r'[\x00-\x1f\x7f\\/:*?"<>|]', "_", title).strip().strip(". ")
+    name = name or private_name
+    stem, suffix = os.path.splitext(name)
+    if len(suffix.encode("utf-8")) > 32:
+        stem, suffix = name, ""
+    budget = 240 - len(suffix.encode("utf-8"))
+    return stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore"), suffix
+
+
+# Executed entirely on the phone. Only the source reader may need run-as. The regular USB
+# shell owns the public writes. All dynamic strings are positional parameters, never shell code.
+EXPORT_COPY = r"""
+set -eu
+folder=$1
+stem=$2
+suffix=$3
+source=$4
+size=$5
+digest=$6
+package=$7
+umask 077
+test ! -L "$folder"
+mkdir -p "$folder"
+cd "$folder"
+part=''
+reserved=''
+identity=''
+cleanup() {
+    if [ -n "$part" ]; then rm -f "$part"; fi
+    # Remove only the same zero-byte reservation if publication or the USB session failed.
+    if [ -n "$reserved" ] && [ -n "$identity" ] && [ ! -L "$reserved" ] &&
+       [ "$(stat -c '%d:%i:%s' "$reserved" 2>/dev/null)" = "$identity" ]; then rm -f "$reserved"; fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+matches() {
+    [ ! -L "$1" ] && [ -f "$1" ] && [ "$(stat -c %s "$1")" = "$size" ] || return 1
+    actual=$(sha256sum < "$1") && [ "${actual%% *}" = "$digest" ]
+}
+index=0
+while :; do
+    if [ "$index" = 0 ]; then name="$stem$suffix"; else name="$stem ($index)$suffix"; fi
+    target="./$name"
+    if matches "$target"; then
+        printf 'Reused\t%s\n' "$name"
+        exit 0
+    fi
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        if [ -z "$part" ]; then
+            part=$(mktemp .nice-export-XXXXXX)
+            if [ -z "$package" ]; then cat "$source" > "$part"; else run-as "$package" cat "$source" > "$part"; fi
+            matches "$part" || { echo "Export verification failed for $source" >&2; exit 1; }
+        fi
+        # noclobber reserves a new name exclusively, including against another concurrent export.
+        # Rename the already verified file on the same volume, so readers never see partial bytes.
+        if (set -C; : > "$target") 2>/dev/null; then
+            reserved=$target
+            identity=$(stat -c '%d:%i:%s' "$reserved")
+            case "$identity" in *:0) ;; *) reserved=''; echo "Destination changed: $name" >&2; exit 1 ;; esac
+            if ! mv -fT "$part" "$target"; then
+                echo "Could not publish $name; the original video is intact." >&2
+                exit 1
+            fi
+            part=''
+            reserved=''
+            printf 'Copied\t%s\n' "$name"
+            exit 0
+        fi
+        # Another writer may have filled this slot while the movie was copying.
+        if matches "$target"; then printf 'Reused\t%s\n' "$name"; exit 0; fi
+        [ -e "$target" ] || [ -L "$target" ] || { echo "Cannot create $name" >&2; exit 1; }
+    fi
+    index=$((index + 1))
+done
+"""
+
+
+def export_downloads(device):
+    device.check_installation(restoring=False)
+    path = device.pref("video_library.xml")
+    require(path, "No download catalog found in this installation. Keep the old app installed.")
+    data = device.app("cat " + path, stdout=subprocess.PIPE).stdout
+    require(len(data) < 32 * 1024 * 1024, "Unexpectedly large preferences file.")
+    root = ET.fromstring(data)
+    require(root.tag == "map", "Invalid download catalog.")
+    ready = []
+    unfinished = 0
+    for node in root:
+        key = node.get("name", "")
+        if key.startswith("movie."):
+            movie = json.loads(node.text)
+            disk = movie.get("disk")
+            if not disk:
+                continue  # Files opened with Android's document picker already live outside the app.
+            require(key == "movie." + movie["id"] and re.fullmatch(UUID, movie["id"])
+                    and MOVIE.fullmatch(disk) and not movie.get("publicDownload"),
+                    "Unexpected entry in the old download catalog.")
+            if movie.get("state", "ready") == "ready":
+                ready.append(movie)
+            else:
+                unfinished += 1
+    if unfinished:
+        print(f"Skipped {unfinished} unfinished or failed download(s).")
+    if not ready:
+        print("No completed downloads to export.")
+        return
+    require(device.select_movies_access(restoring=False),
+            "USB debugging cannot read the old Movies directory on this device. Keep the old app installed.")
+    copied = reused = 0
+    for index, movie in enumerate(ready, 1):
+        source = MOVIES + "/" + movie["disk"]
+        stem, suffix = export_title(movie.get("name") or movie["disk"], movie["disk"])
+        print(f"[{index}/{len(ready)}] {stem}{suffix}", flush=True)
+        item = device.digest(source)
+        require(item and item["bytes"] > 0 and
+                (movie.get("bytes", -1) < 0 or item["bytes"] == movie["bytes"]),
+                f"Completed video missing or incomplete: {source}. Previous exports and originals are preserved.")
+        args = [PUBLIC, stem, suffix, source, str(item["bytes"]), item["sha256"],
+                "" if device.external == device.run else PACKAGE]
+        command = "sh -c " + shlex.quote(EXPORT_COPY) + " nice-export " + " ".join(map(shlex.quote, args))
+        result = device.run(command, stdout=subprocess.PIPE).stdout.decode().rstrip("\n")
+        outcome, filename = result.split("\t", 1)
+        require(outcome in ("Copied", "Reused"), "Unexpected export result.")
+        copied += int(outcome == "Copied")
+        reused += int(outcome == "Reused")
+        print(f"  {outcome}: {PUBLIC}/{filename}", flush=True)
+    print(f"Verified export complete: {copied} copied, {reused} already present. {PUBLIC}/")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("backup", "restore"))
-    parser.add_argument("directory", type=Path)
+    parser.add_argument("mode", choices=("backup", "restore", "export"))
+    parser.add_argument("directory", nargs="?", type=Path, help="Computer backup directory for backup and restore")
     parser.add_argument("--serial", help="ADB device serial if multiple devices are connected")
     args = parser.parse_args()
+    if (args.mode == "export") != (args.directory is None):
+        parser.error("Use export with no directory; backup and restore require a computer directory.")
     os.umask(0o077)
     try:
-        (backup if args.mode == "backup" else restore)(Device(args.serial), args.directory.expanduser())
+        device = Device(args.serial)
+        if args.mode == "export":
+            export_downloads(device)
+        else:
+            (backup if args.mode == "backup" else restore)(device, args.directory.expanduser())
     except (ValueError, OSError, ET.ParseError, subprocess.CalledProcessError, KeyError, TypeError) as error:
         sys.exit(f"Stopped: {error}")
 

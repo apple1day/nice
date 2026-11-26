@@ -42,6 +42,8 @@ final class LegacyDownloadMigration {
         journal = library.context.getSharedPreferences("legacy_download_migration", 0);
     }
 
+    java.util.Set<String> pendingIds() { return journal.getAll().keySet(); }
+
     static boolean needsMigration(VideoLibrary.Entry e) {
         return e != null && e.downloaded() && !e.publicDownload && VideoLibrary.READY.equals(e.state);
     }

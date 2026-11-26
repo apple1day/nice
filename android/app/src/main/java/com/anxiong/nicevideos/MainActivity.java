@@ -15,6 +15,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.text.TextUtils;
@@ -28,7 +29,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
-    private static final int PICK = 30, WRITE_DOWNLOADS = 31;
+    private static final int PICK = 30, WRITE_DOWNLOADS = 31, EXPORT_FOLDER = 32;
+    private static final String MIGRATION_REQUESTED = "migrateLegacyDownloads";
+    private MovieExportTask exports;
+    private String pendingExportId; // Empty string selects all completed downloads.
+    private TextView exportAll;
     private final ExecutorService migrations = Executors.newSingleThreadExecutor();
     private final Set<String> missing = new HashSet<>();
     private boolean migrating, rescanAfterMigration;
@@ -58,10 +63,16 @@ public final class MainActivity extends Activity {
         if ("com.anxiong.nicevideos.PREPARE_RESTORE".equals(getIntent().getAction())) {
             // Android 11+ provisions this app-specific folder through the framework.
             getExternalFilesDir(android.os.Environment.DIRECTORY_MOVIES);
+            if (new VideoLibrary(this).all().isEmpty()) {
+                getSharedPreferences("download_options", MODE_PRIVATE).edit().putBoolean(MIGRATION_REQUESTED, true).apply();
+            }
             finish();
             return;
         }
         library = new VideoLibrary(this);
+        exports = (MovieExportTask) getLastNonConfigurationInstance();
+        if (exports == null) exports = new MovieExportTask(library);
+        if (state != null) pendingExportId = state.getString("exportId");
         if (state != null) { server = state.getBoolean("server"); filter = state.getInt("filter"); }
         if (state != null && state.containsKey("downloadUrl")) {
             requestedDownload = new ServerVideos.Movie(state.getString("downloadName"),
@@ -71,11 +82,13 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         build();
+        exports.listen(() -> { updatePanel(); refreshRows(); });
         if (server && !address().isEmpty()) fetch();
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
+        state.putString("exportId", pendingExportId);
         state.putBoolean("server", server); state.putInt("filter", filter);
         if (requestedDownload != null) {
             state.putString("downloadName", requestedDownload.name);
@@ -142,6 +155,7 @@ public final class MainActivity extends Activity {
     }
 
     private void updatePanel() {
+        exportAll = null;
         panel.removeAllViews();
         LinearLayout heading = row(); panel.addView(heading, -1, dp(50));
         heading.addView(text(server ? "服务器影片" : "本地影片", 21, INK, true), fillWidth(-1));
@@ -153,6 +167,8 @@ public final class MainActivity extends Activity {
                 url.setEllipsize(TextUtils.TruncateAt.END); panel.addView(url);
             }
         } else {
+            exportAll = pill("导出全部", false, () -> pickExportFolder(""));
+            heading.addView(exportAll); gap(heading);
             heading.addView(pill("打开文件", true, this::pick));
             LinearLayout chips = row(); chips.setPadding(0, dp(7), 0, 0); panel.addView(chips);
             String[] names = {"全部", "收藏", "已下载"};
@@ -163,11 +179,8 @@ public final class MainActivity extends Activity {
                 chips.addView(chip); gap(chips);
             }
             if (library.all().stream().anyMatch(LegacyDownloadMigration::needsMigration)) {
-                TextView migrate = pill(migrating ? "正在迁移…" : "迁移历史下载", false, () -> {
-                    if (canWriteDownloads()) startMigration();
-                    else requestDownloadPermission();
-                });
-                migrate.setEnabled(!migrating);
+                TextView migrate = pill(migrating ? "正在迁移…" : "迁移历史下载", false, this::confirmMigration);
+                migrate.setEnabled(!migrating && !exports.running());
                 panel.addView(migrate, -1, dp(44));
             }
         }
@@ -175,8 +188,10 @@ public final class MainActivity extends Activity {
 
     private void refreshRows() {
         rows.clear(); sources.clear();
+        boolean hasExport = false;
         for (VideoLibrary.Entry e : library.all()) {
             if (e.downloaded()) sources.put(e.source, e);
+            hasExport |= MovieExporter.eligible(e) && !missing.contains(e.id);
             if (!server && (filter == 0 || (filter == 1 && e.favorite) || (filter == 2 && e.downloaded()))) rows.add(e);
         }
         if (server) rows.addAll(remote);
@@ -190,7 +205,13 @@ public final class MainActivity extends Activity {
             message = filter == 1 ? "还没有收藏。可在影片右侧菜单中加入收藏。" : filter == 2 ?
                     "还没有离线副本。可从服务器选择影片下载。" : "点「打开文件」选择视频。手机或外接盘上的影片可直接从原位置播放。";
         }
+        if (exportAll != null) {
+            boolean enabled = hasExport && !exports.running() && !migrating;
+            exportAll.setEnabled(enabled);
+            exportAll.setAlpha(enabled ? 1f : .5f);
+        }
         if (!server && !migrationStatus.isEmpty()) message = migrationStatus;
+        if (!server && !exports.status().isEmpty() && !migrating) message = exports.status();
         feedback.setText(message); feedback.setVisibility(message.isEmpty() ? View.GONE : View.VISIBLE);
         adapter.notifyDataSetChanged();
     }
@@ -203,8 +224,37 @@ public final class MainActivity extends Activity {
         catch (ActivityNotFoundException ex) { toast("系统文件选择器不可用。"); }
     }
 
+    private void pickExportFolder(String id) {
+        if (migrating || exports.running() || pendingExportId != null) return;
+        Intent choose = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                .putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        pendingExportId = id;
+        try { startActivityForResult(choose, EXPORT_FOLDER); }
+        catch (ActivityNotFoundException ex) { pendingExportId = null; toast("系统文件夹选择器不可用。"); }
+    }
+
+    private void acceptExportFolder(int result, Intent data) {
+        String id = pendingExportId;
+        pendingExportId = null;
+        if (id == null || result != RESULT_OK || data == null || data.getData() == null) return;
+        Uri tree = data.getData();
+        if (!"content".equals(tree.getScheme()) || !DocumentsContract.isTreeUri(tree)) {
+            toast("请选择可写入的文件夹。");
+            return;
+        }
+        List<VideoLibrary.Entry> selection = new ArrayList<>();
+        for (VideoLibrary.Entry e : library.all()) {
+            if ((id.isEmpty() || id.equals(e.id)) && MovieExporter.eligible(e) && !missing.contains(e.id))
+                selection.add(e);
+        }
+        if (selection.isEmpty()) { toast("没有可以导出的已完成下载。"); return; }
+        exports.start(selection, tree);
+    }
+
     @Override protected void onActivityResult(int code, int result, Intent data) {
         super.onActivityResult(code, result, data);
+        if (code == EXPORT_FOLDER) { acceptExportFolder(result, data); return; }
         if (code != PICK || result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         if (!"content".equals(uri.getScheme())) { toast("请选择系统文件提供方中的视频。"); return; }
@@ -292,6 +342,12 @@ public final class MainActivity extends Activity {
             refreshRows();
             return true;
         });
+        if (MovieExporter.eligible(e) && !missing.contains(e.id)) {
+            menu.getMenu().add("导出到文件夹").setEnabled(!migrating && !exports.running()).setOnMenuItemClickListener(item -> {
+                pickExportFolder(e.id);
+                return true;
+            });
+        }
         if (e.publicDownload && !VideoLibrary.TRANSFER.equals(e.state)) {
             menu.getMenu().add("从列表移除").setOnMenuItemClickListener(item -> {
                 library.forget(e); missing.remove(e.id); refreshRows();
@@ -390,13 +446,27 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void confirmMigration() {
+        new AlertDialog.Builder(this).setTitle("迁移历史下载？")
+                .setMessage("影片会移到 Download/NiceVideos，校验成功后会清理旧文件。要同时保留原件，请使用「导出全部」。")
+                .setNegativeButton("取消", null).setPositiveButton("开始迁移", (d, w) -> {
+                    exports.clearStatus();
+                    getSharedPreferences("download_options", MODE_PRIVATE).edit().putBoolean(MIGRATION_REQUESTED, true).apply();
+                    if (canWriteDownloads()) startMigration();
+                    else requestDownloadPermission();
+                }).show();
+    }
+
     private void startMigration() {
-        if (!canWriteDownloads()) return;
+        if (!canWriteDownloads() || exports.running() || pendingExportId != null) return;
+        boolean batch = getSharedPreferences("download_options", MODE_PRIVATE).getBoolean(MIGRATION_REQUESTED, false);
+        LegacyDownloadMigration migration = new LegacyDownloadMigration(library);
+        Set<String> pending = migration.pendingIds();
+        if (!batch && pending.isEmpty()) return;
         if (migrating) { rescanAfterMigration = true; return; }
         migrating = true;
         updatePanel();
         migrations.execute(() -> {
-            LegacyDownloadMigration migration = new LegacyDownloadMigration(library);
             String problem = "";
             int moved = 0;
             try {
@@ -404,7 +474,7 @@ public final class MainActivity extends Activity {
             } catch (IOException | RuntimeException ex) { problem = error(ex); }
             for (VideoLibrary.Entry entry : library.all()) {
                 if (Thread.currentThread().isInterrupted()) return;
-                if (!LegacyDownloadMigration.needsMigration(entry)) continue;
+                if ((!batch && !pending.contains(entry.id)) || !LegacyDownloadMigration.needsMigration(entry)) continue;
                 main.post(() -> {
                     if (live()) { migrationStatus = "正在迁移：" + entry.name; refreshRows(); }
                 });
@@ -419,6 +489,9 @@ public final class MainActivity extends Activity {
             main.post(() -> {
                 if (!live()) return;
                 migrating = false; migrationStatus = summary;
+                if (library.all().stream().noneMatch(e -> LegacyDownloadMigration.needsMigration(e)
+                        || (e.downloaded() && !e.publicDownload && VideoLibrary.TRANSFER.equals(e.state))))
+                    getSharedPreferences("download_options", MODE_PRIVATE).edit().remove(MIGRATION_REQUESTED).apply();
                 updatePanel(); refreshRows();
                 if (rescanAfterMigration) { rescanAfterMigration = false; startMigration(); }
             });
@@ -430,7 +503,13 @@ public final class MainActivity extends Activity {
         if (library != null) { updatePanel(); refreshRows(); poll(); checkPublicFiles(); startMigration(); }
     }
     @Override protected void onPause() { resumed = false; main.removeCallbacks(pollLater); super.onPause(); }
+    @Override public Object onRetainNonConfigurationInstance() { return exports; }
+
     @Override protected void onDestroy() {
+        if (exports != null) {
+            exports.listen(null);
+            if (!isChangingConfigurations()) exports.close();
+        }
         main.removeCallbacksAndMessages(null); network.shutdownNow(); documents.shutdownNow(); jobs.shutdownNow(); migrations.shutdownNow();
         super.onDestroy();
     }

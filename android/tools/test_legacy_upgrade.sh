@@ -21,8 +21,27 @@ adb install "$work/old.apk"
 echo "Downloading a video using the shipped 1.2.0 app"
 python3 tools/seed_upgrade_movie.py app/build/generated/playbackFixtures/moving-sbs.mp4 > "$work/old-movie"
 read -r movie disk job < "$work/old-movie"
+shared=/sdcard/Download/NiceVideos
+fixture=app/build/generated/playbackFixtures/moving-sbs.mp4
+echo "Exporting from the original installation without replacing the app or its files"
+adb shell -T "mkdir -p '$shared' && test ! -e '$shared/Upgrade test.mp4' && test ! -e '$shared/Upgrade test (1).mp4'"
+printf 'Original unrelated video' > "$work/occupied"
+adb push "$work/occupied" "$shared/Upgrade test.mp4"
+adb exec-out "run-as $package cat shared_prefs/video_library.xml" > "$work/original-library.xml"
+adb exec-out "run-as $package cat shared_prefs/video_positions.xml" > "$work/original-positions.xml"
+python3 tools/legacy_download_backup.py export
+adb exec-out "cat '$shared/Upgrade test (1).mp4'" | cmp "$fixture" -
+python3 tools/legacy_download_backup.py export
+adb exec-out "cat '$shared/Upgrade test.mp4'" | cmp "$work/occupied" -
+adb exec-out "cat '$shared/Upgrade test (1).mp4'" | cmp "$fixture" -
+adb shell -T "test ! -e '$shared/Upgrade test (2).mp4'"
+adb exec-out "run-as $package cat shared_prefs/video_library.xml" | cmp "$work/original-library.xml" -
+adb exec-out "run-as $package cat shared_prefs/video_positions.xml" | cmp "$work/original-positions.xml" -
+echo "Verified the shared export, repeat export, occupied filename, and unchanged old catalog and bookmarks."
+adb shell -T "rm '$shared/Upgrade test.mp4' '$shared/Upgrade test (1).mp4'"
 echo "Verifying the backup and restore of DownloadManager job $job"
 python3 tools/legacy_download_backup.py backup "$work/backup"
+cmp "$fixture" "$work/backup/Movies/$disk"
 adb uninstall "$package"
 adb install app/build/outputs/apk/debug/app-debug.apk
 python3 tools/legacy_download_backup.py restore "$work/backup"
