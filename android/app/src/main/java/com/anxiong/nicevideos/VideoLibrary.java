@@ -271,10 +271,13 @@ final class VideoLibrary {
             e.publicDownload = true; e.publicUri = "";
             long space = Environment.getExternalStorageDirectory().getUsableSpace();
             if (e.bytes > 0 && space > 0 && space < e.bytes) throw new IOException("本机剩余空间不足。");
+            // DownloadManager appends the subpath as an encoded URI path. Encode the filename
+            // so that a literal #, +, or % on the server also reaches the filesystem unchanged.
+            String subPath = PUBLIC_FOLDER + "/" + Uri.encode(e.disk);
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(e.source)).setTitle(e.name)
                     .setDescription("Nice 视频 · Download/" + PUBLIC_FOLDER)
                     .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                    .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, PUBLIC_FOLDER + "/" + e.disk);
+                    .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, subPath);
             req.allowScanningByMediaScanner();
             e.job = manager().enqueue(req);
             e.state = TRANSFER; e.error = ""; e.time = System.currentTimeMillis();
