@@ -1,18 +1,23 @@
-# Nice 视频 · Android
+# Nice 视频 1.0 原版 · 导出已下载影片
 
-[下载 NiceVideos.apk](./NiceVideos.apk)
+这个分支基于 83,397 字节的 Android 1.0.0（`com.anxiong.nicevideos`）。1.0.1 在「本地」增加「导出全部」，也可以在影片菜单点「导出到文件夹」。通过系统文件选择器选中一个公共子目录，导出完成后即可在手机文件管理器按片名找到副本。导出只复制完成的下载，保留原片、收藏和续播位置。
 
-Android 8.0（API 26）及以上的手机和平板可以安装本目录的测试版 APK。它使用 Android 自带的媒体解码器和 OpenGL ES 2.0。安装 APK 或用 Android Studio 打开本目录均可，无需运行 iOS 工程。
+## 已经安装了仓库发布的 83 KB 原版
 
-## 安装试用
+请保留手机上的原 App。仓库先后发布过两份同样大小的 1.0.0 APK，各自使用构建机生成的调试签名，构建流程只保存了 APK 和测试结果。更新已安装的 App 需要与手机上那份 APK 匹配的签名私钥。当前分支的 `NiceVideos.apk` 是存档的 1.0.0。`NiceVideos-1.0.1-classic-export-unsigned.apk` 是供原签名持有人签署的 1.0.1。
 
-将 `NiceVideos.apk` 传到设备，在系统文件管理器中点开安装。如果系统询问是否允许本次来源安装应用，可给打开 APK 的文件管理器授权。已连接 USB 调试的 Mac 也可在仓库根目录执行：
+**只要把现有视频导出到手机公共目录**，可在 Mac 上下载 [export_classic.py](./tools/export_classic.py)，用 USB 数据线连接手机，在开发者选项开启「USB 调试」，并在手机上确认允许这台电脑调试。工具需要 Python 3 以及 Android SDK Platform Tools。使用 Homebrew 的 Mac 可用 `brew install --cask android-platform-tools` 安装后者。假设脚本保存到了 Mac 的「下载」：
 
 ```sh
-adb install -r android/NiceVideos.apk
+adb devices
+python3 "$HOME/Downloads/export_classic.py"
 ```
 
-这是用于侧载试用的 debug 签名包。覆盖更新需要使用相同的签名证书。
+等设备状态显示为 `device` 再执行第二行。完成后打开手机「文件管理 → 内部存储 → Download → NiceVideos」。影片在手机内复制，脚本校验大小及 SHA-256。再次导出会复用相同内容，和已有文件同名但内容不同的副本会增加编号。原文件保留，因此手机要有足够的剩余空间。此命令针对 Android 主用户安装的 1.0.0 调试包。如果有多个设备，使用 `python3 "$HOME/Downloads/export_classic.py" --serial 设备编号`。如果系统限制读取，工具会报告失败的影片，请继续保留旧 App。
+
+## 有原始签名密钥的安装
+
+使用本地 Android SDK Build Tools 的 `apksigner` 对 1.0.1 的未签名 APK 签名。将原版 APK 与签好名的新包分别传给 `apksigner verify --print-certs`，核对输出的证书 SHA-256。签名私钥和口令可一直保存在原构建电脑上。签名相同时，在设备上直接打开已签名的 1.0.1 并选「更新」，也可执行 `adb install -r 已签名的1.0.1.apk`。如果系统提示签名不同，请保留原安装，使用上面的 USB 导出。
 
 ## 播放
 
@@ -29,10 +34,10 @@ adb install -r android/NiceVideos.apk
 
 ```sh
 cd android
-./gradlew :app:assembleDebug
+./gradlew :app:assembleRelease
 ```
 
-输出为 `app/build/outputs/apk/debug/app-debug.apk`。运行设备测试另需 FFmpeg、Python 3 和一台 Android 设备或模拟器。测试资源由 Gradle 生成，只放入测试包。
+待签名产物在 `app/build/outputs/apk/release/app-release-unsigned.apk`。运行设备测试另需 FFmpeg、Python 3 和一台 Android 设备或模拟器。测试资源由 Gradle 生成，只放入测试包。
 
 ```sh
 ./gradlew :app:connectedDebugAndroidTest

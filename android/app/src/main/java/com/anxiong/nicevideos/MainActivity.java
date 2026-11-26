@@ -12,6 +12,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.text.TextUtils;
@@ -25,7 +26,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
-    private static final int PICK = 30;
+    private static final int PICK = 30, EXPORT_FOLDER = 31;
     private static final int INK = 0xfff4f7f8, MUTED = 0xff9ca9b0, ACCENT = 0xff9ee5d6,
             BG = 0xff10171b, CARD = 0xff1b262d, ACTIVE = 0xff28423f;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -37,6 +38,9 @@ public final class MainActivity extends Activity {
     private final Map<String, VideoLibrary.Transfer> progress = new HashMap<>();
     private List<ServerVideos.Movie> remote = new ArrayList<>();
     private VideoLibrary library;
+    private MovieExportTask exports;
+    private String pendingExportId; // Empty string selects all completed downloads.
+    private TextView exportAll;
     private Rows adapter;
     private LinearLayout panel;
     private TextView feedback;
@@ -47,15 +51,20 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         library = new VideoLibrary(this);
+        exports = (MovieExportTask) getLastNonConfigurationInstance();
+        if (exports == null) exports = new MovieExportTask(library);
+        if (state != null) pendingExportId = state.getString("exportId");
         if (state != null) { server = state.getBoolean("server"); filter = state.getInt("filter"); }
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         build();
+        exports.listen(this::refreshRows);
         if (server && !address().isEmpty()) fetch();
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
+        state.putString("exportId", pendingExportId);
         state.putBoolean("server", server); state.putInt("filter", filter);
     }
 
@@ -116,6 +125,7 @@ public final class MainActivity extends Activity {
     }
 
     private void updatePanel() {
+        exportAll = null;
         panel.removeAllViews();
         LinearLayout heading = row(); panel.addView(heading, -1, dp(50));
         heading.addView(text(server ? "服务器影片" : "本地影片", 21, INK, true), fillWidth(-1));
@@ -127,6 +137,8 @@ public final class MainActivity extends Activity {
                 url.setEllipsize(TextUtils.TruncateAt.END); panel.addView(url);
             }
         } else {
+            exportAll = pill("导出全部", false, () -> pickExportFolder(""));
+            heading.addView(exportAll); gap(heading);
             heading.addView(pill("打开文件", true, this::pick));
             LinearLayout chips = row(); chips.setPadding(0, dp(7), 0, 0); panel.addView(chips);
             String[] names = {"全部", "收藏", "已下载"};
@@ -140,9 +152,11 @@ public final class MainActivity extends Activity {
     }
 
     private void refreshRows() {
+        boolean hasExport = false;
         rows.clear(); sources.clear();
         for (VideoLibrary.Entry e : library.all()) {
             if (e.downloaded()) sources.put(e.source, e);
+            if (MovieExporter.eligible(e)) hasExport = true;
             if (!server && (filter == 0 || (filter == 1 && e.favorite) || (filter == 2 && e.downloaded()))) rows.add(e);
         }
         if (server) rows.addAll(remote);
@@ -156,6 +170,12 @@ public final class MainActivity extends Activity {
             message = filter == 1 ? "还没有收藏。可在影片右侧菜单中加入收藏。" : filter == 2 ?
                     "还没有离线副本。可从服务器选择影片下载。" : "点「打开文件」选择视频。手机或外接盘上的影片可直接从原位置播放。";
         }
+        if (exportAll != null) {
+            boolean enabled = hasExport && !exports.running();
+            exportAll.setEnabled(enabled);
+            exportAll.setAlpha(enabled ? 1f : .5f);
+        }
+        if (!server && !exports.status().isEmpty()) message = exports.status();
         feedback.setText(message); feedback.setVisibility(message.isEmpty() ? View.GONE : View.VISIBLE);
         adapter.notifyDataSetChanged();
     }
@@ -168,8 +188,37 @@ public final class MainActivity extends Activity {
         catch (ActivityNotFoundException ex) { toast("系统文件选择器不可用。"); }
     }
 
+    private void pickExportFolder(String id) {
+        if (exports.running() || pendingExportId != null) return;
+        Intent choose = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                .putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        pendingExportId = id;
+        try { startActivityForResult(choose, EXPORT_FOLDER); }
+        catch (ActivityNotFoundException ex) { pendingExportId = null; toast("系统文件夹选择器不可用。"); }
+    }
+
+    private void acceptExportFolder(int result, Intent data) {
+        String id = pendingExportId;
+        pendingExportId = null;
+        if (id == null || result != RESULT_OK || data == null || data.getData() == null) return;
+        Uri tree = data.getData();
+        if (!"content".equals(tree.getScheme()) || !DocumentsContract.isTreeUri(tree)) {
+            toast("请选择可写入的文件夹。");
+            return;
+        }
+        List<VideoLibrary.Entry> selection = new ArrayList<>();
+        for (VideoLibrary.Entry e : library.all()) {
+            if ((id.isEmpty() || id.equals(e.id)) && MovieExporter.eligible(e))
+                selection.add(e);
+        }
+        if (selection.isEmpty()) { toast("没有可以导出的已完成下载。"); return; }
+        exports.start(selection, tree);
+    }
+
     @Override protected void onActivityResult(int code, int result, Intent data) {
         super.onActivityResult(code, result, data);
+        if (code == EXPORT_FOLDER) { acceptExportFolder(result, data); return; }
         if (code != PICK || result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         if (!"content".equals(uri.getScheme())) { toast("请选择系统文件提供方中的视频。"); return; }
@@ -241,6 +290,11 @@ public final class MainActivity extends Activity {
             if (current != null) { current.favorite = !current.favorite; library.save(current); refreshRows(); }
             return true;
         });
+        if (MovieExporter.eligible(e)) {
+            menu.getMenu().add("导出到文件夹").setEnabled(!exports.running()).setOnMenuItemClickListener(item -> {
+                pickExportFolder(e.id); return true;
+            });
+        }
         menu.getMenu().add(!e.downloaded() ? "从最近播放移除" : VideoLibrary.TRANSFER.equals(e.state) ?
                 "取消下载" : "删除本机副本").setOnMenuItemClickListener(item -> { confirmRemove(e); return true; });
         menu.show();
@@ -298,7 +352,11 @@ public final class MainActivity extends Activity {
         if (library != null) { refreshRows(); poll(); }
     }
     @Override protected void onPause() { resumed = false; main.removeCallbacks(pollLater); super.onPause(); }
+    @Override public Object onRetainNonConfigurationInstance() { return exports; }
+
     @Override protected void onDestroy() {
+        exports.listen(null);
+        if (!isChangingConfigurations()) exports.close();
         main.removeCallbacksAndMessages(null); network.shutdownNow(); documents.shutdownNow(); jobs.shutdownNow();
         super.onDestroy();
     }

@@ -1,15 +1,10 @@
-name: Android APK and playback tests
+name: Classic Android 1.0 export
 on:
   push:
-    branches: [main]
+    branches: [fix/android-classic-export]
     paths:
       - 'android/**'
-      - '!android/NiceVideos.apk'
-      - '.github/workflows/android.yml'
-  pull_request:
-    paths:
-      - 'android/**'
-      - '!android/NiceVideos.apk'
+      - '!android/*.apk'
       - '.github/workflows/android.yml'
   workflow_dispatch:
 
@@ -22,6 +17,8 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -33,73 +30,71 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y ffmpeg
           fi
-      - name: Assemble app and tests
+      - name: Build the classic app, unsigned release and device tests
         working-directory: android
-        run: ./gradlew --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest
-      - name: Verify the installable APK
+        run: ./gradlew --stacktrace :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest
+      - name: Verify package identity and release output
         working-directory: android
         run: |
           set -euo pipefail
-          cp app/build/outputs/apk/debug/app-debug.apk NiceVideos.apk
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs NiceVideos.apk
-          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging NiceVideos.apk | sed -n '1,15p'
-          sha256sum NiceVideos.apk
-      - uses: actions/upload-artifact@v4
-        with:
-          name: NiceVideos-Android
-          path: android/NiceVideos.apk
-      - name: Enable KVM for Android Emulator
+          apk=app/build/outputs/apk/release/app-release-unsigned.apk
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          "$tools/aapt" dump badging "$apk" > "$RUNNER_TEMP/classic-badging.txt"
+          grep -F "package: name='com.anxiong.nicevideos' versionCode='2' versionName='1.0.1'" "$RUNNER_TEMP/classic-badging.txt"
+          if "$tools/apksigner" verify "$apk"; then echo "Expected an unsigned artifact for signing by the original owner"; exit 1; fi
+          cp "$apk" NiceVideos-1.0.1-classic-export-unsigned.apk
+      - name: Enable KVM
         run: sudo chmod 666 /dev/kvm
-      - name: Test installed APK on Android
+      - name: Run playback and folder export tests on Android 11
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 30
           arch: x86_64
           target: default
+          disk-size: 12G
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: cd android && ./gradlew :app:connectedDebugAndroidTest
-      - name: Verify tested artifact and publish test counts
-        working-directory: android
-        run: |
-          cmp NiceVideos.apk app/build/outputs/apk/debug/app-debug.apk
-          python3 - <<'PY'
-          from pathlib import Path
-          import xml.etree.ElementTree as ET
-          results = list(Path("app/build/outputs/androidTest-results").rglob("TEST-*.xml"))
-          count = sum(len(ET.parse(f).findall(".//testcase")) for f in results)
-          print(f"Android instrumentation tests: {count}")
-          if not count:
-              raise SystemExit("No instrumentation tests executed")
-          PY
-      - name: Save Android test results
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Test both shipped 83 KB APKs, signature checks and existing downloads on Android 15
+        if: ${{ !cancelled() }}
+        uses: reactivecircus/android-emulator-runner@v2
         with:
-          name: Android-test-results
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          avd-name: classic-export-api35
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: cd android && bash tools/test_classic_export.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Classic-export-tests
           path: |
             android/app/build/reports/androidTests/
             android/app/build/outputs/androidTest-results/
-            android/app/build/reports/tests/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Classic-export-for-original-signer
+          path: android/NiceVideos-1.0.1-classic-export-unsigned.apk
 
-  package:
-    name: Register verified APK for repository distribution
+  register:
     needs: android
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: NiceVideos-Android
-      - name: Register APK blob
+          name: Classic-export-for-original-signer
+      - name: Register unsigned release for the original signer
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           python3 - <<'PY' | gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq '.sha'
           import base64, json, pathlib
-          data = pathlib.Path("NiceVideos.apk").read_bytes()
+          data = pathlib.Path("NiceVideos-1.0.1-classic-export-unsigned.apk").read_bytes()
           print(json.dumps({"content": base64.b64encode(data).decode("ascii"), "encoding": "base64"}))
           PY
-          sha256sum NiceVideos.apk
+          sha256sum NiceVideos-1.0.1-classic-export-unsigned.apk
