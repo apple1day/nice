@@ -9,8 +9,11 @@ shared=/sdcard/Download/NiceVideos
 fixture=app/build/generated/playbackFixtures/moving-sbs.mp4
 signer="$ANDROID_HOME/build-tools/35.0.0/apksigner"
 release=app/build/outputs/apk/release/app-release-unsigned.apk
+keytool -genkeypair -keystore "$work/test-only.p12" -storetype PKCS12 \
+  -alias classic-ci -keyalg RSA -keysize 2048 -validity 30 \
+  -dname "CN=Classic Export CI" -storepass android -keypass android
 sign_for_test() {
-  "$signer" sign --ks "$HOME/.android/debug.keystore" --ks-key-alias androiddebugkey \
+  "$signer" sign --ks "$work/test-only.p12" --ks-key-alias classic-ci \
     --ks-pass pass:android --key-pass pass:android --out "$2" "$1"
   "$signer" verify "$2"
 }
