@@ -222,8 +222,25 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
          reducedFrameOutput: Bool = false, preferSmallerPanoramaFrames: Bool = false) {
         self.pickedFile = pickedFile
         self.reducedFrameOutput = reducedFrameOutput
-        let construction = NICEVLCPlayerConstruction(options: ["--no-video-title-show", "--no-metadata-network-access"],
-                                                     frameHandler: frameHandler)
+        var options = ["--no-video-title-show", "--no-metadata-network-access"]
+        if frameHandler != nil && preferSmallerPanoramaFrames {
+            // VLC 3 drops a picture already half a frame late before vmem can
+            // offer it. At 59.94 fps that leaves about 8 ms. Keep the decoded
+            // panorama available for presentation, with at most one pending
+            // picture in our renderer. Leave VLC's original audio clock intact.
+            options.append("--no-drop-late-frames")
+            // The avcodec hurry-up path can discard a *compressed* reference
+            // block after 11 late frames, producing a cascade of missing POCs.
+            // Preserve the reference chain; the decoder's 5 s late-block
+            // safety and the regular playback clock remain enabled.
+            options.append("--no-avcodec-hurry-up")
+            if reducedFrameOutput {
+                // This is already a quality-recovery input. FFmpeg may omit
+                // non-reference pictures without breaking later HEVC pictures.
+                options.append("--avcodec-skip-frame=1")
+            }
+        }
+        let construction = NICEVLCPlayerConstruction(options: options, frameHandler: frameHandler)
         frameDelivery = construction?.frameDelivery
         construction?.frameDelivery?.preferSmallerPanoramaFrames = preferSmallerPanoramaFrames
         if reducedFrameOutput { construction?.frameDelivery?.maximumLongEdge = Self.reducedLongEdge }
@@ -454,7 +471,8 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
 
         // Delegate changes can arrive late during a seek. Read the native input
         // clock on every seek poll, including while VLC has stopped emitting ticks.
-        let nativeMS = nativeLifetime?.resource?.timeMilliseconds ?? -1
+        let awaitingNativeClock = callbackLock.withLock { seekGate.target != nil }
+        let nativeMS = awaitingNativeClock ? nativeLifetime?.resource?.timeMilliseconds ?? -1 : -1
         let rawSeconds = max(0, nativeMS >= 0 ? Double(nativeMS) / 1000 : Double(player.time.intValue) / 1000)
         let now = ProcessInfo.processInfo.systemUptime
         let duration = durationSeconds(player)

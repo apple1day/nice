@@ -28,9 +28,9 @@ import XCTest
     func testNaturalEndMountsAndPlaysNextSurfaceThenStopsAtPlaylistEnd() throws {
         XCTAssertEqual(element("uiTestAttachCount").label, "1")
         XCTAssertEqual(element("uiTestLoadCount").label, "1")
-        try seekNearEnd()
-
-        waitUntil("EOF should attach and play the next video without a Next tap") {
+        // Both fixture movies run for 30 seconds. Leave the transport untouched
+        // so that this exercises natural completion even on a busy simulator.
+        waitUntil("EOF should attach and play the next video without a Next tap", timeout: 75) {
             self.element("uiTestCurrentItem").label == "uitest-2.mp4"
                 && self.element("uiTestPlaybackPhase").label == "playing"
         }
@@ -41,8 +41,7 @@ import XCTest
         XCTAssertEqual(element("uiTestStopCount").label, "1",
                        "The previous decoder must be stopped before the new surface plays")
 
-        try seekNearEnd()
-        waitUntil("The last item should end without wrapping to the first") {
+        waitUntil("The last item should end without wrapping to the first", timeout: 75) {
             self.element("uiTestCurrentItem").label == "uitest-2.mp4"
                 && self.element("uiTestPlaybackPhase").label == "ended"
         }
@@ -54,6 +53,8 @@ import XCTest
         }
         XCTAssertEqual(element("uiTestCurrentItem").label, "uitest-2.mp4")
         XCTAssertEqual(element("uiTestPlaybackPhase").label, "ended")
+        XCTAssertEqual(element("uiTestSeekCount").label, "0")
+        XCTAssertEqual(element("uiTestEndCount").label, "2")
         XCTAssertEqual(element("uiTestAttachCount").label, "2")
         XCTAssertEqual(element("uiTestLoadCount").label, "2")
         XCTAssertEqual(element("uiTestStopCount").label, "1")

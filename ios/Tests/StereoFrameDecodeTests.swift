@@ -16,9 +16,17 @@ import XCTest
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: fixture, withExtension: "mp4", subdirectory: "Fixtures"))
         let ready = expectation(description: "VLC output contains both moving eyes at the negotiated size")
-        var colors = Set<Int>()
+        let diagnostics = PlaybackDiagnostics(bytes: nil, log: { _ in })
+        diagnostics.setRoute(.vlcFrames, mode: .immersive(.vr360, .sideBySide, headset: true))
+        diagnostics.beginInput(at: startAt)
+        var clock = 0.0
+        var firstClock: Double?
+        var previousPair: Int?
+        var transitions = 0
+        var finished = false
         let engine = VLCPlaybackEngine(frameHandler: { frame in
-            guard colors.count < 2 else { return }
+            guard !finished else { return }
+            diagnostics.decodedFrame(frame, pts: nil)
             let width = CVPixelBufferGetWidth(frame), height = CVPixelBufferGetHeight(frame)
             XCTAssertEqual(width, expectedWidth)
             XCTAssertEqual(height, expectedHeight)
@@ -28,14 +36,30 @@ import XCTest
             let row = base.advanced(by: (height / 2) * CVPixelBufferGetBytesPerRow(frame)).assumingMemoryBound(to: UInt8.self)
             let left = (width / 4) * 4, right = (3 * width / 4) * 4
             // Decode the fixture's two known eye pairs at their centers.
-            if row[left + 2] > 180 && row[left + 1] < 70 && row[right] > 180 { colors.insert(0) }
-            if row[left + 1] > 180 && row[left + 2] < 70 && row[right + 2] > 180 && row[right + 1] > 180 { colors.insert(1) }
-            if colors.count == 2 { ready.fulfill() }
+            let pair: Int
+            if row[left + 2] > 180 && row[left + 1] < 70 && row[right] > 180 {
+                pair = 0
+            } else if row[left + 1] > 180 && row[left + 2] < 70 && row[right + 2] > 180 && row[right + 1] > 180 {
+                pair = 1
+            } else { return }
+            if let previousPair, pair != previousPair { transitions += 1 }
+            previousPair = pair
+            if firstClock == nil { firstClock = clock }
+            if transitions >= 2, let firstClock, clock >= max(startAt, firstClock) + 0.4 {
+                finished = true
+                ready.fulfill()
+            }
         }, reducedFrameOutput: reduced, preferSmallerPanoramaFrames: true)
+        engine.diagnostics = diagnostics
+        engine.onUpdate = { snapshot in
+            clock = snapshot.seconds
+            diagnostics.observe(snapshot) { "" }
+        }
         defer { engine.stop() }
         try engine.load(fileURL: url, startAt: startAt, paused: false)
         engine.play()
         await fulfillment(of: [ready], timeout: 15)
+        XCTAssertTrue(finished, "Eye-pair changes=\(transitions). " + diagnostics.report { "" })
     }
 
     func testSBSFramePreservesBothEyesInMetalCompatibleBGRA() async throws {

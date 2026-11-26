@@ -16,7 +16,7 @@ permissions:
 jobs:
   test:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: Install build and fixture tools
@@ -38,9 +38,17 @@ jobs:
         run: bash ios/check-player-teardown.sh
       - name: Test local playlist order and swipe directions
         run: bash ios/check-playlist.sh
-      - name: Compile app and run offline policy, lifecycle, playlist, watch-delete, batch-delete and VLC decode tests
+      - name: Verify offline 8K conversion, moving stereo pictures, replay and seeks
         run: |
-          if ! bash ios/test.sh > ios/xcode-tests.log 2>&1; then
+          if ! bash ios/test.sh vr-motion > ios/vr-motion.log 2>&1; then
+            grep -E 'error:|Failing tests:|threw error|Test Case.*(failed|passed)|VR conversion test:|NiceVRConvert|unexpected exit' ios/vr-motion.log | tail -n 50 || true
+            tail -n 60 ios/vr-motion.log
+            exit 1
+          fi
+          grep 'Test Case.*passed' ios/vr-motion.log | tail -n 8
+      - name: Run remaining app and UI tests
+        run: |
+          if ! bash ios/test.sh remaining-after-vr > ios/xcode-tests.log 2>&1; then
             grep -E 'error:|Failing tests:|threw error' ios/xcode-tests.log | tail -n 40 || true
             tail -n 140 ios/xcode-tests.log
             exit 1
@@ -58,6 +66,7 @@ jobs:
             ios/DerivedData/Logs/Test/*.xcresult
             ios/Podfile.lock
             ios/xcode-tests.log
+            ios/vr-motion.log
 
   iphone:
     name: Build iPhone IPA

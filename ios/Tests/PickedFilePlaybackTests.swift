@@ -91,11 +91,14 @@ final class PickedFilePlaybackTests: XCTestCase {
         try Data("replacement".utf8).write(to: file, options: .atomic)
         let destination = directory.appendingPathComponent("双眼 兼容.mp4")
         var lastProgress = 0.0
+        print("VR conversion test: starting from retained 8K file")
         let result = try await VRCompatibleCopy.generate(fileURL: file, pickedFile: input, destination: destination) {
+            if Int($0 * 4) > Int(lastProgress * 4) { print("VR conversion test: progress \(Int($0 * 100))%") }
             lastProgress = $0
         }
         XCTAssertEqual(result, destination)
         XCTAssertEqual(lastProgress, 1)
+        print("VR conversion test: verified and published H.264 output")
         let output = AVURLAsset(url: result)
         let videoTracks = try await output.loadTracks(withMediaType: .video)
         let video = try XCTUnwrap(videoTracks.first)
@@ -110,7 +113,8 @@ final class PickedFilePlaybackTests: XCTestCase {
         XCTAssertEqual(audio.count, 1)
         let reader = try AVAssetReader(asset: output)
         let audioOutput = AVAssetReaderTrackOutput(track: try XCTUnwrap(audio.first), outputSettings: [
-            AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 16
+            AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false
         ])
         reader.add(audioOutput)
         XCTAssertTrue(reader.startReading())
@@ -127,7 +131,9 @@ final class PickedFilePlaybackTests: XCTestCase {
         }
         reader.cancelReading()
         XCTAssertTrue(foundTone, "Converted track must contain decoded non-silent PCM")
-        try await checkMovingEyes(url: result, input: try await PickedVideoFile.open(result), allowVLCFallback: false)
+        print("VR conversion test: checking Afterglow motion after seek with verified PCM")
+        let copy = try await PickedVideoFile.open(result)
+        try await checkMovingEyes(url: result, input: copy, allowVLCFallback: false)
     }
 
     private func checkPackedPlayback(prefix: String, allowVLCFallback: Bool) async throws {
