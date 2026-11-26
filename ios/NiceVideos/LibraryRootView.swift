@@ -35,7 +35,10 @@ struct LibraryRootView: View {
                     catch { store.errorMessage = error.localizedDescription }
                 }
             }
-                .tabItem { Label("VR", systemImage: "goggles").accessibilityIdentifier("vrFolderTab") }
+                .toolbarBackground(Color(red: 0.05, green: 0.05, blue: 0.06), for: .tabBar)
+                .toolbarBackground(.visible, for: .tabBar)
+                .toolbarColorScheme(.dark, for: .tabBar)
+                .tabItem { Label("VR", systemImage: "eyeglasses").accessibilityIdentifier("vrFolderTab") }
             NavigationStack { ServerCatalogView() }
                 .tabItem { Label("服务器", systemImage: "server.rack") }
             NavigationStack { TransfersView() }
