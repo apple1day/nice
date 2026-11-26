@@ -9,7 +9,10 @@ trap 'rm -rf "$work"' EXIT
 diagnose() {
   echo "Upgrade check failed at line $1" >&2
   adb shell -T "id; ls -ld /sdcard/Android/data/$package '$old_dir' /sdcard/Download/NiceVideos" >&2 || true
-  adb shell -T "run-as $package sh -c 'ls -l shared_prefs; cat shared_prefs/video_library.xml'" >&2 || true
+  adb shell -T "ls -la '$old_dir' /sdcard/Download/NiceVideos; run-as $package sh -c 'ls -l shared_prefs files/legacy_download_restore; cat shared_prefs/download_options.xml shared_prefs/video_library.xml shared_prefs/legacy_download_migration.xml'" >&2 || true
+  if adb shell uiautomator dump /sdcard/nice-upgrade-ui.xml >/dev/null 2>&1; then
+    adb exec-out cat /sdcard/nice-upgrade-ui.xml | python3 -c 'import sys, xml.etree.ElementTree as ET; print([v for n in ET.parse(sys.stdin).iter("node") if (v := n.get("text"))])' >&2 || true
+  fi
   adb logcat -d -t 120 'AndroidRuntime:E' 'ActivityTaskManager:E' 'MediaProvider:W' '*:S' >&2 || true
 }
 trap 'diagnose "$LINENO"' ERR
@@ -53,6 +56,7 @@ cmp "$fixture" "$work/backup/Movies/$disk"
 adb uninstall "$package"
 adb install app/build/outputs/apk/debug/app-debug.apk
 python3 tools/legacy_download_backup.py restore "$work/backup"
+adb exec-out "run-as $package cat files/legacy_download_restore/$disk" | cmp "$fixture" -
 adb shell am start -W -n "$package/com.anxiong.nicevideos.MainActivity"
 for ((attempt=0; attempt<45; attempt++)); do
   if adb shell -T "test -s '/sdcard/Download/NiceVideos/Upgrade test.mp4'" &&
@@ -61,6 +65,7 @@ for ((attempt=0; attempt<45; attempt++)); do
 done
 adb exec-out "cat '/sdcard/Download/NiceVideos/Upgrade test.mp4'" | cmp app/build/generated/playbackFixtures/moving-sbs.mp4 -
 adb shell -T "run-as $package test ! -e files/legacy_download_restore/$disk"
+adb shell -T "test ! -e '$old_dir/$disk'"
 adb shell -T "run-as $package cat shared_prefs/video_positions.xml" | grep -q 12500
 adb shell -T "run-as $package cat shared_prefs/video_library.xml" > "$work/catalog.xml"
 python3 - "$work/catalog.xml" "$movie" <<'PY'

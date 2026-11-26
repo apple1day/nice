@@ -54,7 +54,9 @@ class Device:
     def select_movies_access(self, restoring):
         parent = MOVIES.rsplit("/", 1)[0]
         for probe in (MOVIES,) if restoring else (MOVIES, parent):
-            for method in (self.run, self.app):
+            # A shell-writeable external mount does not prove that the installed
+            # app's UID can open those same files after reinstall.
+            for method in ((self.app,) if restoring else (self.run, self.app)):
                 try:
                     test = f"test -d {probe} && ls -A {probe} >/dev/null"
                     if probe == parent:
@@ -260,12 +262,12 @@ def stage_path(directory, name):
     return parent + "/.nice-restore-" + name + ".part"
 
 
-def upload(device, directory, name, expected, source=None, data=None, replace_empty=False):
+def upload(device, directory, name, expected, source=None, data=None, replace_empty=False, previous=None):
     path = directory + "/" + name
     current = device.digest(path)
     if current == expected:
         return
-    if current:
+    if current and current != previous:
         require(replace_empty and current["bytes"] < 4096, f"Refusing to replace existing device file: {name}")
         existing = ET.fromstring(device.app("cat " + path, stdout=subprocess.PIPE).stdout)
         require(existing.tag == "map" and len(existing) == 0, f"Device already has settings: {name}")
@@ -300,6 +302,7 @@ def restore(device, root):
             prefs[name] = check_catalog(data, info["Movies"], True) if name == "video_library.xml" else data
     device.stop(restoring=True)
     prior_directory = None
+    previous_catalog = None
     for name in PREFS:
         path = device.pref(name)
         if path:
@@ -314,6 +317,7 @@ def restore(device, root):
                         prior_directory = STAGING
                     elif current == allowed[0]:
                         prior_directory = MOVIES
+                        previous_catalog = current
                 allowed.append(internal_digest)
             if current not in allowed:
                 require(current["bytes"] < 4096, "Target already contains app settings.")
@@ -324,11 +328,31 @@ def restore(device, root):
     device.run("am start -W -n " + PACKAGE + "/com.anxiong.nicevideos.MainActivity "
                "-a com.anxiong.nicevideos.PREPARE_RESTORE", stdout=subprocess.DEVNULL)
     device.run("am force-stop " + PACKAGE)
-    directory = prior_directory or MOVIES
-    if directory == MOVIES and not device.select_movies_access(restoring=True):
-        require(prior_directory is None,
-                "The previously restored Movies directory is inaccessible. Keep both copies and retry.")
-        directory = STAGING
+    # Code 4 and later resolve restoredPrivate entries from the app's internal
+    # files directory. Keep new transfers there regardless of shell access to Movies.
+    directory = STAGING
+    external_names = set()
+    if device.select_movies_access(restoring=False):
+        external_names = set(device.movies())
+        require(external_names <= set(info["Movies"]),
+                "Target contains other videos. Start with a fresh installation.")
+    if prior_directory == MOVIES or (prior_directory is None and external_names):
+        # Resume an earlier external restore only if this app UID can write
+        # there and can actually read the files, including those written by adb.
+        if device.select_movies_access(restoring=True):
+            try:
+                if set(device.movies()) == external_names:
+                    for name in external_names:
+                        current = device.digest(MOVIES + "/" + name)
+                        if current is None:
+                            break  # This app UID cannot see a file listed by the USB shell.
+                        require(current == info["Movies"][name], f"Different movie exists on target: {name}")
+                    else:
+                        directory = MOVIES
+            except subprocess.CalledProcessError:
+                pass  # Rebuild from the verified computer copy in internal storage.
+        if directory == STAGING:
+            print("Resuming in app-owned storage. Existing external copies are preserved.", flush=True)
     if directory == STAGING:
         device.app("mkdir -p " + directory)
         if "video_library.xml" in prefs:
@@ -353,7 +377,8 @@ def restore(device, root):
         print(f"[{i}/{len(info['Movies'])}] Restore {name}", flush=True)
         upload(device, directory, name, item, source=root / "Movies" / name)
     for name, data in prefs.items():
-        upload(device, "shared_prefs", name, bytes_digest(data), data=data, replace_empty=True)
+        upload(device, "shared_prefs", name, bytes_digest(data), data=data, replace_empty=True,
+               previous=previous_catalog if name == "video_library.xml" else None)
     print("Verified restore complete. Open the updated Nice app to migrate the historical downloads.")
 
 

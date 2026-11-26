@@ -73,7 +73,8 @@ public final class MainActivity extends Activity {
             // Android 11+ provisions this app-specific folder through the framework.
             getExternalFilesDir(android.os.Environment.DIRECTORY_MOVIES);
             if (new VideoLibrary(this).all().isEmpty()) {
-                getSharedPreferences("download_options", MODE_PRIVATE).edit().putBoolean(MIGRATION_REQUESTED, true).apply();
+                // The USB restore helper force-stops this process as soon as this activity finishes.
+                getSharedPreferences("download_options", MODE_PRIVATE).edit().putBoolean(MIGRATION_REQUESTED, true).commit();
             }
             finish();
             return;
