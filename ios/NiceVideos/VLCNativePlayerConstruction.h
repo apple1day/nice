@@ -21,7 +21,14 @@ typedef struct {
     uint64_t bufferMisses;
     uint64_t formatSetups;
     uint64_t staleSource;
+    unsigned outputLongEdge;
 } NICEVLCFrameStats;
+
+typedef struct {
+    int32_t decoded;
+    int32_t displayed;
+    int32_t lost;
+} NICEVLCVideoStats;
 
 @interface NICEVLCFrameDelivery : NSObject
 // Assigned before starting the local media. The decoder thread reads its
@@ -29,6 +36,8 @@ typedef struct {
 @property (atomic, strong, nullable) id<NICEVLCTrackSource> sourceMedia;
 @property (atomic, readonly) BOOL hasDeliveredFrame;
 @property (atomic, readonly) NICEVLCFrameStats frameStats;
+// Set before load; sampled only when VLC negotiates a new output.
+@property (atomic) unsigned maximumLongEdge;
 // Called on the main queue when retiring playback, before VLC stops asynchronously.
 - (void)invalidate;
 - (instancetype)init NS_UNAVAILABLE;
@@ -36,7 +45,9 @@ typedef struct {
 
 @interface NICEVLCNativeReference : NSObject
 @property (nonatomic, readonly) int64_t lengthMilliseconds;
-@property (nonatomic, readonly, nullable) NSString *videoStatistics;
+@property (nonatomic, readonly, nullable) NSString *videoTrackDescription;
+// Unavailable counters are -1.
+@property (nonatomic, readonly) NICEVLCVideoStats videoStatistics;
 - (BOOL)loadFileWithByteCount:(uint64_t)byteCount
                       options:(NSArray<NSString *> *)options
                          read:(NICEVLCFileRead)reader NS_SWIFT_NAME(loadFile(byteCount:options:read:));

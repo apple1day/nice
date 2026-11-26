@@ -3,6 +3,32 @@ import XCTest
 @testable import NiceVideos
 
 @MainActor final class StereoFrameDecodeTests: XCTestCase {
+    func testReducedOutputResumes8KSourceWithSmallerStereoBuffers() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "stereo8k-replay", withExtension: "mp4", subdirectory: "Fixtures"))
+        let ready = expectation(description: "Resumed VLC output contains both eyes at the reduced size")
+        var colors = Set<Int>()
+        let engine = VLCPlaybackEngine(frameHandler: { frame in
+            guard colors.count < 2 else { return }
+            let width = CVPixelBufferGetWidth(frame), height = CVPixelBufferGetHeight(frame)
+            XCTAssertEqual(width, 1280)
+            XCTAssertEqual(height, 320)
+            guard CVPixelBufferLockBaseAddress(frame, .readOnly) == kCVReturnSuccess else { return }
+            defer { CVPixelBufferUnlockBaseAddress(frame, .readOnly) }
+            guard let base = CVPixelBufferGetBaseAddress(frame) else { return }
+            let row = base.advanced(by: (height / 2) * CVPixelBufferGetBytesPerRow(frame)).assumingMemoryBound(to: UInt8.self)
+            let left = (width / 4) * 4, right = (3 * width / 4) * 4
+            // Decode the fixture's two known eye pairs at their centers.
+            if row[left + 2] > 180 && row[left + 1] < 70 && row[right] > 180 { colors.insert(0) }
+            if row[left + 1] > 180 && row[left + 2] < 70 && row[right + 2] > 180 && row[right + 1] > 180 { colors.insert(1) }
+            if colors.count == 2 { ready.fulfill() }
+        }, reducedFrameOutput: true)
+        defer { engine.stop() }
+        try engine.load(fileURL: url, startAt: 2, paused: false)
+        engine.play()
+        await fulfillment(of: [ready], timeout: 15)
+    }
+
     func testSBSFramePreservesBothEyesInMetalCompatibleBGRA() async throws {
         try await checkStereoOutput(picked: false)
     }

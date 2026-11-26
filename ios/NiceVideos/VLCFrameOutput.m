@@ -13,7 +13,7 @@
 - (instancetype)initWithHandler:(NICEVLCFrameHandler)handler;
 - (void)enqueue:(CVPixelBufferRef)frame forMedia:(id<NICEVLCTrackSource>)media;
 - (void)recordBufferMissForMedia:(id<NICEVLCTrackSource>)media;
-- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media;
+- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge;
 @end
 
 @implementation NICEVLCFrameDelivery {
@@ -26,7 +26,10 @@
 
 - (instancetype)initWithHandler:(NICEVLCFrameHandler)handler {
     self = [super init];
-    if (self) { _handler = [handler copy]; }
+    if (self) {
+        _handler = [handler copy];
+        _maximumLongEdge = 2560;
+    }
     return self;
 }
 
@@ -57,9 +60,12 @@
     }
 }
 
-- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media {
+- (void)recordFormatSetupForMedia:(id<NICEVLCTrackSource>)media longEdge:(unsigned)longEdge {
     @synchronized (self) {
-        if (_handler && media == _sourceMedia) { _frameStats.formatSetups++; }
+        if (_handler && media == _sourceMedia) {
+            _frameStats.formatSetups++;
+            _frameStats.outputLongEdge = longEdge;
+        }
     }
 }
 
@@ -261,7 +267,7 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         id<NICEVLCTrackSource> source = delivery.sourceMedia;
         NICEFrameGeometry geometry = NICEVisibleGeometry(source, *width, *height);
         // Bound the CPU color conversion and IOSurface allocations for 4K/8K sources.
-        const double scale = MIN(1.0, 2560.0 / MAX(geometry.width, geometry.height));
+        const double scale = MIN(1.0, (double)delivery.maximumLongEdge / MAX(geometry.width, geometry.height));
         *width = geometry.width = (unsigned)MAX(1.0, round(geometry.width * scale));
         *height = geometry.height = (unsigned)MAX(1.0, round(geometry.height * scale));
         NICEVLCFrameFormat *format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry source:source delivery:delivery];
@@ -270,7 +276,7 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         pitches[0] = (unsigned)format.pitch;
         lines[0] = *height;
         *opaque = (void *)CFBridgingRetain(format);
-        [delivery recordFormatSetupForMedia:source];
+        [delivery recordFormatSetupForMedia:source longEdge:MAX(*width, *height)];
         return 1;
     }
 }

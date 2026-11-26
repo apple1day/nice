@@ -3,11 +3,10 @@ import UIKit
 enum MovieOutput: Equatable {
     case system, vlcNative, vlcFrames
 
-    static func defaultOutput(for file: PickedVideoFile?) -> Self {
-        guard let file else { return .vlcNative }
-        switch file.url.pathExtension.lowercased() {
+    static func defaultOutput(for url: URL, pickedFile: PickedVideoFile?) -> Self {
+        switch url.pathExtension.lowercased() {
         case "mp4", "m4v", "mov": return .system
-        default: return .vlcFrames
+        default: return pickedFile == nil ? .vlcNative : .vlcFrames
         }
     }
 
@@ -133,13 +132,18 @@ final class SBSPlaybackView: UIView {
 // VLC's native and callback-based outputs require separate decoder sessions.
 extension AppleFilePlaybackEngine: SwitchableVideoEngine {}
 
-final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting {
+protocol SystemOutputRetrying: AnyObject {
+    @MainActor func retrySystemOutput()
+}
+
+final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting, SystemOutputRetrying {
     private let diagnostics: PlaybackDiagnostics
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     private var session: SwitchableVideoEngine?
     private weak var hostView: SBSPlaybackView?
     private(set) var currentOutput: MovieOutput?
     private var systemFailed = false
+    private var reducedVLCFrameOutput = false
     private var systemStereo = false
     private let pickedFile: PickedVideoFile?
     private var file: URL?
@@ -174,8 +178,8 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
         MainActor.assumeIsolated {
             hostView?.onOutputChange = nil
             hostView = host
-            if host.standardOutput == nil {
-                host.configure(mode: host.mode, standardOutput: MovieOutput.defaultOutput(for: pickedFile))
+            if host.standardOutput == nil, let url = pickedFile?.url ?? file {
+                host.configure(mode: host.mode, standardOutput: MovieOutput.defaultOutput(for: url, pickedFile: pickedFile))
             }
             host.onOutputChange = { [weak self, weak host] in
                 guard let self, let host, self.hostView === host else { return }
@@ -198,6 +202,19 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
                 if let seek = self.pendingSeek { self.seconds = seek }
                 else if snapshot.seconds.isFinite, snapshot.seconds > 0 { self.seconds = snapshot.seconds }
                 MainActor.assumeIsolated { self.reconcileOutput(host) }
+                return
+            }
+            if snapshot.retryVLCWithSmallerFrames, self.currentOutput == .vlcFrames,
+               !self.reducedVLCFrameOutput, self.wantsPlayback, !self.awaitingOutput, !self.openingPaused,
+               self.pendingSeek == nil, self.phase != .ended, self.phase != .failed, let host = self.hostView {
+                MainActor.assumeIsolated {
+                    self.seconds = snapshot.seconds
+                    self.reducedVLCFrameOutput = true
+                    self.diagnostics.event("VLC: late pictures without new frames; reopening at \(self.seconds)s, maximum frame edge 1280")
+                    self.retireSession()
+                    self.installVLCFrameSession()
+                    self.reopenAfterOutputChange(host)
+                }
                 return
             }
             // A stopped event may trail EOF. Only an explicit reload can
@@ -260,13 +277,16 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
     }
 
     @MainActor private func installVLCFrameSession() {
-        let vlc = VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile)
+        let vlc = VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile,
+                                    reducedFrameOutput: reducedVLCFrameOutput)
         vlc.diagnostics = diagnostics
         observe(vlc)
     }
 
     @MainActor private func reconcileOutput(_ host: SBSPlaybackView, attaching: Bool = false) {
-        let system = host.standardOutput == .system && pickedFile != nil && !systemFailed
+        // A bare playback surface can be attached before the local URL is known.
+        guard let output = host.standardOutput else { return }
+        let system = output == .system && !systemFailed
         let next: MovieOutput = system ? .system : (host.renderer == nil ? .vlcNative : .vlcFrames)
         diagnostics.setRoute(next, mode: host.mode)
         if next == currentOutput, let session {
@@ -277,12 +297,10 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
             return
         }
         if phase == .failed { phase = .opening }
-        session?.onUpdate = nil
-        session?.stop()
-        session = nil
+        retireSession()
         currentOutput = next
         systemStereo = false
-        if next == .system, let pickedFile {
+        if next == .system {
             let apple = AppleFilePlaybackEngine(pickedFile: pickedFile)
             apple.diagnostics = diagnostics
             observe(apple)
@@ -340,12 +358,23 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
     func load(fileURL: URL) throws {
         guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
         let differentFile = file != fileURL
+        if differentFile {
+            reducedVLCFrameOutput = false
+            let size = pickedFile?.byteCount ?? (fileURL.isFileURL
+                ? (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { UInt64(exactly: $0) }
+                : nil)
+            diagnostics.setFileByteCount(size)
+        }
+        MainActor.assumeIsolated {
+            if let host = hostView, host.standardOutput == nil {
+                host.configure(mode: host.mode, standardOutput: MovieOutput.defaultOutput(for: fileURL, pickedFile: pickedFile))
+            }
+        }
         if currentOutput == .vlcFrames, let vlc = session as? VLCPlaybackEngine, vlc.loaded {
             // VLC 3 may reuse a vout across equal-format inputs. Its vmem
             // format still owns the old media token; do not reuse that player
             // or weaken the check that rejects frames from a retired input.
-            vlc.onUpdate = nil
-            vlc.stop()
+            retireSession()
             MainActor.assumeIsolated {
                 hostView?.renderer?.clear()
                 installVLCFrameSession()
@@ -395,6 +424,11 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting 
     func stop() {
         stopped = true
         onUpdate = nil
+        retireSession()
+    }
+
+    private func retireSession() {
+        session?.onUpdate = nil
         session?.stop()
         session = nil
     }

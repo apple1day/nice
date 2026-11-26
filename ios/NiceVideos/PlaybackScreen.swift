@@ -162,7 +162,7 @@ final class PlaybackModel: ObservableObject {
             message = nil
             phase = .opening
         }
-        if output == .system { (engine as? SBSPlaybackEngine)?.retrySystemOutput() }
+        if output == .system { (engine as? SystemOutputRetrying)?.retrySystemOutput() }
     }
 
     private func receive(_ snapshot: PlaybackSnapshot) {
@@ -433,8 +433,12 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         _camera = StateObject(wrappedValue: VRGestureCamera(fieldOfView: profile.fieldOfView))
     }
 
-    private var defaultOutput: MovieOutput { MovieOutput.defaultOutput(for: request.pickedFile) }
-    private var standardOutput: MovieOutput { outputOverride ?? defaultOutput }
+    private var defaultOutput: MovieOutput { MovieOutput.defaultOutput(for: request.url, pickedFile: request.pickedFile) }
+    private var standardOutput: MovieOutput {
+        // A playlist may move from a system-compatible container to an MKV.
+        if outputOverride == .system { return defaultOutput }
+        return outputOverride ?? defaultOutput
+    }
     private var activeOutput: MovieOutput { model.videoOutput ?? standardOutput }
     private var request: PlaybackRequest { playlist.current }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }

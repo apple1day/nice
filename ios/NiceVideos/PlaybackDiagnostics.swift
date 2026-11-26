@@ -18,7 +18,9 @@ final class PlaybackDiagnostics {
     private let log: (String) -> Void
     private let start: TimeInterval
     private let session = String(UUID().uuidString.prefix(8))
-    private let header: String
+    private let deviceInfo: String
+    private var fileBytes: UInt64?
+    private var header: String { deviceInfo + " fileBytes=" + (fileBytes.map { String($0) } ?? "unknown") }
     private var history: [String] = []
     private var lastSample: TimeInterval?
     private var phase = PlaybackPhase.idle
@@ -52,8 +54,8 @@ final class PlaybackDiagnostics {
         let version = info["CFBundleShortVersionString"] as? String ?? "?"
         let build = info["CFBundleVersion"] as? String ?? "?"
         let os = ProcessInfo.processInfo.operatingSystemVersion
-        let size = bytes.map { String($0) } ?? "unknown"
-        header = "session=\(session) app=\(version)(\(build)) device=\(hardware) iOS=\(os.majorVersion).\(os.minorVersion).\(os.patchVersion) fileBytes=\(size)"
+        self.fileBytes = bytes
+        deviceInfo = "session=\(session) app=\(version)(\(build)) device=\(hardware) iOS=\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
         self.log(header)
     }
 
@@ -67,6 +69,14 @@ final class PlaybackDiagnostics {
             self.mode = mode
             lastSample = nil
             record("output \(route) mode=\(mode)", at: now())
+        }
+    }
+
+    func setFileByteCount(_ bytes: UInt64?) {
+        lock.withLock {
+            guard fileBytes != bytes else { return }
+            fileBytes = bytes
+            log(header)
         }
     }
 

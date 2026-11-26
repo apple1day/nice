@@ -12,7 +12,7 @@ private final class AppleVideoSurface: UIView {
 final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     var onUpdate: ((PlaybackSnapshot) -> Void)?
     weak var diagnostics: PlaybackDiagnostics?
-    private let pickedFile: PickedVideoFile
+    private let pickedFile: PickedVideoFile?
     private let player = AVPlayer()
     private var surface: AppleVideoSurface?
     private var loader: PickedAssetResourceLoader?
@@ -38,7 +38,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private var trackDetails: String?
     private var reportedPlaybackStalls = 0
 
-    init(pickedFile: PickedVideoFile) { self.pickedFile = pickedFile }
+    init(pickedFile: PickedVideoFile? = nil) { self.pickedFile = pickedFile }
 
     func attach(to view: UIView) {
         guard !stopped else { return }
@@ -117,8 +117,23 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     func load(fileURL: URL) throws { try load(fileURL: fileURL, startAt: 0, paused: false) }
 
     func load(fileURL: URL, startAt seconds: Double, paused: Bool) throws {
-        guard !stopped, pickedFile.url == fileURL else { throw ClientError("无法打开所选文件，请重新选择视频。") }
+        guard !stopped else { throw ClientError("播放器已关闭，请重新打开视频。") }
+        let newLoader: PickedAssetResourceLoader?
+        let asset: AVURLAsset
+        if let pickedFile {
+            guard pickedFile.url == fileURL else { throw ClientError("无法打开所选文件，请重新选择视频。") }
+            let input = PickedAssetResourceLoader(file: pickedFile)
+            newLoader = input
+            asset = input.asset
+        } else {
+            try OfflineMediaPolicy.validateLocalFile(fileURL)
+            newLoader = nil
+            asset = AVURLAsset(url: fileURL, options: [
+                AVURLAssetReferenceRestrictionsKey: AVAssetReferenceRestrictions.forbidAll.rawValue
+            ])
+        }
         retireItem()
+        loader = newLoader
         ended = false
         failure = nil
         trackDetails = nil
@@ -128,9 +143,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         frameRate = nil
         wantsPlayback = false
         pendingSeek = seconds.isFinite && seconds > 0 ? seconds : nil
-        let input = PickedAssetResourceLoader(file: pickedFile)
-        let item = AVPlayerItem(asset: input.asset)
-        loader = input
+        let item = AVPlayerItem(asset: asset)
         player.replaceCurrentItem(with: item)
         MainActor.assumeIsolated { installStereoOutput() }
         observations = [

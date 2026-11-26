@@ -82,15 +82,52 @@
 
 - (int64_t)lengthMilliseconds { return libvlc_media_player_get_length(_player); }
 
-- (NSString *)videoStatistics {
+- (NSString *)videoTrackDescription {
     libvlc_media_t *media = libvlc_media_player_get_media(_player);
     if (!media) { return nil; }
+    libvlc_media_track_t **tracks = NULL;
+    unsigned count = libvlc_media_tracks_get(media, &tracks);
+    libvlc_media_release(media);
+    if (!count) { return nil; }
+
+    int activeID = libvlc_video_get_track(_player);
+    libvlc_media_track_t *selected = NULL;
+    unsigned videoCount = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        libvlc_media_track_t *track = tracks[i];
+        if (track->i_type != libvlc_track_video || !track->video) { continue; }
+        ++videoCount;
+        if (track->i_id == activeID) { selected = track; break; }
+        selected = track;
+    }
+    NSString *result = nil;
+    if (selected && (selected->i_id == activeID || videoCount == 1)) {
+        libvlc_video_track_t *video = selected->video;
+        if (video->i_width && video->i_height) {
+            NSMutableString *details = [NSMutableString stringWithFormat:@"%u×%u", video->i_width, video->i_height];
+            const char *codec = libvlc_media_get_codec_description(libvlc_track_video, selected->i_codec);
+            if (codec && *codec) { [details appendFormat:@" · %s", codec]; }
+            if (video->i_frame_rate_num && video->i_frame_rate_den) {
+                [details appendFormat:@" · %.2f fps", (double)video->i_frame_rate_num / video->i_frame_rate_den];
+            }
+            if (selected->i_bitrate) { [details appendFormat:@" · %.2f Mb/s", selected->i_bitrate / 1e6]; }
+            result = details;
+        }
+    }
+    libvlc_media_tracks_release(tracks, count);
+    return result;
+}
+
+
+- (NICEVLCVideoStats)videoStatistics {
+    const NICEVLCVideoStats unavailable = { -1, -1, -1 };
+    libvlc_media_t *media = libvlc_media_player_get_media(_player);
+    if (!media) { return unavailable; }
     libvlc_media_stats_t stats = {0};
     int available = libvlc_media_get_stats(media, &stats);
     libvlc_media_release(media);
-    if (!available) { return nil; }
-    return [NSString stringWithFormat:@"decoded=%d displayed=%d lost=%d",
-            stats.i_decoded_video, stats.i_displayed_pictures, stats.i_lost_pictures];
+    if (!available) { return unavailable; }
+    return (NICEVLCVideoStats){ stats.i_decoded_video, stats.i_displayed_pictures, stats.i_lost_pictures };
 }
 
 - (BOOL)loadFileWithByteCount:(uint64_t)byteCount options:(NSArray<NSString *> *)options read:(NICEVLCFileRead)reader {

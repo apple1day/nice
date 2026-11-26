@@ -80,6 +80,11 @@ final class VLCHeadsetReplayTests: XCTestCase {
                 if playthrough == 3 && sawRedBlue && sawGreenYellow { break }
                 try await Task.sleep(nanoseconds: 120_000_000)
             }
+            if playthrough == 1 {
+                XCTAssertTrue(model.videoDetails?.contains("8192×2048") == true,
+                              "The source track should be reported separately from the scaled VR buffer.")
+                XCTAssertTrue(model.videoDetails?.contains("24.00 fps") == true)
+            }
             guard sawRedBlue && sawGreenYellow && (playthrough == 3 || model.phase == .ended) else {
                 XCTFail("Playthrough \(playthrough): red/blue=\(sawRedBlue) green/yellow=\(sawGreenYellow), " +
                         "phase=\(model.phase) " + (engine.playbackDiagnosticReport() ?? ""))
