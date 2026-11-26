@@ -16,6 +16,10 @@ import UIKit
     @State private var status: String?
     @State private var cleanupTime: UIBackgroundTaskIdentifier = .invalid
 
+    init(onPlay: @escaping (PickedVideoFile) -> Void) {
+        self.onPlay = onPlay
+    }
+
     private enum Picker: Int, Identifiable {
         case source, folder
         var id: Int { rawValue }

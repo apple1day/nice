@@ -41,21 +41,108 @@ import UIKit
     }
 
     var body: some View {
+        sheets
+            .alert("无法打开视频", isPresented: showsError) {
+                Button("好", role: .cancel) {}
+            } message: { Text(playbackError ?? "") }
+            .confirmationDialog("从 VR 片库移除这个文件夹？", isPresented: confirmsRemoval,
+                                titleVisibility: .visible, presenting: pendingRemoval) { root in
+                Button("移除文件夹记录", role: .destructive) {
+                    cancelOpen()
+                    library.forget(root)
+                    pendingRemoval = nil
+                }
+                Button("取消", role: .cancel) {}
+            } message: { root in Text("原文件仍保存在「文件」的 \(root.name) 中。") }
+            .task {
+                guard !restored else { return }
+                restored = true
+                library.restoreLastSelection()
+            }
+            .onDisappear { cancelOpen() }
+    }
+
+    private var showsError: Binding<Bool> {
+        Binding(get: { playbackError != nil }, set: { if !$0 { playbackError = nil } })
+    }
+
+    private var confirmsRemoval: Binding<Bool> {
+        Binding(get: { pendingRemoval != nil }, set: { if !$0 { pendingRemoval = nil } })
+    }
+
+    private var sheets: some View {
+        navigation
+            .sheet(item: $picker, onDismiss: didDismissPicker) { target in pickerContent(target) }
+            .sheet(isPresented: $showsAfterglowSettings) { AfterglowPresetView() }
+            .sheet(isPresented: $showsCopyCreator, onDismiss: didDismissCopyCreator) {
+                VRCompatibleCopySheet(onPlay: { file in
+                    finishedCopy = file
+                    showsCopyCreator = false
+                })
+            }
+    }
+
+    @ViewBuilder private func pickerContent(_ target: PickerTarget) -> some View {
+        switch target {
+        case .folder(let prior):
+            VRDirectoryPicker { url in
+                if let url { library.authorize(url, replacing: prior) }
+                picker = nil
+            }
+        case .video(let mode):
+            VideoDocumentPicker { selection in
+                if let selection { pendingVideo = (selection, mode) }
+                picker = nil
+            }
+        }
+    }
+
+    private func didDismissPicker() {
+        guard let (selection, mode) = pendingVideo else { return }
+        pendingVideo = nil
+        open(selection, id: UUID().uuidString, startMode: mode)
+    }
+
+    private func didDismissCopyCreator() {
+        guard let file = finishedCopy else { return }
+        finishedCopy = nil
+        onPlay(file, .afterglow)
+    }
+
+    private var title: String {
+        guard let root = library.currentRoot else { return "VR 片库" }
+        return library.path.last ?? root.name
+    }
+
+    private var navigation: some View {
+        folderScroll
+            .background(Self.background.ignoresSafeArea())
+            .environment(\.colorScheme, .dark)
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(library.currentRoot == nil ? .large : .inline)
+            .toolbarBackground(Self.background, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbar {
+                if let root = library.currentRoot {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button { cancelOpen(); library.back() } label: {
+                            Label("上一级", systemImage: "chevron.backward")
+                        }
+                        .accessibilityIdentifier("vrFolderBackButton")
+                    }
+                    ToolbarItem(placement: .topBarTrailing) { folderMenu(root) }
+                }
+            }
+    }
+
+    private var folderScroll: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 afterglowActions
-                Button {
-                    cancelOpen()
-                    showsCopyCreator = true
-                } label: {
-                    Label("制作兼容副本", systemImage: "film.stack")
-                        .font(.subheadline).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain).padding(.horizontal, 16)
-                .accessibilityIdentifier("makeCompatibleCopy")
+                createCopyButton
                 if library.currentRoot == nil { sources }
-                if library.currentRoot != nil { folderHeader }
+                else { folderHeader }
                 if let message = library.errorMessage {
                     folderError(message)
                 } else if library.isLoading {
@@ -67,73 +154,19 @@ import UIKit
             }
             .padding(.horizontal, 16).padding(.bottom, 22)
         }
-        .background(Self.background.ignoresSafeArea())
-        .environment(\.colorScheme, .dark)
-        .navigationTitle(library.currentRoot == nil ? "VR 片库" : library.path.last ?? library.currentRoot?.name ?? "VR 片库")
-        .navigationBarTitleDisplayMode(library.currentRoot == nil ? .large : .inline)
-        .toolbarBackground(Self.background, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-        .toolbarColorScheme(.dark, for: .navigationBar)
-        .toolbar {
-            if let root = library.currentRoot {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { cancelOpen(); library.back() } label: {
-                        Label("上一级", systemImage: "chevron.backward")
-                    }
-                    .accessibilityIdentifier("vrFolderBackButton")
-                }
-                ToolbarItem(placement: .topBarTrailing) { folderMenu(root) }
-            }
+    }
+
+    private var createCopyButton: some View {
+        Button {
+            cancelOpen()
+            showsCopyCreator = true
+        } label: {
+            Label("制作兼容副本", systemImage: "film.stack")
+                .font(.subheadline).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
         }
-        .sheet(item: $picker, onDismiss: {
-            if let (selection, mode) = pendingVideo {
-                pendingVideo = nil
-                open(selection, id: UUID().uuidString, startMode: mode)
-            }
-        }) { target in
-            switch target {
-            case .folder(let prior):
-                VRDirectoryPicker { url in
-                    if let url { library.authorize(url, replacing: prior) }
-                    picker = nil
-                }
-            case .video(let mode):
-                VideoDocumentPicker { selection in
-                    if let selection { pendingVideo = (selection, mode) }
-                    picker = nil
-                }
-            }
-        }
-        .sheet(isPresented: $showsAfterglowSettings) { AfterglowPresetView() }
-        .sheet(isPresented: $showsCopyCreator, onDismiss: {
-            if let file = finishedCopy {
-                finishedCopy = nil
-                onPlay(file, .afterglow)
-            }
-        }) {
-            VRCompatibleCopySheet { file in
-                finishedCopy = file
-                showsCopyCreator = false
-            }
-        }
-        .alert("无法打开视频", isPresented: Binding(get: { playbackError != nil },
-                                               set: { if !$0 { playbackError = nil } })) {
-            Button("好", role: .cancel) {}
-        } message: { Text(playbackError ?? "") }
-        .confirmationDialog("从 VR 片库移除这个文件夹？", isPresented: Binding(
-            get: { pendingRemoval != nil }, set: { if !$0 { pendingRemoval = nil } }),
-            titleVisibility: .visible, presenting: pendingRemoval) { root in
-            Button("移除文件夹记录", role: .destructive) {
-                cancelOpen(); library.forget(root); pendingRemoval = nil
-            }
-            Button("取消", role: .cancel) {}
-        } message: { root in Text("原文件仍保存在「文件」的 \(root.name) 中。") }
-        .task {
-            guard !restored else { return }
-            restored = true
-            library.restoreLastSelection()
-        }
-        .onDisappear { cancelOpen() }
+        .buttonStyle(.plain).padding(.horizontal, 16)
+        .accessibilityIdentifier("makeCompatibleCopy")
     }
 
     private var afterglowActions: some View {
