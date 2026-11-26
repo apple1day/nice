@@ -45,7 +45,11 @@ if [[ -n "$hvc1_mode" ]]; then
   if $full || $source_sample || { [[ "$hvc1_mode" == --hvc1-full ]] && [[ "$start" != 0 ]]; }; then
     usage >&2; exit 2
   fi
-  if [[ "$hvc1_mode" == --hvc1-full ]]; then start=full; fi
+  if [[ "$hvc1_mode" == --hvc1-full ]]; then
+    start=full
+  elif [[ "$start" == full ]]; then
+    usage >&2; exit 2
+  fi
   mkdir -p "$destination"
   folder=$(mktemp -d "${destination%/}/NiceVideos-VR-XXXXXXXX")
   python3 "$(dirname "$0")/hevc_sample.py" "$input" "$start" "$folder" || { rmdir "$folder" 2>/dev/null || true; exit 1; }
