@@ -297,6 +297,10 @@ enum VRPinchResponse: String, CaseIterable {
                 }
                 Section("片源信息") {
                     LabeledContent("当前解码", value: decoder)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("当前解码")
+                        .accessibilityValue(decoder)
+                        .accessibilityIdentifier("vrCurrentDecoder")
                     if let details { Text(details).font(.footnote) }
                     if let decoderAction { Button(decoderAction) { onDecoderChange(); dismiss() } }
                     if !usesAfterglowPreset {

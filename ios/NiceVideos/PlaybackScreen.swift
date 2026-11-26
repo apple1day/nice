@@ -879,7 +879,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         let profile = Binding<VRMoviePreferences>(get: { vrProfile }, set: { applyProfile($0) })
         return VRViewerSettingsView(profile: profile, followHead: gyro, nativeResolution: $nativeResolution,
                              doubleTap: $doubleTap, pinchResponse: $pinchResponse, wakeGesture: $wakeGesture,
-                             sensorAvailable: camera.sensorAvailable, decoder: activeOutput.title,
+                             sensorAvailable: camera.sensorAvailable, decoder: model.videoOutput?.title ?? "正在打开…",
                              details: details, decoderAction: action,
                              onCopyDiagnostics: model.copyPlaybackDiagnostics,
                              onDecoderChange: { selectOutput(appleActive ? .vlcFrames : retryOutput) },

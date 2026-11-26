@@ -117,6 +117,7 @@ final class VRFolderLibraryUITests: XCTestCase {
 
     func testAfterglowPresetAppliesBeforeFolderMovieAndSurvivesRelaunch() throws {
         continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
         let app = XCUIApplication()
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "panorama-chart", withExtension: "mp4"))
         app.launchArguments = ["--ui-test-vr-folder"]
@@ -128,18 +129,24 @@ final class VRFolderLibraryUITests: XCTestCase {
         }
         func openTab() {
             app.launch()
-            let tab = app.tabBars.buttons["VR"]
+            let byID = app.tabBars.buttons["vrFolderTab"]
+            let tab = byID.exists ? byID : app.tabBars.buttons["VR"]
             XCTAssertTrue(tab.waitForExistence(timeout: 10))
             tab.tap()
         }
         openTab()
-        defer { app.terminate() }
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
         XCTAssertTrue(control("afterglowOpenVideo").exists)
+        attachVRScreen("Afterglow XR entry")
         control("afterglowOpenSettings").tap()
-        let headset = control("vrHeadsetToggle")
-        XCTAssertTrue(headset.waitForExistence(timeout: 6))
-        if headset.value as? String == "1" { headset.tap() }
-        XCTAssertEqual(headset.value as? String, "0")
+        let headset = app.switches.matching(identifier: "vrHeadsetToggle").firstMatch
+        XCTAssertTrue(headset.waitForExistence(timeout: 6), app.debugDescription)
+        attachVRScreen("Afterglow XR playback presets")
+        if headset.value as? String == "1" {
+            headset.coordinate(withNormalizedOffset: CGVector(dx: 0.88, dy: 0.5)).tap()
+        }
+        let singleScreen = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '0'"), object: headset)
+        XCTAssertEqual(XCTWaiter.wait(for: [singleScreen], timeout: 5), .completed)
         XCTAssertTrue(control("afterglowFrameRate").exists)
         control("afterglowSettingsDone").tap()
         app.terminate()
@@ -148,12 +155,29 @@ final class VRFolderLibraryUITests: XCTestCase {
         let play = control("afterglowEntry-Panorama Demo.mp4")
         XCTAssertTrue(play.waitForExistence(timeout: 12))
         play.tap()
+        let surface = control("playbackSurfaceToggle")
+        XCTAssertTrue(surface.waitForExistence(timeout: 12), app.debugDescription)
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.95)).tap()
+        let toggle = app.buttons["togglePlaybackButton"]
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true AND enabled == true AND label == %@", "暂停"),
+            object: toggle)
+        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 8), .completed, app.debugDescription)
+        toggle.tap()
+        let paused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "播放"), object: toggle)
+        XCTAssertEqual(XCTWaiter.wait(for: [paused], timeout: 6), .completed, app.debugDescription)
         let format = control("videoFormatButton")
-        XCTAssertTrue(format.waitForExistence(timeout: 12), app.debugDescription)
         XCTAssertEqual(format.value as? String, "360° 全景")
         XCTAssertEqual(control("vrHeadsetButton").label, "切换双眼眼镜")
         format.tap()
-        XCTAssertTrue(app.staticTexts["Afterglow XR"].waitForExistence(timeout: 8), app.debugDescription)
+        XCTAssertTrue(control("copyPlaybackDiagnostics").waitForExistence(timeout: 6))
+        let decoder = control("vrCurrentDecoder")
+        for _ in 0..<4 {
+            if decoder.exists && decoder.isHittable { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(decoder.exists && decoder.isHittable, app.debugDescription)
+        XCTAssertEqual(decoder.value as? String, "Afterglow XR", app.debugDescription)
     }
 
     private func attachVRScreen(_ name: String) {
