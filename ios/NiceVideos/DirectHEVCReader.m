@@ -7,11 +7,51 @@ static NSError *DecodeError(NSString *stage, OSStatus code) {
                            userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"%@ (%d)", stage, (int)code]}];
 }
 
+// AVAssetReader returns compressed media timestamps and may attach an edit
+// mapping. AVPlayer's clock and all seek/presentation decisions use output time.
+static CMTime OutputPTS(CMSampleBufferRef sample) {
+    CMTime time = CMSampleBufferGetOutputPresentationTimeStamp(sample);
+    return CMTIME_IS_NUMERIC(time) ? time : CMSampleBufferGetPresentationTimeStamp(sample);
+}
+
+static CMTime OutputDTS(CMSampleBufferRef sample) {
+    CMTime time = CMSampleBufferGetOutputDecodeTimeStamp(sample);
+    return CMTIME_IS_NUMERIC(time) ? time : OutputPTS(sample);
+}
+
 static BOOL IsSync(CMSampleBufferRef sample) {
+    CMBlockBufferRef data = CMSampleBufferGetDataBuffer(sample);
+    if (!data || CMSampleBufferGetNumSamples(sample) != 1) return NO;
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, false);
-    if (!attachments || CFArrayGetCount(attachments) == 0) return YES;
-    CFDictionaryRef flags = CFArrayGetValueAtIndex(attachments, 0);
-    return CFDictionaryGetValue(flags, kCMSampleAttachmentKey_NotSync) != kCFBooleanTrue;
+    if (attachments && CFArrayGetCount(attachments)) {
+        CFDictionaryRef flags = CFArrayGetValueAtIndex(attachments, 0);
+        if (CFDictionaryGetValue(flags, kCMSampleAttachmentKey_NotSync) != kCFBooleanTrue) return YES;
+    }
+    // Some unrecognised HEVC sample entries have incomplete dependency flags.
+    // Inspect NAL headers only; IRAP access units start an independent decode.
+    CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample);
+    if (!format) return NO;
+    NSDictionary *atoms = (__bridge NSDictionary *)CMFormatDescriptionGetExtension(format,
+                              kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
+    NSData *config = atoms[@"hvcC"];
+    if (![config isKindOfClass:NSData.class] || config.length < 23) {
+        return CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC && !attachments;
+    }
+    const uint8_t *record = config.bytes;
+    size_t header = (record[21] & 3) + 1;
+    size_t at = 0, total = CMBlockBufferGetDataLength(data);
+    for (int i = 0; i < 256 && at + header + 2 <= total; i++) {
+        uint8_t prefix[6];
+        if (CMBlockBufferCopyDataBytes(data, at, header + 2, prefix) != noErr) return NO;
+        size_t size = 0;
+        for (size_t j = 0; j < header; j++) size = (size << 8) | prefix[j];
+        at += header;
+        if (size < 2 || size > total - at) return NO;
+        unsigned type = (prefix[header] >> 1) & 63;
+        if (type < 32) return type >= 16 && type <= 21;
+        at += size;
+    }
+    return NO;
 }
 
 // hev1 can carry additional parameter sets in-band. Preserve its NAL units unchanged.
@@ -98,15 +138,22 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
     // indexed time range around the requested position until it contains a sync
     // sample preceding the target. Never decode from zero after a long seek.
     double lookbacks[] = {0, 1, 4, 16};
+    NSUInteger packets = 0, syncs = 0;
+    double firstRaw = NAN, firstOutput = NAN, firstDecode = NAN, lastOutput = NAN;
+    double lastStart = 0;
     for (size_t attempt = 0; attempt < sizeof(lookbacks)/sizeof(*lookbacks); attempt++) {
         [_reader cancelReading];
         _reader = [[AVAssetReader alloc] initWithAsset:_asset error:error];
         if (!_reader) return NO;
         _output = [[AVAssetReaderTrackOutput alloc] initWithTrack:_track outputSettings:nil];
         _output.alwaysCopiesSampleData = NO;
-        if (![_reader canAddOutput:_output]) break;
+        if (![_reader canAddOutput:_output]) {
+            *error = DecodeError(@"cannot add compressed HEVC track output", -2);
+            return NO;
+        }
         [_reader addOutput:_output];
         double start = MAX(target - lookbacks[attempt], 0);
+        lastStart = start;
         if (start > 0) _reader.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(start, 60000), kCMTimePositiveInfinity);
         if (![_reader startReading]) {
             *error = _reader.error ?: DecodeError(@"compressed reader", -1);
@@ -116,15 +163,30 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
         for (int packet = 0; packet < 1024; packet++) {
             _next = [_output copyNextSampleBuffer];
             if (!_next) break;
-            double pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(_next));
-            if (IsSync(_next) && isfinite(pts) && pts <= target + 0.025) return YES;
+            double pts = CMTimeGetSeconds(OutputPTS(_next));
+            if (packets++ == 0) {
+                firstRaw = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(_next));
+                firstOutput = pts;
+                firstDecode = CMTimeGetSeconds(OutputDTS(_next));
+            }
+            lastOutput = pts;
+            BOOL sync = IsSync(_next);
+            if (sync) syncs++;
+            // The first access unit at the physical start is valid preroll
+            // even when its PTS is positive (B frames, an empty head edit).
+            // The output clock below still holds this picture until it is due.
+            if (sync && isfinite(pts) && (pts <= target + 0.002 || (start == 0 && packet == 0))) return YES;
             CFRelease(_next);
             _next = NULL;
             if (pts > target + 0.25) break;
         }
         if (start == 0) break;
     }
-    *error = _reader.error ?: DecodeError(@"no nearby HEVC sync sample", -2);
+    NSString *detail = [NSString stringWithFormat:
+        @"no nearby HEVC sync sample: target=%.3f rangeStart=%.3f packets=%lu syncs=%lu firstPTS=%.3f firstOutputPTS=%.3f firstOutputDTS=%.3f lastOutputPTS=%.3f reader=%ld",
+        target, lastStart, (unsigned long)packets, (unsigned long)syncs, firstRaw, firstOutput, firstDecode,
+        lastOutput, (long)_reader.status];
+    *error = _reader.error ?: DecodeError(detail, -2);
     return NO;
 }
 
@@ -189,7 +251,8 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
         *error = DecodeError(@"compressed sample timing", status);
         return NO;
     }
-    double pts = CMTimeGetSeconds(timing.presentationTimeStamp);
+    CMTime outputPTS = OutputPTS(source);
+    double pts = CMTimeGetSeconds(outputPTS);
     // Decode references even when their presentation deadlines have passed.
     VTDecodeFrameFlags flags = pts < clock - 0.15 ? kVTDecodeFrame_DoNotOutputFrame : 0;
     __block OSStatus delivery = noErr;
@@ -201,7 +264,7 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
             if (CVPixelBufferGetPixelFormatType(image) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
                 w == 0 || h == 0 || w > self->_sourceDimensions.width || h > self->_sourceDimensions.height ||
                 MAX(w, h) > 8192 || w*h > 36u*1024u*1024u ||
-                !CVPixelBufferGetIOSurface(image) || !CMTIME_IS_NUMERIC(timestamp)) {
+                !CVPixelBufferGetIOSurface(image) || !CMTIME_IS_NUMERIC(outputPTS)) {
                 delivery = -7;
                 return;
             }
@@ -211,7 +274,10 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
             self->_surfaceLimit = MAX(1, MIN(2, (128u*1024u*1024u)/bytes));
             CMVideoFormatDescriptionRef imageFormat = NULL;
             CMSampleBufferRef picture = NULL;
-            CMSampleTimingInfo outputTime = {duration, timestamp, kCMTimeInvalid};
+            // The output handler belongs to this input packet. Its timestamp
+            // may still be raw media PTS. Publish the asset-timeline timestamp
+            // of this packet (including any edit offset), including B frames.
+            CMSampleTimingInfo outputTime = {duration, outputPTS, kCMTimeInvalid};
             delivery = CMVideoFormatDescriptionCreateForImageBuffer(NULL, image, &imageFormat);
             if (delivery == noErr) delivery = CMSampleBufferCreateReadyWithImageBuffer(NULL, image, imageFormat, &outputTime, &picture);
             if (imageFormat) CFRelease(imageFormat);
@@ -263,8 +329,7 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
             if (_reader.status == AVAssetReaderStatusFailed) *error = _reader.error ?: DecodeError(@"compressed read", -8);
             break;
         }
-        CMTime time = CMSampleBufferGetDecodeTimeStamp(_next);
-        if (!CMTIME_IS_NUMERIC(time)) time = CMSampleBufferGetPresentationTimeStamp(_next);
+        CMTime time = OutputDTS(_next);
         double lookahead = _pictures.count < _surfaceLimit ? 0.1 : 0;
         if (CMTimeGetSeconds(time) > seconds + lookahead) break;
         BOOL ok = [self decode:_next clock:seconds error:error];
