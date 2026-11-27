@@ -8,8 +8,10 @@ import android.database.Cursor;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
+import android.provider.MediaStore;
 import org.json.JSONObject;
 import org.json.JSONException;
 import java.io.File;
@@ -183,6 +185,36 @@ final class VideoLibrary {
         return file;
     }
 
+    // A MediaStore URI follows renames. Bulk deletion only applies to the recorded destination.
+    boolean atRecordedLocation(Entry e) throws IOException {
+        if (!e.publicDownload) return true;
+        if (!e.publicUri.isEmpty()) {
+            Uri location = Uri.parse(e.publicUri);
+            if ("file".equals(location.getScheme())) return e.disk.equals(publicFile(location).getName());
+            if (!MediaStore.AUTHORITY.equals(location.getAuthority())) return false;
+            String column = Build.VERSION.SDK_INT >= 29 ? MediaStore.MediaColumns.RELATIVE_PATH : MediaStore.MediaColumns.DATA;
+            try (Cursor c = context.getContentResolver().query(location,
+                    new String[]{MediaStore.MediaColumns.DISPLAY_NAME, column}, null, null, null)) {
+                if (c == null) throw new IOException("无法核对公共目录。");
+                if (!c.moveToFirst() || !e.disk.equals(c.getString(0))) return false;
+                String path = c.getString(1);
+                if (Build.VERSION.SDK_INT >= 29)
+                    return (Environment.DIRECTORY_DOWNLOADS + "/" + PUBLIC_FOLDER + "/").equals(path);
+                return path != null && publicFile(Uri.fromFile(new File(path))).getName().equals(e.disk);
+            }
+        }
+        if (e.job < 0) return false;
+        try (Cursor c = manager().query(new DownloadManager.Query().setFilterById(e.job))) {
+            if (c == null) throw new IOException("无法核对下载记录。");
+            if (!c.moveToFirst() || c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                    != DownloadManager.STATUS_SUCCESSFUL) return false;
+            String path = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI));
+            if (path == null) return false;
+            Uri location = Uri.parse(path);
+            return "file".equals(location.getScheme()) && e.disk.equals(publicFile(location).getName());
+        }
+    }
+
     private ParcelFileDescriptor openDownload(Entry e) throws IOException {
         if (!e.publicDownload) return ParcelFileDescriptor.open(file(e), ParcelFileDescriptor.MODE_READ_ONLY);
         if (!e.publicUri.isEmpty()) {
@@ -253,17 +285,24 @@ final class VideoLibrary {
     }
 
     private void removeTransfer(Entry e) throws IOException {
-        if (e.job >= 0) manager().remove(e.job);
+        int removedJobs = e.job >= 0 ? manager().remove(e.job) : 0;
         if (e.publicDownload) {
             // The system removes a DownloadManager-owned file together with its job.
-            // A migrated copy has no job; delete only its recorded destination.
-            if (e.job < 0 && !e.publicUri.isEmpty()) {
+            // A completed file may outlive its job. Only use a recorded destination as a fallback.
+            if (removedJobs == 0 && e.publicUri.isEmpty() && READY.equals(e.state)) {
+                File recorded = publicFile(Uri.fromFile(new File(publicDirectory(), e.disk)));
+                if (recorded.exists()) throw new IOException("系统未删除这部影片，下载记录已保留。");
+            }
+            if (removedJobs == 0 && !e.publicUri.isEmpty()) {
+                if (e.job >= 0 && !atRecordedLocation(e) && !missingPublicFile(e))
+                    throw new IOException("下载文件的位置已更改，已保留。");
                 Uri location = Uri.parse(e.publicUri);
                 if ("file".equals(location.getScheme())) {
                     File f = publicFile(location);
                     if (f.exists() && !f.delete()) throw new IOException("无法删除公共目录中的影片。");
                 } else {
-                    context.getContentResolver().delete(location, null, null);
+                    int removed = context.getContentResolver().delete(location, null, null);
+                    if (removed == 0 && !missingPublicFile(e)) throw new IOException("无法删除公共目录中的影片。");
                 }
             }
             return;

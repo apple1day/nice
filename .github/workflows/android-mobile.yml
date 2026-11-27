@@ -1,8 +1,8 @@
 name: Android mobile download and playback
 on:
   push:
-    branches: ['feat/android-1.3.10']
-    paths: ['android/app/**', 'android/test-fixtures.sh', 'android/tools/check_mobile_transfers.sh', '.github/workflows/android-mobile.yml']
+    branches: ['fix/android-bulk-delete']
+    paths: ['android/app/**', 'android/test-fixtures.sh', 'android/tools/check_mobile_transfers.sh', 'android/tools/sign_mobile_update.command', '.github/workflows/android-mobile.yml']
   workflow_dispatch:
 
 permissions:
@@ -23,45 +23,60 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y ffmpeg age
           fi
-      - name: Prepare mobile signer
+      - name: Select compatible update or independently installable build
         env:
-          PRIVATE_STORE: ${{ secrets.NICE_MOBILE_KEYSTORE_B64 }}
-          PRIVATE_PASSWORD: ${{ secrets.NICE_MOBILE_STORE_PASS }}
+          ORIGINAL_STORE: ${{ secrets.NICE_MOBILE_KEYSTORE_B64 }}
+          ORIGINAL_PASSWORD: ${{ secrets.NICE_MOBILE_STORE_PASS }}
+          DOWNLOADS_STORE: ${{ secrets.NICE_DOWNLOADS_KEYSTORE_B64 }}
+          DOWNLOADS_PASSWORD: ${{ secrets.NICE_DOWNLOADS_STORE_PASS }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           umask 077
           sign="$RUNNER_TEMP/nice-mobile-sign"
           mkdir -p "$sign"
-          if [[ -n "$PRIVATE_STORE" && -n "$PRIVATE_PASSWORD" ]]; then
-            printf %s "$PRIVATE_STORE" | base64 -d > "$sign/release.p12"
-            password="$PRIVATE_PASSWORD"
+          if [[ -n "$ORIGINAL_STORE" && -n "$ORIGINAL_PASSWORD" ]]; then
+            printf %s "$ORIGINAL_STORE" | base64 -d > "$sign/release.p12"
+            password="$ORIGINAL_PASSWORD"
+            id='com.anxiong.nicevideos.mobile'
+            flags=''
           else
-            if [[ -e android/NiceVideos-Mobile.apk ]]; then
-              echo "Use the existing mobile release key to distribute the next update."; exit 1
+            id='com.anxiong.nicevideos.mobile.downloads'
+            flags='-PstandaloneDownloads'
+            if [[ -n "$DOWNLOADS_STORE" && -n "$DOWNLOADS_PASSWORD" ]]; then
+              printf %s "$DOWNLOADS_STORE" | base64 -d > "$sign/release.p12"
+              password="$DOWNLOADS_PASSWORD"
+            else
+              if [[ -f android/releases/1.3.11/NiceVideos-Android-1.3.11.apk ]]; then
+                echo 'Supply the established downloads signing identity for subsequent releases.'; exit 1
+              fi
+              password=$(openssl rand -hex 32)
+              echo "::add-mask::$password"
+              printf '%s\n' "$password" > "$sign/password.txt"
+              keytool -genkeypair -storetype PKCS12 -alias nice-mobile -keyalg RSA -keysize 3072 -sigalg SHA256withRSA -validity 13000 -dname 'CN=NiceVideos Downloads' -keystore "$sign/release.p12" -storepass:file "$sign/password.txt"
+              gh api "users/$GITHUB_REPOSITORY_OWNER/keys?per_page=100" --jq '.[].key' | awk '/^ssh-(rsa|ed25519) /' > "$sign/recipients"
+              echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMYzlcjAwomYe2/HM6ZdAUTmMp3DPFSWi36aBWulS5as nice-mobile-downloads-recovery' >> "$sign/recipients"
+              tar -C "$sign" -cf - release.p12 password.txt | age -R "$sign/recipients" -o "$RUNNER_TEMP/NiceVideos-Downloads-Recovery.tar.age"
             fi
-            password=$(openssl rand -hex 32)
-            echo "::add-mask::$password"
-            printf '%s\n' "$password" > "$sign/password.txt"
-            keytool -genkeypair -storetype PKCS12 -alias nice-mobile -keyalg RSA -keysize 3072 -sigalg SHA256withRSA -validity 15000 -dname 'CN=NiceVideos Mobile' -keystore "$sign/release.p12" -storepass:file "$sign/password.txt"
-            gh api "users/$GITHUB_REPOSITORY_OWNER/keys?per_page=100" --jq '.[].key' | awk '/^ssh-(rsa|ed25519) /' > "$sign/recipients"
-            test -s "$sign/recipients"
-            tar -C "$sign" -cf - release.p12 password.txt | age -R "$sign/recipients" -o "$RUNNER_TEMP/NiceVideos-Mobile-Recovery.tar.age"
           fi
           echo "::add-mask::$password"
-          printf 'NICE_MOBILE_STORE_FILE=%s\nNICE_MOBILE_STORE_PASS=%s\n' "$sign/release.p12" "$password" >> "$GITHUB_ENV"
+          printf 'NICE_MOBILE_STORE_FILE=%s\nNICE_MOBILE_STORE_PASS=%s\nMOBILE_ID=%s\nMOBILE_FLAGS=%s\n' "$sign/release.p12" "$password" "$id" "$flags" >> "$GITHUB_ENV"
       - name: Build mobile release and its exact instrumentation target
         working-directory: android
-        run: ./gradlew --stacktrace -PtestMobile :app:assembleMobile :app:assembleMobileAndroidTest :app:testMobileUnitTest
+        run: ./gradlew --stacktrace -PtestMobile $MOBILE_FLAGS :app:assembleMobile :app:assembleMobileAndroidTest :app:testMobileUnitTest
       - name: Verify signed mobile APK
         working-directory: android
         run: |
           set -euo pipefail
+          cp NiceVideos-Mobile.apk "$RUNNER_TEMP/original-mobile.apk"
           cp app/build/outputs/apk/mobile/app-mobile.apk NiceVideos-Mobile.apk
           sdk="$ANDROID_HOME/build-tools/35.0.0"
           "$sdk/apksigner" verify --verbose --print-certs NiceVideos-Mobile.apk
           "$sdk/aapt" dump badging NiceVideos-Mobile.apk > "$RUNNER_TEMP/badging"
-          grep -F "package: name='com.anxiong.nicevideos.mobile' versionCode='22' versionName='1.3.10'" "$RUNNER_TEMP/badging"
+          grep -F "package: name='$MOBILE_ID' versionCode='23' versionName='1.3.11'" "$RUNNER_TEMP/badging"
+          if [[ "$MOBILE_ID" == com.anxiong.nicevideos.mobile ]]; then
+            "$sdk/apksigner" verify --print-certs NiceVideos-Mobile.apk | grep -F 'certificate SHA-256 digest: 94b219553d6b9f07108b25d9be09764e94445e9f140200635e33ba7626f6a21b'
+          fi
           sha256sum NiceVideos-Mobile.apk
       - name: Enable emulator acceleration
         run: sudo chmod 666 /dev/kvm
@@ -74,7 +89,7 @@ jobs:
           disk-size: 12G
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: cd android && ./gradlew -PtestMobile :app:connectedMobileAndroidTest
+          script: cd android && ./gradlew -PtestMobile $MOBILE_FLAGS :app:connectedMobileAndroidTest
       - name: Keep Android 11 test reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -83,7 +98,7 @@ jobs:
           path: |
             android/app/build/outputs/androidTest-results/
             android/app/build/reports/tests/
-      - name: Android 15 release download and upload
+      - name: Android 15 installation, deletion and transfers
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -111,7 +126,37 @@ jobs:
         with:
           name: Mobile-owner-encrypted-recovery
           if-no-files-found: ignore
-          path: ${{ runner.temp }}/NiceVideos-Mobile-Recovery.tar.age
+          path: ${{ runner.temp }}/NiceVideos-Downloads-Recovery.tar.age
+      - name: Assemble local owner update kit for existing installations
+        if: env.MOBILE_ID == 'com.anxiong.nicevideos.mobile.downloads'
+        working-directory: android
+        run: |
+          set -euo pipefail
+          ./gradlew -PtestMobile :app:assembleMobile
+          kit="$RUNNER_TEMP/owner-kit"
+          mkdir -p "$kit/tools"
+          cp app/build/outputs/apk/mobile/app-mobile.apk "$kit/payload.apk"
+          sdk="$ANDROID_HOME/build-tools/35.0.0"
+          "$sdk/zipalign" -c -P 16 4 "$kit/payload.apk"
+          "$sdk/aapt" dump badging "$kit/payload.apk" > "$RUNNER_TEMP/payload.badging"
+          grep -F "package: name='com.anxiong.nicevideos.mobile' versionCode='23' versionName='1.3.11'" "$RUNNER_TEMP/payload.badging"
+          cp "$sdk/lib/apksigner.jar" "$kit/apksigner.jar"
+          cp tools/sign_mobile_update.command "$kit/更新安装包.command"
+          tmpgo=$(mktemp -d)
+          cd "$tmpgo"
+          go mod init nice-release-helper
+          go get filippo.io/age/cmd/age@v1.2.1
+          for arch in arm64 amd64; do
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -trimpath -o "$kit/tools/age-$arch" filippo.io/age/cmd/age
+          done
+          # Exercise real v2/v3 re-signing of the exact payload locally in CI.
+          java -jar "$kit/apksigner.jar" sign --ks "$NICE_MOBILE_STORE_FILE" --ks-type PKCS12 --ks-key-alias nice-mobile --ks-pass env:NICE_MOBILE_STORE_PASS --out "$tmpgo/resigned.apk" "$kit/payload.apk"
+          java -jar "$kit/apksigner.jar" verify "$tmpgo/resigned.apk"
+      - uses: actions/upload-artifact@v4
+        if: success() && env.MOBILE_ID == 'com.anxiong.nicevideos.mobile.downloads'
+        with:
+          name: Mobile-owner-update-kit
+          path: ${{ runner.temp }}/owner-kit/
       - name: Clear temporary signing files
         if: always()
         run: rm -rf "$RUNNER_TEMP/nice-mobile-sign"

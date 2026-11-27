@@ -43,19 +43,23 @@ public final class MainActivity extends Activity {
     private static final int PICK_FOR_UPLOAD = 47;
     private MovieExportTask exports;
     private MovieUploadTask uploads;
+    private DownloadedVideoDeletion deletions;
+    private boolean preparingDeletion;
     private String pendingUploadServer;
 
     private static final class Transfers {
         final MovieExportTask exports;
         final MovieUploadTask uploads;
-        Transfers(MovieExportTask exports, MovieUploadTask uploads) {
+        final DownloadedVideoDeletion deletions;
+        Transfers(MovieExportTask exports, MovieUploadTask uploads, DownloadedVideoDeletion deletions) {
             this.exports = exports;
             this.uploads = uploads;
+            this.deletions = deletions;
         }
     }
 
     private String pendingExportId; // Empty string selects all completed downloads.
-    private TextView exportAll, clearMissing;
+    private TextView exportAll, clearMissing, deleteDownloads;
     private final ExecutorService migrations = Executors.newSingleThreadExecutor();
     private final Set<String> missing = new HashSet<>();
     private boolean migrating, rescanAfterMigration;
@@ -96,6 +100,7 @@ public final class MainActivity extends Activity {
         Transfers retained = (Transfers)getLastNonConfigurationInstance();
         exports = retained == null ? new MovieExportTask(library) : retained.exports;
         uploads = retained == null ? new MovieUploadTask(getApplicationContext().getContentResolver()) : retained.uploads;
+        deletions = retained == null ? new DownloadedVideoDeletion(library) : retained.deletions;
         if (state != null) pendingUploadServer = state.getString("uploadServer");
         if (state != null) pendingExportId = state.getString("exportId");
         vrFolders = new VrFolderLibrary(this);
@@ -117,6 +122,10 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         build();
+        deletions.listen(() -> {
+            updatePanel(); refreshRows();
+            if (!deletions.running()) { checkPublicFiles(); startMigration(); }
+        });
         exports.listen(() -> { updatePanel(); refreshRows(); });
         uploads.listen(finished -> {
             if (finished) {
@@ -208,6 +217,7 @@ public final class MainActivity extends Activity {
     private void updatePanel() {
         exportAll = null;
         clearMissing = null;
+        deleteDownloads = null;
         panel.removeAllViews();
         LinearLayout heading = row(); panel.addView(heading, -1, dp(50));
         if (tab == Tab.VR) {
@@ -245,8 +255,11 @@ public final class MainActivity extends Activity {
             heading.addView(pill("打开文件", true, () -> pick(PICK)));
             LinearLayout downloads = row(); downloads.setPadding(0, dp(7), 0, 0); panel.addView(downloads);
             downloads.addView(pill("视频直链", false, this::directDownload)); gap(downloads);
+            deleteDownloads = pill("一键删除已下载视频", false, this::confirmDeleteDownloads);
+            deleteDownloads.setTextColor(0xffffb4ab);
+            downloads.addView(deleteDownloads);
             clearMissing = pill("清理已删除记录", false, this::confirmClearMissing);
-            downloads.addView(clearMissing);
+            panel.addView(clearMissing, -2, -2);
             clearMissing.setVisibility(missing.isEmpty() ? View.GONE : View.VISIBLE);
             LinearLayout chips = row(); chips.setPadding(0, dp(7), 0, 0); panel.addView(chips);
             String[] names = {"全部", "收藏", "已下载"};
@@ -258,7 +271,7 @@ public final class MainActivity extends Activity {
             }
             if (library.all().stream().anyMatch(LegacyDownloadMigration::needsMigration)) {
                 TextView migrate = pill(migrating ? "正在迁移…" : "迁移历史下载", false, this::confirmMigration);
-                migrate.setEnabled(!migrating && !exports.running());
+                migrate.setEnabled(!migrating && !exports.running() && !deletions.running());
                 panel.addView(migrate, -1, dp(44));
             }
         }
@@ -266,9 +279,10 @@ public final class MainActivity extends Activity {
 
     private void refreshRows() {
         rows.clear(); sources.clear();
-        boolean hasExport = false;
+        boolean hasExport = false, hasDownloads = false;
         for (VideoLibrary.Entry e : library.all()) {
             if (e.downloaded()) sources.put(e.source, e);
+            hasDownloads |= DownloadedVideoDeletion.eligible(e) && !missing.contains(e.id);
             hasExport |= MovieExporter.eligible(e) && !missing.contains(e.id);
             if (tab == Tab.LOCAL && (filter == 0 || (filter == 1 && e.favorite) || (filter == 2 && e.downloaded()))) rows.add(e);
         }
@@ -291,13 +305,19 @@ public final class MainActivity extends Activity {
                     "还没有离线副本。可粘贴视频直链，或从服务器下载。" : "点「视频直链」下载影片，或点「打开文件」播放本机视频。";
         }
         if (clearMissing != null) clearMissing.setVisibility(missing.isEmpty() ? View.GONE : View.VISIBLE);
+        if (deleteDownloads != null) {
+            boolean enabled = hasDownloads && !preparingDeletion && !deletions.running() && !exports.running() && !migrating;
+            deleteDownloads.setEnabled(enabled);
+            deleteDownloads.setAlpha(enabled ? 1f : .5f);
+        }
         if (exportAll != null) {
-            boolean enabled = hasExport && !exports.running() && !migrating;
+            boolean enabled = hasExport && !exports.running() && !migrating && !deletions.running();
             exportAll.setEnabled(enabled);
             exportAll.setAlpha(enabled ? 1f : .5f);
         }
         if (tab == Tab.LOCAL && !migrationStatus.isEmpty()) message = migrationStatus;
         if (tab == Tab.LOCAL && !exports.status().isEmpty() && !migrating) message = exports.status();
+        if (tab == Tab.LOCAL && !deletions.status().isEmpty()) message = deletions.status();
         feedback.setText(message); feedback.setVisibility(message.isEmpty() ? View.GONE : View.VISIBLE);
         adapter.notifyDataSetChanged();
     }
@@ -381,7 +401,8 @@ public final class MainActivity extends Activity {
     }
 
     private void pickExportFolder(String id) {
-        if (migrating || exports.running() || pendingExportId != null) return;
+        if (migrating || exports.running() || deletions.running() || pendingExportId != null) return;
+        deletions.clearStatus();
         Intent choose = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
                 .putExtra(Intent.EXTRA_LOCAL_ONLY, true)
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
@@ -546,7 +567,7 @@ public final class MainActivity extends Activity {
             return true;
         });
         if (MovieExporter.eligible(e) && !missing.contains(e.id)) {
-            menu.getMenu().add("导出到文件夹").setEnabled(!migrating && !exports.running()).setOnMenuItemClickListener(item -> {
+            menu.getMenu().add("导出到文件夹").setEnabled(!migrating && !exports.running() && !deletions.running()).setOnMenuItemClickListener(item -> {
                 pickExportFolder(e.id);
                 return true;
             });
@@ -595,6 +616,38 @@ public final class MainActivity extends Activity {
             } catch (IOException ex) { url.setError(ex.getMessage()); }
         }));
         dialog.show();
+    }
+
+    private void confirmDeleteDownloads() {
+        if (preparingDeletion || deletions.running() || migrating || exports.running() || pendingExportId != null) return;
+        preparingDeletion = true;
+        refreshRows();
+        jobs.execute(() -> {
+            DownloadedVideoDeletion.Plan plan = deletions.prepare();
+            main.post(() -> {
+                if (!live()) return;
+                preparingDeletion = false;
+                refreshRows();
+                if (!resumed || tab != Tab.LOCAL || migrating || exports.running()) return;
+                if (plan.copies.isEmpty()) {
+                    toast(plan.unavailable == 0 ? "没有可删除的已下载视频。" : "暂时无法访问已下载的视频，请稍后重试。");
+                    return;
+                }
+                String hint = "将删除 " + plan.copies.size() + " 部已下载视频，包括收藏中的下载。"
+                        + "本机文件和对应的下载记录都会删除，其他播放器也无法再打开这些副本。"
+                        + "服务器原片、另存的副本和手动打开的影片会保留。"
+                        + (plan.unavailable == 0 ? "" : "\n另有 " + plan.unavailable + " 部暂时无法核对，将跳过。");
+                new AlertDialog.Builder(this).setTitle("一键删除已下载视频").setMessage(hint)
+                        .setNegativeButton("取消", null).setPositiveButton("确认删除", (dialog, which) -> {
+                            if (migrating || exports.running() || pendingExportId != null) {
+                                toast("请等当前文件操作完成后重试。"); return;
+                            }
+                            exports.clearStatus();
+                            migrationStatus = "";
+                            deletions.start(plan);
+                        }).show();
+            });
+        });
     }
 
     private void confirmClearMissing() {
@@ -690,6 +743,7 @@ public final class MainActivity extends Activity {
                 .setMessage("影片会移到 Download/NiceVideos，校验成功后会清理旧文件。要同时保留原件，请使用「导出全部」。")
                 .setNegativeButton("取消", null).setPositiveButton("开始迁移", (d, w) -> {
                     exports.clearStatus();
+                    deletions.clearStatus();
                     getSharedPreferences("download_options", MODE_PRIVATE).edit().putBoolean(MIGRATION_REQUESTED, true).apply();
                     if (canWriteDownloads()) startMigration();
                     else requestDownloadPermission();
@@ -697,7 +751,7 @@ public final class MainActivity extends Activity {
     }
 
     private void startMigration() {
-        if (!canWriteDownloads() || exports.running() || pendingExportId != null) return;
+        if (!canWriteDownloads() || exports.running() || deletions.running() || pendingExportId != null) return;
         boolean batch = getSharedPreferences("download_options", MODE_PRIVATE).getBoolean(MIGRATION_REQUESTED, false);
         LegacyDownloadMigration migration = new LegacyDownloadMigration(library);
         Set<String> pending = migration.pendingIds();
@@ -745,13 +799,17 @@ public final class MainActivity extends Activity {
         }
     }
     @Override protected void onPause() { resumed = false; main.removeCallbacks(pollLater); super.onPause(); }
-    @Override public Object onRetainNonConfigurationInstance() { return new Transfers(exports, uploads); }
+    @Override public Object onRetainNonConfigurationInstance() { return new Transfers(exports, uploads, deletions); }
 
     @Override protected void onDestroy() {
         if (vrRead != null) vrRead.cancel();
         if (exports != null) {
             exports.listen(null);
             if (!isChangingConfigurations()) exports.close();
+        }
+        if (deletions != null) {
+            deletions.listen(null);
+            if (!isChangingConfigurations()) deletions.close();
         }
         if (uploads != null) {
             uploads.listen(null);
