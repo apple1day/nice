@@ -1,0 +1,83 @@
+name: Verify signed classic APK
+on:
+  push:
+    branches: [fix/android-classic-export]
+    paths:
+      - 'android/NiceVideos-1.0.1-classic-export.apk'
+      - '.github/workflows/classic-signed-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify signed APK and package identity
+        run: |
+          set -euo pipefail
+          apk=android/NiceVideos-1.0.1-classic-export.apk
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          "$tools/apksigner" verify --verbose --print-certs "$apk"
+          "$tools/aapt" dump badging "$apk" > "$RUNNER_TEMP/classic-badging.txt"
+          grep -F "package: name='com.anxiong.nicevideos' versionCode='2' versionName='1.0.1'" "$RUNNER_TEMP/classic-badging.txt"
+          sha256sum "$apk"
+      - name: Prepare device checks
+        run: |
+          cat > "$RUNNER_TEMP/verify-classic-signed.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ "${GITHUB_ACTIONS:-}" == true && "$(adb shell getprop ro.kernel.qemu | tr -d '\r')" == 1 ]]
+          apk=android/NiceVideos-1.0.1-classic-export.apk
+          pkg=com.anxiong.nicevideos
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          while read -r commit sha <&3; do
+            git show "$commit:android/NiceVideos.apk" > "$work/original.apk"
+            echo "$sha  $work/original.apk" | sha256sum -c -
+            adb install "$work/original.apk"
+            if adb install -r "$apk" > "$work/update.log" 2>&1; then
+              echo "The historical signing comparison unexpectedly accepted the new APK." >&2
+              exit 1
+            fi
+            grep -F 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' "$work/update.log"
+            adb shell dumpsys package "$pkg" > "$work/package.txt"
+            grep -F 'versionCode=1 ' "$work/package.txt"
+            adb uninstall "$pkg"
+          done 3<<'ORIGINALS'
+          f3a76ebf65f37bb2e6a997cace2a93ca21087e45 6507584a0e260f971a88d98b7f1226e249c76077fe613dfbf2de49775c95200b
+          1ef6092567f8faa0e3a3bc620011bf5314b33733 9b192ec696851c6e06c30b26032cd928e1cafd2fafad21ce46d0f7b661d75c03
+          ORIGINALS
+          adb install "$apk"
+          adb shell input keyevent WAKEUP
+          adb shell wm dismiss-keyguard
+          adb shell am start -W -n "$pkg/.MainActivity" > "$work/launch.txt"
+          grep -F 'Status: ok' "$work/launch.txt"
+          for attempt in {1..10}; do
+            if adb shell uiautomator dump /sdcard/classic-ui.xml >/dev/null &&
+               adb exec-out cat /sdcard/classic-ui.xml > "$work/ui.xml" &&
+               python3 -c 'import sys, xml.etree.ElementTree as ET; sys.exit(0 if any(n.get("package") == "com.anxiong.nicevideos" and n.get("text") == "导出全部" for n in ET.parse(sys.argv[1]).iter("node")) else 1)' "$work/ui.xml"; then
+              echo 'The shipped signed APK launched on Android 15 and displayed its export control.'
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$work/launch.txt" "$work/ui.xml"
+          exit 1
+          SCRIPT
+          bash -n "$RUNNER_TEMP/verify-classic-signed.sh"
+      - name: Enable emulator acceleration
+        run: sudo chmod 666 /dev/kvm
+      - name: Check historical signatures and launch the signed release
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: bash "$RUNNER_TEMP/verify-classic-signed.sh"
