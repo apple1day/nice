@@ -22,6 +22,9 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private var surface: AppleVideoSurface?
     private var loader: PickedAssetResourceLoader?
     private var frameHandler: ((CVPixelBuffer) -> Void)?
+    private var direct: DirectHEVCFrameOutput?
+    private(set) var directCandidate = false
+    private(set) var attemptedDirect = false
     private var stereo: AppleStereoFrameOutput?
     private var observations: [NSKeyValueObservation] = []
     private var displayObservation: NSKeyValueObservation?
@@ -39,6 +42,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private var failure: String?
     private var frameWatch = AppleVideoFrameWatch()
     private var videoTimeRange: CMTimeRange?
+    private(set) var vlcFrameColor: VLCFrameColor?
     private var isSDR = false
     private var frameRate: Float?
     private var trackDetails: String?
@@ -62,7 +66,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                 view.addSubview(video)
             }
             surface = video
-            video.videoLayer.player = afterglow && frameHandler != nil ? nil : player
+            video.videoLayer.player = direct != nil || (afterglow && frameHandler != nil) ? nil : player
             displayObservation = video.videoLayer.observe(\.isReadyForDisplay, options: [.new]) { [weak self] _, _ in
                 DispatchQueue.main.async { self?.publish() }
             }
@@ -73,6 +77,18 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         guard !stopped else { return }
         let returningToLayer = frameHandler != nil && handler == nil
         frameHandler = handler
+        if direct != nil {
+            if returningToLayer {
+                // This handoff only disqualifies the native layer. The same file
+                // can use its successful hardware path again on re-entering VR.
+                attemptedDirect = false
+                direct?.stop()
+                direct = nil
+                failure = "该视频需要使用兼容播放器进行普通播放。"
+                DispatchQueue.main.async { [weak self] in self?.publish() }
+            }
+            return
+        }
         frameWatch = AppleVideoFrameWatch()
         // Keep the native display alive under the opaque stereo view. A ready
         // layer can be uncovered without an extra seek or decoder restart.
@@ -94,6 +110,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     }
 
     @MainActor private func installStereoOutput(on preparedItem: AVPlayerItem? = nil, recovery: Bool = false) {
+        guard direct == nil else { return }
         stereo?.stop()
         stereo = nil
         guard let item = preparedItem ?? player.currentItem, let frameHandler else { return }
@@ -153,12 +170,14 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         failure = nil
         trackDetails = nil
         reportedPlaybackStalls = 0
+        vlcFrameColor = nil
         isSDR = false
         videoTimeRange = nil
         frameRate = nil
         wantsPlayback = false
         pendingSeek = seconds.isFinite && seconds > 0 ? seconds : (afterglow && paused ? 0 : nil)
         let item = AVPlayerItem(asset: asset)
+        MainActor.assumeIsolated { surface?.videoLayer.player = afterglow && frameHandler != nil ? nil : player }
         if afterglow {
             // Afterglow attaches its packed output before handing the item to AVPlayer.
             // Read the local video geometry first so an 8K BGRA surface is never
@@ -214,18 +233,32 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                     // On the explicit Afterglow route try the single video
                     // track even if AVFoundation flags it as unsupported.
                     // Actual picture delivery is bounded by the startup check.
-                    if decodable || (self?.afterglow == true && tracks.count == 1) {
+                    if decodable || tracks.count == 1 {
                         let formats = try? await track.load(.formatDescriptions)
                         let rate = try? await track.load(.nominalFrameRate)
                         let range = try? await track.load(.timeRange)
                         let bitRate = try? await track.load(.estimatedDataRate)
                         let size = try? await track.load(.naturalSize)
+                        var directCandidate = false
+                        if !decodable, let format = formats?.first, Self.isDirectCandidate(format, rate: rate) {
+                            let transform = try? await track.load(.preferredTransform)
+                            let audioTracks = try? await item.asset.loadTracks(withMediaType: .audio)
+                            directCandidate = transform == .identity && audioTracks?.isEmpty == false
+                        }
                         guard !Task.isCancelled, let self,
                               self.player.currentItem === item || self.preparingItem === item else { return }
+                        if tracks.count == 1 { self.vlcFrameColor = VLCFrameColor(format: formats?.first) }
                         self.frameRate = rate
                         self.videoTimeRange = range
                         self.isSDR = Self.supportsSDRConversion(formats?.first)
                         self.trackDetails = Self.videoDescription(format: formats?.first, rate: rate, bitRate: bitRate)
+                        self.directCandidate = directCandidate
+                        if directCandidate, self.frameHandler != nil {
+                            self.foundNoDecodableVideoTrack = true
+                            self.installDirectOutput(track: track, item: item)
+                            return
+                        }
+                        if !decodable && !self.afterglow { continue }
                         if self.preparingItem === item {
                             self.afterglowSourceSize = size ?? .zero
                             if let format = formats?.first {
@@ -263,6 +296,61 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                 self.publish()
             }
         }
+    }
+
+    private static func isDirectCandidate(_ format: CMFormatDescription, rate: Float?) -> Bool {
+        let codec = CMFormatDescriptionGetMediaSubType(format)
+        let dims = CMVideoFormatDescriptionGetDimensions(format)
+        guard (codec == kCMVideoCodecType_HEVC || codec == 0x68657631), (rate ?? 0) >= 48,
+              max(dims.width, dims.height) > 4096, max(dims.width, dims.height) <= 8192 else { return false }
+        // Conventional SDR or unspecified tags. Preserve the native color path for HDR and wide gamut.
+        let tags = CMFormatDescriptionGetExtensions(format) as? [String: Any]
+        let accepted: [(CFString, [CFString])] = [
+            (kCVImageBufferTransferFunctionKey, [kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferTransferFunction_sRGB]),
+            (kCVImageBufferColorPrimariesKey, [kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferColorPrimaries_EBU_3213, kCVImageBufferColorPrimaries_SMPTE_C]),
+            (kCVImageBufferYCbCrMatrixKey, [kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_601_4])
+        ]
+        return accepted.allSatisfy { key, allowed in
+            guard let value = tags?[key as String] as? String else { return true }
+            return allowed.contains { ($0 as String) == value }
+        }
+    }
+
+    @MainActor private func installDirectOutput(track: AVAssetTrack, item: AVPlayerItem) {
+        attemptedDirect = true
+        stopFirstPictureTimer()
+        stereo?.stop()
+        stereo = nil
+        surface?.videoLayer.player = nil
+        if preparingItem === item {
+            player.replaceCurrentItem(with: item)
+            preparingItem = nil
+        }
+        diagnostics?.event("AV: packed HEVC track rejected by AVPlayer; probing hardware VideoToolbox")
+        direct = DirectHEVCFrameOutput(track: track, asset: item.asset, clock: { [weak self, weak item] in
+            guard let self, let item, self.player.currentItem === item, !self.stopped, !self.ended,
+                  self.failure == nil, self.visibleInForeground, item.status == .readyToPlay,
+                  !self.seeking, self.pendingSeek == nil else { return nil }
+            let seconds = item.currentTime().seconds
+            guard self.expectsVideo(at: seconds) else { return nil }
+            if self.wantsPlayback && self.player.timeControlStatus != .playing { return nil }
+            return (seconds, self.wantsPlayback)
+        }, awaitingClock: { [weak self] in
+            guard let self, self.visibleInForeground, self.wantsPlayback, !self.ended, self.failure == nil else { return false }
+            return self.seeking || self.pendingSeek != nil || self.player.timeControlStatus != .playing
+        }, deliver: { [weak self, weak item] image, pts in
+            guard let self, let item, self.player.currentItem === item else { return }
+            self.diagnostics?.decodedFrame(image, pts: pts)
+            self.frameHandler?(image)
+            if self.direct?.frameCount == 1 { self.publish() }
+        }, fail: { [weak self, weak item] reason in
+            guard let self, let item, self.player.currentItem === item else { return }
+            self.diagnostics?.event("DirectVT: " + reason)
+            self.failure = "硬件直解未能持续提供画面，正在切换兼容播放。"
+            self.publish()
+        })
+        applyIntent()
+        publish()
     }
 
     // Preserve the existing system color conversion for HDR, wide gamut and
@@ -320,6 +408,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
 
     func pause() {
         wantsPlayback = false
+        direct?.suspendWatch()
         stopFirstPictureTimer()
         player.pause()
         frameWatch.interrupt()
@@ -329,6 +418,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     func seek(to seconds: Double) {
         guard seconds.isFinite, !stopped, player.currentItem != nil || preparingItem != nil else { return }
         firstPictureWatch.seek()
+        direct?.seek()
         pendingSeek = max(0, seconds)
         seekGeneration += 1
         seeking = false
@@ -340,6 +430,12 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private func applyIntent() {
         guard let item = player.currentItem, item.status == .readyToPlay,
               !stopped, failure == nil, !ended, !seeking else { return }
+        if direct != nil {
+            // AVPlayer supplies the audio clock only. Avoid a second video decode.
+            for track in item.tracks where track.assetTrack?.mediaType == .video && track.isEnabled {
+                track.isEnabled = false
+            }
+        }
         if let target = pendingSeek {
             let request = seekGeneration
             seeking = true
@@ -393,7 +489,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     }
 
     private func updateFirstPictureTimer() {
-        guard afterglow else { return }
+        guard afterglow, direct == nil else { return }
         guard frameHandler != nil, wantsPlayback, !stopped, !ended, failure == nil,
               !firstPictureWatch.delivered, let item = player.currentItem ?? preparingItem else {
             if firstPictureTimer != nil { stopFirstPictureTimer() }
@@ -437,6 +533,11 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             visibleInForeground && player.timeControlStatus == .playing
         var details = trackDetails
         let hasVideo = MainActor.assumeIsolated {
+            if let direct {
+                let fps = direct.deliveredFPS.map { String(format: "%.1f", $0) } ?? "pending"
+                diagnostics?.appleStatus("item=\(item.status.rawValue) timeControl=\(player.timeControlStatus.rawValue) output=directVT hardwareRequired=true targetFPS=30 deliveredFPS=\(fps) uniquePTS=\(direct.frameCount)")
+                return direct.hasFrame
+            }
             stereo?.setContinuousPull(active, paused: !wantsPlayback)
             let ready = surface?.videoLayer.isReadyForDisplay ?? false
             let hasImage = stereo?.hasVideoFrame ?? ready
@@ -487,6 +588,10 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
 
     private func retireItem() {
         foundNoDecodableVideoTrack = false
+        directCandidate = false
+        attemptedDirect = false
+        direct?.stop()
+        direct = nil
         stopFirstPictureTimer()
         firstPictureWatch = AfterglowFirstPictureWatch()
         preparingItem = nil

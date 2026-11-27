@@ -4,6 +4,28 @@ import XCTest
 @testable import NiceVideos
 
 final class SBSMovieTests: XCTestCase {
+    func testPresentationCadenceCountsNewPicturesAndIncludesVisibleStalls() throws {
+        var cadence = MoviePresentationCadence()
+        XCTAssertNil(cadence.sample(at: 1))
+        for i in 0...300 {
+            let time = 4 + Double(i) / 60
+            let id = UInt64(i + 1)
+            cadence.record(id: id, time: time)
+            cadence.record(id: id, time: time + 0.001)
+        }
+        cadence.record(id: 302, time: 8) // late callback
+        XCTAssertEqual(cadence.lastID, 301)
+        let moving = try XCTUnwrap(cadence.sample(at: 9))
+        XCTAssertEqual(moving.fps, 60, accuracy: 0.001)
+        XCTAssertEqual(moving.maxGap, 1.0 / 60, accuracy: 0.001)
+        let stalling = try XCTUnwrap(cadence.sample(at: 10))
+        XCTAssertEqual(stalling.fps, 45, accuracy: 0.001)
+        XCTAssertEqual(stalling.maxGap, 1, accuracy: 0.001)
+        let stopped = try XCTUnwrap(cadence.sample(at: 14))
+        XCTAssertEqual(stopped.fps, 0)
+        XCTAssertEqual(stopped.maxGap, 4)
+    }
+
     func testHalfAndFullProduceTheSameEyeGeometryForEquivalentMovies() {
         let half = SBSDisplayMode.half.eyeAspect(packedAspect: 1920.0 / 1080)
         let full = SBSDisplayMode.full.eyeAspect(packedAspect: 3840.0 / 1080)

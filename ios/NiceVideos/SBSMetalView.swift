@@ -88,6 +88,39 @@ struct SBSMovieGeometry: Equatable {
     }()
 }
 
+// Each ID identifies one input frame. Camera movement may redraw it many times.
+struct MoviePresentationCadence {
+    private(set) var lastID: UInt64 = 0
+    private(set) var lastTime: CFTimeInterval = 0
+    private var firstTime: CFTimeInterval = 0
+    // Render targets are capped at 60 Hz. Keep four seconds with room to spare.
+    private var times = [CFTimeInterval](repeating: 0, count: 256)
+    private var next = 0
+
+    mutating func record(id: UInt64, time: CFTimeInterval) {
+        guard id > lastID, time.isFinite, time > lastTime else { return }
+        if firstTime == 0 { firstTime = time }
+        lastID = id
+        lastTime = time
+        times[next] = time
+        next = (next + 1) % times.count
+    }
+
+    func sample(at now: CFTimeInterval) -> (fps: Double, maxGap: Double)? {
+        guard firstTime > 0, now.isFinite, now >= lastTime, now - firstTime >= 1 else { return nil }
+        let start = max(firstTime, now - 4)
+        var later = now, gap = 0.0, count = 0
+        for offset in 1...times.count {
+            let time = times[(next + times.count - offset) % times.count]
+            if time <= start { break }
+            gap = max(gap, later - time)
+            later = time
+            count += 1
+        }
+        return (Double(count) / (now - start), max(gap, later - start))
+    }
+}
+
 @MainActor
 final class SBSMetalView: UIView, MTKViewDelegate {
     // GPU completion and actual drawable presentation are distinct callbacks.
@@ -95,15 +128,20 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     private final class GPUProgress: @unchecked Sendable {
         private let lock = NSLock()
         private var completedID: UInt64 = 0
-        private var presentedID: UInt64 = 0
-        private var presentationTime: CFTimeInterval = 0
+        private var uniqueCompletions: UInt64 = 0
+        private var cadence = MoviePresentationCadence()
         private var failures = 0
         private var lastError = "none"
 
         func completed(id: UInt64, command: MTLCommandBuffer) {
             lock.withLock {
-                if command.status == .completed { completedID = max(completedID, id) }
-                else {
+                if command.status == .completed {
+                    // A camera redraw can complete the same source frame again.
+                    if id > completedID {
+                        completedID = id
+                        uniqueCompletions += 1
+                    }
+                } else {
                     failures += 1
                     if let error = command.error as NSError? { lastError = "\(error.domain):\(error.code)" }
                     else { lastError = "status-\(command.status.rawValue)" }
@@ -112,25 +150,25 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         }
 
         func presented(id: UInt64, time: CFTimeInterval) {
-            lock.withLock {
-                if id > presentedID && time > 0 {
-                    presentedID = id
-                    presentationTime = time
-                }
-            }
+            lock.withLock { cadence.record(id: id, time: time) }
         }
 
-        var lastPresentedID: UInt64 { lock.withLock { presentedID } }
+        var completedVideoFrameCount: UInt64 { lock.withLock { uniqueCompletions } }
+        var lastPresentedID: UInt64 { lock.withLock { cadence.lastID } }
 
         var summary: String {
             lock.withLock {
                 #if targetEnvironment(simulator)
                 let presentation = "presentID=NA presentAgeSec=NA presentation=unavailable-on-simulator"
                 #else
-                let age = presentationTime > 0 ? String(format: "%.2f", max(0, CACurrentMediaTime() - presentationTime)) : "NA"
-                let presentation = "presentID=\(presentedID) presentAgeSec=\(age)"
+                let now = CACurrentMediaTime()
+                let age = cadence.lastTime > 0 ? String(format: "%.2f", max(0, now - cadence.lastTime)) : "NA"
+                let rate = cadence.sample(at: now).map {
+                    String(format: "presentFPS=%.1f maxPresentGapMs=%.0f", $0.fps, $0.maxGap * 1000)
+                } ?? "presentFPS=NA maxPresentGapMs=NA"
+                let presentation = "presentID=\(cadence.lastID) presentAgeSec=\(age) " + rate
                 #endif
-                return "completeID=\(completedID) \(presentation) gpuFailures=\(failures) gpuError=\(lastError)"
+                return "completeID=\(completedID) \(presentation) gpuFailures=\(failures) gpuError=\(lastError) uniqueGPUFrames=\(uniqueCompletions)"
             }
         }
     }
@@ -180,6 +218,7 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     private(set) var receivedFrameID: UInt64 = 0
     private(set) var acceptedFrameID: UInt64 = 0
     private var submittedFrameID: UInt64 = 0
+    var completedVideoFrameCount: UInt64 { gpuProgress.completedVideoFrameCount }
     var presentedFrameID: UInt64 { gpuProgress.lastPresentedID }
     private var receivedWidth = 0, receivedHeight = 0
     private var pixelFormat: OSType = 0

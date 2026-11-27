@@ -30,6 +30,9 @@
     if (self) {
         _handler = [handler copy];
         _maximumLongEdge = 2560;
+        // The two-plane path only applies to full-height 8K sources. An
+        // untagged HD source's default matrix is independent of output scale.
+        _panoramaYCbCrMatrix = (__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2;
     }
     return self;
 }
@@ -161,7 +164,7 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
 // lock/unlock (Prepare), display and cleanup serially for this specific vout.
 @interface NICEVLCFrameFormat : NSObject
 - (void)describePlanesWithPitches:(unsigned *)pitches lines:(unsigned *)lines;
-- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry biPlanar:(BOOL)biPlanar source:(id<NICEVLCTrackSource>)source delivery:(NICEVLCFrameDelivery *)delivery;
+- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry matrix:(NSString *)matrix source:(id<NICEVLCTrackSource>)source delivery:(NICEVLCFrameDelivery *)delivery;
 - (void *)lockPlane:(void **)planes;
 - (void)unlockPicture:(void *)picture;
 - (void)displayPicture:(void *)picture;
@@ -180,14 +183,17 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
     CVPixelBufferRef _picture;
     NSDictionary *_poolLimits;
     NSDictionary *_displayDimensions;
+    NSString *_ycbcrMatrix;
 }
 
-- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry biPlanar:(BOOL)biPlanar source:(id<NICEVLCTrackSource>)source delivery:(NICEVLCFrameDelivery *)delivery {
+- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry matrix:(NSString *)matrix source:(id<NICEVLCTrackSource>)source delivery:(NICEVLCFrameDelivery *)delivery {
     self = [super init];
     if (!self) { return nil; }
     _delivery = delivery;
     _source = source;
     unsigned width = geometry.width, height = geometry.height;
+    _ycbcrMatrix = [matrix copy];
+    BOOL biPlanar = _ycbcrMatrix != nil;
     _planeCount = biPlanar ? 2 : 1;
     _displayDimensions = @{
         (__bridge NSString *)kCVImageBufferDisplayWidthKey: @(width * geometry.pixelAspect),
@@ -274,6 +280,10 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
     if (picture && picture == _picture) {
         CVBufferSetAttachment(_picture, kCVImageBufferDisplayDimensionsKey,
                               (__bridge CFDictionaryRef)_displayDimensions, kCVAttachmentMode_ShouldPropagate);
+        if (_ycbcrMatrix) {
+            CVBufferSetAttachment(_picture, kCVImageBufferYCbCrMatrixKey,
+                                  (__bridge CFStringRef)_ycbcrMatrix, kCVAttachmentMode_ShouldPropagate);
+        }
         [_delivery enqueue:_picture forMedia:_source];
         CVPixelBufferRelease(_picture);
         _picture = NULL;
@@ -307,16 +317,17 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         *height = geometry.height = (unsigned)MAX(1.0, round(geometry.height * scale));
         // Keep both eyes packed. Let Metal perform YCbCr -> RGB when sampling;
         // converting the whole downscaled 8K movie to BGRA costs extra bandwidth.
-        BOOL biPlanar = fullHeight8K && delivery.preferSmallerPanoramaFrames &&
-                        (*width % 2 == 0) && (*height % 2 == 0);
-        NICEVLCFrameFormat *format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry biPlanar:biPlanar
+        NSString *matrix = fullHeight8K && delivery.preferSmallerPanoramaFrames &&
+                           (*width % 2 == 0) && (*height % 2 == 0) && chroma[0] != 'J'
+                           ? delivery.panoramaYCbCrMatrix : nil;
+        NICEVLCFrameFormat *format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry matrix:matrix
                                                                            source:source delivery:delivery];
-        if (!format && biPlanar) {
-            biPlanar = NO;
-            format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry biPlanar:NO source:source delivery:delivery];
+        if (!format && matrix) {
+            matrix = nil;
+            format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry matrix:nil source:source delivery:delivery];
         }
         if (!format) { return 0; }
-        memcpy(chroma, biPlanar ? "NV12" : "BGRA", 4);
+        memcpy(chroma, matrix ? "NV12" : "BGRA", 4);
         [format describePlanesWithPitches:pitches lines:lines];
         *opaque = (void *)CFBridgingRetain(format);
         [delivery recordFormatSetupForMedia:source longEdge:MAX(*width, *height) limit:limit panoramaLimit:panoramaLimit];

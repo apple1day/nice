@@ -155,6 +155,9 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
     private weak var hostView: SBSPlaybackView?
     private(set) var currentOutput: MovieOutput?
     private var failedAppleOutputs: Set<MovieOutput> = []
+    private var directVRProbePending = false
+    private var directVRProbeFailed = false
+    private var vlcFrameColor: VLCFrameColor?
     private var reducedVLCFrameOutput = false
     private var systemStereo = false
     private let pickedFile: PickedVideoFile?
@@ -214,10 +217,22 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             guard let self, !self.stopped, self.session === newSession else { return }
             self.diagnostics.observe(snapshot) { MainActor.assumeIsolated { self.rendererStatus } }
             if let output = self.currentOutput, output.usesAVPlayer, snapshot.phase == .failed, let host = self.hostView {
+                if let color = (newSession as? AppleFilePlaybackEngine)?.vlcFrameColor {
+                    self.vlcFrameColor = color
+                }
                 self.failedAppleOutputs.insert(output)
                 // Both routes use the same AVFoundation asset and video tracks.
                 // Cache this specific discovery for this file. An output stall
                 // or transient AV error only disqualifies the route that failed.
+                if let apple = newSession as? AppleFilePlaybackEngine, apple.attemptedDirect {
+                    self.directVRProbeFailed = true
+                    self.directVRProbePending = false
+                    self.failedAppleOutputs.formUnion([.system, .afterglow])
+                } else if let apple = newSession as? AppleFilePlaybackEngine, apple.directCandidate,
+                          !self.directVRProbeFailed, !MainActor.assumeIsolated({ host.isImmersive }) {
+                    // A native-layer failure cannot exercise the projected hardware decoder.
+                    self.directVRProbePending = true
+                }
                 if output == .system, (newSession as? AppleFilePlaybackEngine)?.foundNoDecodableVideoTrack == true {
                     self.failedAppleOutputs.insert(.afterglow)
                     self.diagnostics.event("AV: skipping automatic Afterglow retry for this input; no decodable video track")
@@ -253,7 +268,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
                 MainActor.assumeIsolated {
                     self.seconds = snapshot.seconds
                     self.reducedVLCFrameOutput = true
-                    self.diagnostics.event("VLC: sustained video loss; reopening at \(self.seconds)s, maximum frame edge 1280")
+                    self.diagnostics.event("VLC: sustained low picture output; reopening at \(self.seconds)s, maximum frame edge 1280")
                     self.retireSession()
                     self.installVLCFrameSession()
                     self.reopenAfterOutputChange(host)
@@ -325,7 +340,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         let vlc = VLCPlaybackEngine(frameHandler: frameHandler(), pickedFile: pickedFile,
                                     reducedFrameOutput: reducedVLCFrameOutput,
                                     preferSmallerPanoramaFrames: hostView.map { $0.mode != .standard } ?? false,
-                                    decoderPolicy: hostView?.effectiveDecoderPolicy ?? .automatic)
+                                    decoderPolicy: hostView?.effectiveDecoderPolicy ?? .automatic, frameColor: vlcFrameColor)
         vlc.monitorsImmersiveFrameRate = hostView?.isImmersive == true
         vlc.diagnostics = diagnostics
         observe(vlc)
@@ -335,6 +350,10 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         // A bare playback surface can be attached before the local URL is known.
         guard let output = host.standardOutput else { return }
         let policy = host.effectiveDecoderPolicy
+        if directVRProbePending, host.isImmersive, policy == .automatic, output.usesAVPlayer {
+            directVRProbePending = false
+            failedAppleOutputs.remove(output)
+        }
         let useRequestedOutput = policy == .automatic && output.usesAVPlayer && !failedAppleOutputs.contains(output)
         let next: MovieOutput = useRequestedOutput ? output : (host.renderer == nil ? .vlcNative : .vlcFrames)
         let needsNewDecoder = (session as? VLCPlaybackEngine).map { $0.decoderPolicy != policy } ?? false
@@ -448,7 +467,10 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
             // Route the new asset without reopening the previous asset at its
             // old position. The selected session is loaded exactly once below.
             file = nil
+            vlcFrameColor = nil
             failedAppleOutputs.removeAll()
+            directVRProbePending = false
+            directVRProbeFailed = false
             reducedVLCFrameOutput = false
             let size = pickedFile?.byteCount ?? (fileURL.isFileURL
                 ? (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { UInt64(exactly: $0) }

@@ -42,6 +42,8 @@ typedef struct {
 // Set before load; sampled only when VLC negotiates a new output.
 @property (atomic) unsigned maximumLongEdge;
 @property (atomic) BOOL preferSmallerPanoramaFrames;
+// Set before format negotiation. nil retains VLC's packed-color conversion.
+@property (atomic, copy, nullable) NSString *panoramaYCbCrMatrix;
 // Called on the main queue when retiring playback, before VLC stops asynchronously.
 - (void)invalidate;
 - (instancetype)init NS_UNAVAILABLE;

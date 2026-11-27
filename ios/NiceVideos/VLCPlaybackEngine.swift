@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import CoreMedia
 import CoreVideo
 import MobileVLCKit
 import ObjectiveC
@@ -7,6 +8,43 @@ import ObjectiveC
 // Each policy belongs to a single libVLC instance, including seek and replay reopens.
 enum VLCDecoderPolicy: String {
     case automatic, software
+}
+
+// VMEM's callback only reports a fourcc and dimensions. Carry the color
+// description we already read from this asset across the decoder fallback.
+enum VLCFrameColor {
+    case packedRGB
+    case ycbcr(String)
+
+    var matrix: String? {
+        guard case let .ycbcr(matrix) = self else { return nil }
+        return matrix
+    }
+
+    init?(format: CMFormatDescription?) {
+        guard let format else { return nil }
+        let tags = CMFormatDescriptionGetExtensions(format) as? [String: Any] ?? [:]
+        let sourceMatrix = tags[kCVImageBufferYCbCrMatrixKey as String] as? String
+        let transfer = tags[kCVImageBufferTransferFunctionKey as String] as? String
+        let primaries = tags[kCVImageBufferColorPrimariesKey as String] as? String
+        let rec601 = kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String
+        let rec709 = kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String
+        let sdrTransfers = [kCVImageBufferTransferFunction_ITU_R_709_2 as String,
+                            kCVImageBufferTransferFunction_sRGB as String]
+        let sdrPrimaries = [kCVImageBufferColorPrimaries_ITU_R_709_2 as String,
+                            kCVImageBufferColorPrimaries_EBU_3213 as String, kCVImageBufferColorPrimaries_SMPTE_C as String]
+        // Use VLC's preexisting BGRA conversion when the source calls for
+        // full range, tone mapping, or a matrix outside the SDR shader path.
+        if tags[kCMFormatDescriptionExtension_FullRangeVideo as String] as? Bool == true ||
+            sourceMatrix.map({ ![rec601, rec709].contains($0) }) == true ||
+            transfer.map({ !sdrTransfers.contains($0) }) == true ||
+            primaries.map({ !sdrPrimaries.contains($0) }) == true {
+            self = .packedRGB
+        } else {
+            let size = CMVideoFormatDescriptionGetDimensions(format)
+            self = .ycbcr(sourceMatrix ?? (size.height > 576 ? rec709 : rec601))
+        }
+    }
 }
 
 enum PlaybackPhase: Equatable { case idle, opening, playing, paused, ended, failed }
@@ -298,7 +336,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
 
     init(frameHandler: ((CVPixelBuffer) -> Void)?, pickedFile: PickedVideoFile? = nil,
          reducedFrameOutput: Bool = false, preferSmallerPanoramaFrames: Bool = false,
-         decoderPolicy: VLCDecoderPolicy = .automatic) {
+         decoderPolicy: VLCDecoderPolicy = .automatic, frameColor: VLCFrameColor? = nil) {
         self.pickedFile = pickedFile
         self.reducedFrameOutput = reducedFrameOutput
         let panoramaOutput = frameHandler != nil && preferSmallerPanoramaFrames
@@ -331,6 +369,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         }
         let construction = NICEVLCPlayerConstruction(options: options, frameHandler: frameHandler)
         frameDelivery = construction?.frameDelivery
+        if let frameColor { construction?.frameDelivery?.panoramaYCbCrMatrix = frameColor.matrix }
         construction?.frameDelivery?.preferSmallerPanoramaFrames = preferSmallerPanoramaFrames
         if reducedFrameOutput { construction?.frameDelivery?.maximumLongEdge = Self.reducedLongEdge }
         playerResource = BackgroundPlaybackResource(construction?.player)

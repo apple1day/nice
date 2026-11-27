@@ -1,8 +1,26 @@
+import CoreMedia
 import CoreVideo
 import XCTest
 @testable import NiceVideos
 
 @MainActor final class StereoFrameDecodeTests: XCTestCase {
+    func testVMEMColorUsesSourceMatrixAndRetainsPackedRGBForExplicitFullRangeOrHDR() throws {
+        func hint(_ tags: [String: Any]) throws -> VLCFrameColor {
+            var format: CMVideoFormatDescription?
+            let result = CMVideoFormatDescriptionCreate(allocator: nil, codecType: kCMVideoCodecType_HEVC,
+                width: 8192, height: 4096, extensions: tags as CFDictionary, formatDescriptionOut: &format)
+            XCTAssertEqual(result, noErr)
+            return try XCTUnwrap(VLCFrameColor(format: format))
+        }
+        let matrixKey = kCVImageBufferYCbCrMatrixKey as String
+        let rec601 = kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String
+        XCTAssertEqual(try hint([:]).matrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String)
+        XCTAssertEqual(try hint([matrixKey: rec601]).matrix, rec601)
+        XCTAssertNil(try hint([kCMFormatDescriptionExtension_FullRangeVideo as String: true]).matrix)
+        XCTAssertNil(try hint([kCVImageBufferTransferFunctionKey as String:
+                                kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String]).matrix)
+    }
+
     func testReducedOutputResumes8KSourceWithSmallerStereoBuffers() async throws {
         try await checkMovingPanorama("stereo8k-replay", width: 1280, height: 320, startAt: 2, reduced: true)
     }
@@ -56,6 +74,8 @@ import XCTest
                       let uv = CVPixelBufferGetBaseAddressOfPlane(frame, 1) else {
                     XCTFail("Expected VLC to deliver an NV12 IOSurface"); return
                 }
+                XCTAssertEqual(CVBufferCopyAttachment(frame, kCVImageBufferYCbCrMatrixKey, nil) as? String,
+                               kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String)
                 let luma = y.advanced(by: height / 2 * CVPixelBufferGetBytesPerRowOfPlane(frame, 0))
                     .assumingMemoryBound(to: UInt8.self)
                 let chroma = uv.advanced(by: height / 4 * CVPixelBufferGetBytesPerRowOfPlane(frame, 1))

@@ -4,6 +4,11 @@ cd "$(dirname "$0")"
 # Run storage and playback regressions before the longer UI suite.
 # A plain invocation still runs every test.
 field_tests=(
+  NiceVideosTests/FullHeightVRPlaybackTests/testAutomatic8K60HeadsetPlaybackAdvancesAfterPauseAndSeek
+  NiceVideosTests/DirectHEVCFrameTests
+  NiceVideosTests/VLCFrameLossWatchTests
+  NiceVideosTests/VLCHeadsetReplayTests/testSustainedFullHeight8K60VLCToMetalCadence
+  NiceVideosUITests/MovingMovieUITests/testPickedPanoramaCanLookAroundRecenterAndPlayInBothEyes
   NiceVideosUITests/UploadFilesPickerUITests
   NiceVideosUITests/MissingLocalRecordUITests
   NiceVideosTests/PickedFileUploadIntegrationTests
