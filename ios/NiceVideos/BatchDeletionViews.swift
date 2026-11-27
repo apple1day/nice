@@ -44,7 +44,7 @@ private struct OfflineLibraryContent: View {
                         .accessibilityIdentifier("openVideoFileButton")
                     }
                 } footer: {
-                    Text(preparingFile == nil ? "从「文件」中选择视频，直接播放。" : "云端文件可能需要先下载到设备。")
+                    Text(preparingFile == nil ? "下载位置：文件 → 我的 iPhone → Nice 视频 → 下载。" : "云端文件可能需要先下载到设备。")
                 }
             }
             Section {
@@ -70,39 +70,19 @@ private struct OfflineLibraryContent: View {
             }
             if let result = result { BatchDeletionResultSection(result: result) }
             ForEach(library.visibleRows) { row in
-                Button {
-                    if selection.isSelecting { selection.toggle(row.record.taskToken) }
-                    else {
-                        preparingFile = nil
-                        store.playLocal(row.record, playlistIDs: library.visibleRows.map(\.id))
-                    }
-                } label: {
-                    LocalVideoRowLabel(row: row, selecting: selection.isSelecting,
-                                       selected: selection.contains(row.record.taskToken)).equatable()
-                }
-                .buttonStyle(.plain)
-                .accessibilityValue(selection.isSelecting
-                    ? (selection.contains(row.record.taskToken) ? "已选择" : "未选择")
-                    : (row.record.hasWatched ? "已观看，本地播放" : "未观看，本地播放"))
-                .accessibilityIdentifier("localVideoRow.\(row.id)")
-                .swipeActions(allowsFullSwipe: false) {
-                    if !selection.isSelecting {
-                        Button("删除", role: .destructive) {
-                            preparingFile = nil
-                            deletion = BatchDeletionRequest(scope: .localVideos, records: [row.record])
-                        }.disabled(library.restoring)
-                    }
-                }
-                .contextMenu {
-                    if !selection.isSelecting {
-                        Button("用 Afterglow XR 播放", systemImage: "eyeglasses") {
-                            preparingFile = nil
-                            store.playLocal(row.record, playlistIDs: library.visibleRows.map(\.id), startMode: .afterglow)
-                        }
-                        if row.record.pendingDeletionOrder != nil {
-                            Button("撤销待删除") { store.unmarkForDeletion(row.id) }
+                if row.record.state == .missing {
+                    HStack {
+                        LocalVideoRowLabel(row: row, selecting: false, selected: false).equatable()
+                            .accessibilityIdentifier("localVideoRow.\(row.id)")
+                        if !selection.isSelecting {
+                            Button("重新下载") { store.retry(row.record) }
+                                .buttonStyle(.borderless)
+                                .disabled(library.restoring)
+                                .accessibilityLabel("重新下载 \(row.record.video.name)")
                         }
                     }
+                } else {
+                    availableRow(row)
                 }
             }
             if library.visibleRows.isEmpty {
@@ -110,6 +90,7 @@ private struct OfflineLibraryContent: View {
                     description: Text(emptyDescription))
             }
         }
+        .refreshable { await store.refreshDownloadedFiles() }
         .navigationTitle("本地视频")
         .searchable(text: $search, prompt: "搜索本地视频")
         .toolbar {
@@ -121,11 +102,11 @@ private struct OfflineLibraryContent: View {
                 if selection.isSelecting {
                     Button(selection.allSelected(in: library.visibleTokens) ? "取消全选" : "全选") {
                         selection.toggleAll(in: library.visibleTokens)
-                    }.disabled(library.visibleRows.isEmpty)
+                    }.disabled(library.visibleTokens.isEmpty)
                     Button("取消") { selection.cancel() }
                 } else {
                     Button("选择") { result = nil; selection.begin() }
-                        .disabled(library.visibleRows.isEmpty || library.restoring || preparingFile != nil)
+                        .disabled(library.visibleTokens.isEmpty || library.restoring || preparingFile != nil)
                         .accessibilityIdentifier("selectLocalVideosButton")
                 }
             }
@@ -173,6 +154,42 @@ private struct OfflineLibraryContent: View {
             Button("取消", role: .cancel) { deletion = nil }
         } message: { snapshot in Text(snapshot.message) }
     }
+    private func availableRow(_ row: LocalLibraryRow) -> some View {
+        Button {
+            if selection.isSelecting { selection.toggle(row.record.taskToken) }
+            else {
+                preparingFile = nil
+                store.playLocal(row.record, playlistIDs: library.playableIDs)
+            }
+        } label: {
+            LocalVideoRowLabel(row: row, selecting: selection.isSelecting,
+                               selected: selection.contains(row.record.taskToken)).equatable()
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(selection.isSelecting
+            ? (selection.contains(row.record.taskToken) ? "已选择" : "未选择")
+            : (row.record.hasWatched ? "已观看，本地播放" : "未观看，本地播放"))
+        .accessibilityIdentifier("localVideoRow.\(row.id)")
+        .swipeActions(allowsFullSwipe: false) {
+            if !selection.isSelecting {
+                Button("删除", role: .destructive) {
+                    preparingFile = nil
+                    deletion = BatchDeletionRequest(scope: .localVideos, records: [row.record])
+                }.disabled(library.restoring)
+            }
+        }
+        .contextMenu {
+            if !selection.isSelecting {
+                Button("用 Afterglow XR 播放", systemImage: "eyeglasses") {
+                    preparingFile = nil
+                    store.playLocal(row.record, playlistIDs: library.playableIDs, startMode: .afterglow)
+                }
+                if row.record.pendingDeletionOrder != nil {
+                    Button("撤销待删除") { store.unmarkForDeletion(row.id) }
+                }
+            }
+        }
+    }
     private var emptyTitle: String {
         if !search.isEmpty { return "没有匹配的视频" }
         switch library.filter {
@@ -204,7 +221,9 @@ private struct LocalVideoRowLabel: View, Equatable {
     let selected: Bool
     var body: some View {
         HStack(spacing: 12) {
-            if selecting { SelectionIndicator(selected: selected) }
+            if row.record.state == .missing {
+                Image(systemName: "film").font(.title).foregroundStyle(.secondary)
+            } else if selecting { SelectionIndicator(selected: selected) }
             else { Image(systemName: "play.circle.fill").font(.title) }
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
@@ -214,16 +233,25 @@ private struct LocalVideoRowLabel: View, Equatable {
                             .accessibilityLabel("已收藏").accessibilityIdentifier("favoriteBadge.\(row.id)")
                     }
                 }
+                if let filename = row.record.publicFileName, filename != row.record.video.name {
+                    Text("文件名：\(filename)").font(.caption).foregroundStyle(.secondary)
+                }
                 Text(row.subtitle).font(.caption).foregroundStyle(.secondary)
                 HStack(spacing: 10) {
+                    if row.record.state == .missing {
+                        Text("已删除").accessibilityIdentifier("missingBadge.\(row.id)")
+                    }
                     Label(row.record.hasWatched ? "已观看" : "未观看",
                           systemImage: row.record.hasWatched ? "eye.fill" : "eye")
                         .foregroundStyle(row.record.hasWatched ? Color.secondary : Color.accentColor)
                         .accessibilityIdentifier("watchedBadge.\(row.id)")
-                    if row.record.pendingDeletionOrder != nil {
+                    if row.record.state == .complete && row.record.pendingDeletionOrder != nil {
                         Label("待删除", systemImage: "trash").foregroundStyle(.orange)
                     }
                 }.font(.caption)
+                if row.record.state == .missing, let message = row.record.message {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 0)
         }.padding(.vertical, 4).contentShape(Rectangle())

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-# The CI job runs the field regressions first so codec and playback failures
-# are available before the longer UI suite. A plain invocation runs everything.
-motion_tests=(
+# Run storage and playback regressions before the longer UI suite.
+# A plain invocation still runs every test.
+field_tests=(
+  NiceVideosTests/FilesIntegrationTests
+  NiceVideosTests/SharedDownloadStorageTests
+  NiceVideosTests/SharedDownloadAvailabilityTests
+  NiceVideosTests/LibraryPerformanceTests/testFilesRemovalKeepsVisibleHistoryButExcludesItFromPlaybackAndUpload
   NiceVideosTests/PickedFilePlaybackTests/testOfflineCopyOfFull8KMain10PreservesAudioAndMovingPanoramaAfterSeeking
   NiceVideosTests/SBSPlaybackEngineTests/testKnownUndecodableAppleTrackSkipsSecondAutomaticOpenButAllowsRetryAndNextFile
   NiceVideosTests/SBSPlaybackEngineTests/testSoftwareDecoderPolicyKeepsPositionAndPauseWhenReturningToAutomaticVLC
@@ -20,8 +24,8 @@ case "${1:-all}" in
 esac
 set -- "${1:-all}"
 case "$1" in
-  vr-motion) set -- "${motion_tests[@]/#/-only-testing:}" ;;
-  remaining-after-vr) set -- "${motion_tests[@]/#/-skip-testing:}" ;;
+  vr-motion) set -- "${field_tests[@]/#/-only-testing:}" ;;
+  remaining-after-vr) set -- "${field_tests[@]/#/-skip-testing:}" ;;
   all) set -- ;;
 esac
 DEVICE_ID="${DEVICE_ID:-$(xcrun simctl list devices available -j | python3 -c '

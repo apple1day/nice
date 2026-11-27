@@ -7,7 +7,7 @@ enum BatchDeletionScope {
     func includes(_ record: DownloadRecord) -> Bool {
         switch self {
         case .localVideos: return record.state == .complete
-        case .downloadTasks: return record.state != .complete
+        case .downloadTasks: return record.state == .downloading || record.state == .failed
         }
     }
 }

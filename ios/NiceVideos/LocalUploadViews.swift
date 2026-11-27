@@ -101,7 +101,7 @@ private struct UploadVideoPicker: View {
     @State private var failedToQueue = false
 
     init(store: VideoStore, destination: UploadDestination, upload: @escaping ([LocalUploadSource]) -> Bool) {
-        _library = StateObject(wrappedValue: LocalLibraryModel(store: store))
+        _library = StateObject(wrappedValue: LocalLibraryModel(store: store, includeMissing: false))
         self.destination = destination
         self.upload = upload
     }

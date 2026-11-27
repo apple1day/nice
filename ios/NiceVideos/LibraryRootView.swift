@@ -2,7 +2,7 @@ import SwiftUI
 import Combine
 
 // Presentation changes are infrequent. Download progress must not invalidate the
-// entire tab hierarchy, and foreground activation must not scan the media folder.
+// entire tab hierarchy. File availability is refreshed separately on activation.
 private final class LibraryPresentationModel: ObservableObject {
     @Published private(set) var playback: PlaybackRequest?
     @Published private(set) var errorMessage: String?
@@ -16,6 +16,7 @@ private final class LibraryPresentationModel: ObservableObject {
 }
 
 struct LibraryRootView: View {
+    @Environment(\.scenePhase) private var scenePhase
     let store: VideoStore
     @StateObject private var presentation: LibraryPresentationModel
     init(store: VideoStore) {
@@ -47,6 +48,9 @@ struct LibraryRootView: View {
                 .tabItem { Label("上传", systemImage: "arrow.up.circle") }
             NavigationStack { SettingsView() }
                 .tabItem { Label("设置", systemImage: "gearshape") }
+        }
+        .task(id: scenePhase) {
+            if scenePhase == .active { await store.refreshDownloadedFiles() }
         }
         .background { SigningLifecycleView() }
         .fullScreenCover(item: Binding(

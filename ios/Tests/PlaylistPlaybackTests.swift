@@ -57,6 +57,7 @@ final class PlaylistPlaybackTests: XCTestCase {
             let video = Video(name: name, size: 4, contentType: "video/mp4", url: "/api/stream/\(name)",
                               downloadUrl: "/api/download/\(name)")
             var record = DownloadRecord(video: video, server: try ServerAddress.normalize("http://127.0.0.1:\(8100 + index)"))
+            record.publicFileName = try disk.availableFileName(for: record, among: records)
             record.state = .complete
             // Explicit newest-first dates retain the fixture's display order.
             // Legacy reverse order is covered separately by LibraryPoliciesTests.
@@ -454,6 +455,7 @@ final class PlaylistPlaybackTests: XCTestCase {
         let f = try fixture(count: 2, sameNames: true)
         XCTAssertEqual(f.model.entries.count, 2)
         XCTAssertNotEqual(f.records[0].id, f.records[1].id)
+        XCTAssertNotEqual(try f.disk.destination(for: f.records[0]), try f.disk.destination(for: f.records[1]))
         XCTAssertTrue(f.model.move(.next))
         XCTAssertEqual(f.model.current.key, f.records[1].id)
     }

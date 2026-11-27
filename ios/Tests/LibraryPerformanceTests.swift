@@ -58,6 +58,36 @@ final class LibraryPerformanceTests: XCTestCase {
         XCTAssertTrue(probe.ids.isEmpty)
     }
 
+    @MainActor func testFilesRemovalKeepsVisibleHistoryButExcludesItFromPlaybackAndUpload() async throws {
+        let (disk, _, records, store, _) = try fixture()
+        let library = LocalLibraryModel(store: store)
+        let uploads = LocalLibraryModel(store: store, includeMissing: false)
+        let record = records[1]
+        let original = try disk.destination(for: record)
+        let elsewhere = disk.root.appendingPathComponent("moved.mp4")
+        store.toggleFavorite(record.id)
+        try FileManager.default.moveItem(at: original, to: elsewhere)
+        await store.refreshDownloadedFiles()
+
+        XCTAssertEqual(library.visibleRows.map(\.id), records.reversed().map(\.id))
+        XCTAssertEqual(library.visibleRows[1].record.state, .missing)
+        XCTAssertTrue(library.visibleRows[1].record.isFavorite)
+        XCTAssertTrue(library.summary.contains("1 项已删除"))
+        XCTAssertFalse(library.visibleTokens.contains(record.taskToken))
+        XCTAssertEqual(library.playableIDs, [records[2].id, records[0].id])
+        XCTAssertEqual(uploads.visibleRows.map(\.id), library.playableIDs)
+        XCTAssertFalse(BatchDeletionScope.downloadTasks.includes(library.visibleRows[1].record))
+        library.setFilter(.favorites)
+        XCTAssertEqual(library.visibleRows.map(\.id), [record.id])
+        XCTAssertTrue(library.playableIDs.isEmpty)
+
+        try FileManager.default.moveItem(at: elsewhere, to: original)
+        await store.refreshDownloadedFiles()
+        XCTAssertEqual(library.playableIDs, [record.id])
+        XCTAssertFalse(library.summary.contains("已删除"))
+        XCTAssertEqual(uploads.visibleRows.count, 3)
+    }
+
     @MainActor func testSearchUsesMetadataAndKeepsDescendingOrder() throws {
         let (_, _, records, store, probe) = try fixture(count: 30)
         let list = LocalLibraryModel(store: store)

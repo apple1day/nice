@@ -48,7 +48,7 @@ final class BatchDeletionTests: XCTestCase {
         XCTAssertEqual(try disk.loadRecords(), store.records)
     }
 
-    @MainActor func testClearTasksRemovesUnfinishedAndPartialFilesButKeepsCompleted() throws {
+    @MainActor func testClearTasksKeepsUserFilesAtUnfinishedPathsAndCompletedDownloads() throws {
         let (disk, defaults, entries, store) = try fixture([.complete, .downloading, .failed])
         let request = BatchDeletionRequest(scope: .downloadTasks, records: store.records, clearAll: true)
         XCTAssertEqual(request.records.count, 2)
@@ -57,7 +57,7 @@ final class BatchDeletionTests: XCTestCase {
         XCTAssertTrue(store.unfinished.isEmpty)
         XCTAssertEqual(store.completed.map(\.id), [entries[0].id])
         XCTAssertNotNil(disk.verifiedFile(for: entries[0]))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: try disk.destination(for: entries[1]).path))
+        XCTAssertEqual(try Data(contentsOf: disk.destination(for: entries[1])), Data([0, 1]))
         XCTAssertEqual(defaults.double(forKey: "position." + entries[0].id), 20)
         XCTAssertNil(defaults.object(forKey: "position." + entries[1].id))
         XCTAssertEqual(try disk.loadRecords(), store.records)

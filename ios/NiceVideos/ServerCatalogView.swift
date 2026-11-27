@@ -23,8 +23,8 @@ struct UpdatedRootView: View {
             set: { if !$0 { store.errorMessage = nil } }
         )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
         message: { Text(store.errorMessage ?? "") }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active { store.reconcileFiles() }
+        .task(id: scenePhase) {
+            if scenePhase == .active { await store.refreshDownloadedFiles() }
         }
     }
 }
@@ -105,6 +105,9 @@ struct ServerCatalogView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
+                    if record?.state == .missing {
+                        Label("本地文件已删除", systemImage: "film").font(.caption).foregroundStyle(.secondary)
+                    }
                     if let record = record, store.isPendingDeletion(record.id) {
                         Label("手机副本待删除", systemImage: "trash")
                             .font(.caption)
@@ -232,7 +235,7 @@ struct ServerCatalogView: View {
                 .disabled(true)
         } else {
             Button { store.download(video) } label: {
-                Label(record?.state == .failed ? "重新下载" : "下载到手机",
+                Label(record?.state == .failed || record?.state == .missing ? "重新下载" : "下载到手机",
                       systemImage: "arrow.down.to.line")
             }
             .disabled(store.restoring || deletingFromServer)
