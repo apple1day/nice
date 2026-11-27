@@ -107,7 +107,7 @@ tar -xOf "$work/recovery.tar" password.txt > "$work/password"
 stage=$(mktemp -d "$bundle/.nice-update.XXXXXXXX")
 signed="$stage/update.apk"
 java -jar "$signer" sign --ks "$work/store.p12" --ks-key-alias nice-mobile \
-    --ks-pass "file:$work/password" --key-pass "file:$work/password" \
+    --ks-pass "file:$work/password" \
     --v4-signing-enabled false --out "$signed" "$payload"
 verify_owner "$signed" || die '签名校验失败，请核对备份是否属于之前的 1.3.10 安装包。'
 same_payload "$payload" "$signed" || die '输出文件内容校验失败。'
