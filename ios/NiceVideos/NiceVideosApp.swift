@@ -28,11 +28,26 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 struct NiceVideosApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     #if DEBUG
-    private static let emptyFilePickerTestStore: VideoStore? = {
+    private static let isolatedLibraryTestStore: VideoStore? = {
         let id = UUID().uuidString
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(id, isDirectory: true)
         guard let storage = try? LocalStorage(root: directory),
               let defaults = UserDefaults(suiteName: "FilePickerUITest." + id) else { return nil }
+        if ProcessInfo.processInfo.arguments.contains("--ui-test-deleted-records") {
+            do {
+                let server = try ServerAddress.normalize("http://127.0.0.1:9")
+                func completed(_ name: String) -> DownloadRecord {
+                    let video = Video(name: name, size: 4, contentType: "video/mp4", url: "", downloadUrl: "")
+                    var record = DownloadRecord(video: video, server: server)
+                    record.state = .complete
+                    return record
+                }
+                let kept = completed("Retained movie.mp4")
+                try Data([1, 2, 3, 4]).write(to: storage.destination(for: kept))
+                // Leave the second payload absent, as when removed from Files.
+                try storage.saveRecords([kept, completed("Removed movie.mp4")])
+            } catch { return nil }
+        }
         return VideoStore(storage: storage, defaults: defaults, restoreDownloads: false)
     }()
     #endif
@@ -42,11 +57,12 @@ struct NiceVideosApp: App {
             if ProcessInfo.processInfo.arguments.contains("--ui-test-playback") {
                 PlaybackUITestFixtureView()
             } else if ProcessInfo.processInfo.arguments.contains("--ui-test-file-picker") ||
-                        ProcessInfo.processInfo.arguments.contains("--ui-test-vr-folder") {
-                if let store = Self.emptyFilePickerTestStore { NiceVideosRootView(store: store) }
+                        ProcessInfo.processInfo.arguments.contains("--ui-test-vr-folder") ||
+                        ProcessInfo.processInfo.arguments.contains("--ui-test-deleted-records") {
+                if let store = Self.isolatedLibraryTestStore { NiceVideosRootView(store: store) }
                 else { Text("无法创建文件选择器测试片库") }
             } else if ProcessInfo.processInfo.arguments.contains("--ui-test-moving-video"),
-                      let store = Self.emptyFilePickerTestStore {
+                      let store = Self.isolatedLibraryTestStore {
                 MovingVideoUITestRoot(store: store)
             } else {
                 NiceVideosRootView(store: .shared)

@@ -23,6 +23,15 @@ struct LocalUploadSource: Codable, Equatable {
     let taskToken: String
     let name: String
     let size: Int64
+    // Older manifests contain only library records and decode with a nil document.
+    var pickedFile: PickedUploadDocument? = nil
+}
+
+struct PickedUploadDocument: Codable, Equatable {
+    let bookmark: Data
+    let modificationDate: Date?
+    let volume: UInt64?
+    let fileNumber: UInt64?
 }
 
 struct LocalUploadJob: Codable, Identifiable, Equatable {
@@ -56,19 +65,23 @@ enum LocalUploadWire {
     static let responseLimit = 16 * 1024
     private static let queryCharacters = CharacterSet(charactersIn:
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-    private static let extensions: Set<String> = ["mp4", "m4v", "mov", "mkv", "avi", "webm", "ogg", "flv", "wmv", "ts"]
+    static let supportedExtensions: Set<String> = ["mp4", "m4v", "mov", "mkv", "avi", "webm", "ogg", "flv", "wmv", "ts"]
 
-    static func request(for job: LocalUploadJob) throws -> URLRequest {
-        let name = job.source.name
+    static func validateSource(name: String, size: Int64) throws {
         guard !name.isEmpty, name.utf8.count <= 240, !name.hasPrefix("."),
               !name.contains("/"), !name.contains("\\"),
               name.rangeOfCharacter(from: .controlCharacters) == nil,
-              extensions.contains((name as NSString).pathExtension.lowercased()) else {
+              supportedExtensions.contains((name as NSString).pathExtension.lowercased()) else {
             throw LocalUploadError("视频文件名或格式不适合上传。")
         }
-        guard job.source.size > 0, job.source.size <= maximumBytes else {
+        guard size > 0, size <= maximumBytes else {
             throw LocalUploadError("单个视频需大于 0 字节且不超过 20 GiB。")
         }
+    }
+
+    static func request(for job: LocalUploadJob) throws -> URLRequest {
+        let name = job.source.name
+        try validateSource(name: name, size: job.source.size)
         guard var components = URLComponents(url: job.server, resolvingAgainstBaseURL: false),
               ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
               let host = components.host, !host.isEmpty,

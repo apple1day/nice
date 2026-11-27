@@ -64,6 +64,13 @@ private struct OfflineLibraryContent: View {
                     Text("点击视频后，按当前列表顺序自动播放后续视频。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                if !selection.isSelecting && library.visibleMissingRecords.count > 1 {
+                    Button("清理已删除记录（\(library.visibleMissingRecords.count)）", role: .destructive) {
+                        deletion = BatchDeletionRequest(scope: .missingHistory, records: library.visibleMissingRecords)
+                    }
+                    .disabled(library.restoring)
+                    .accessibilityIdentifier("clearVisibleMissingRecords")
+                }
                 if let notice = library.notice {
                     Text(notice).font(.caption).foregroundStyle(.secondary)
                 }
@@ -71,14 +78,22 @@ private struct OfflineLibraryContent: View {
             if let result = result { BatchDeletionResultSection(result: result) }
             ForEach(library.visibleRows) { row in
                 if row.record.state == .missing {
-                    HStack {
+                    VStack(alignment: .leading, spacing: 8) {
                         LocalVideoRowLabel(row: row, selecting: false, selected: false).equatable()
                             .accessibilityIdentifier("localVideoRow.\(row.id)")
                         if !selection.isSelecting {
-                            Button("重新下载") { store.retry(row.record) }
-                                .buttonStyle(.borderless)
-                                .disabled(library.restoring)
-                                .accessibilityLabel("重新下载 \(row.record.video.name)")
+                            HStack {
+                                Button("重新下载") { store.retry(row.record) }
+                                    .accessibilityLabel("重新下载 \(row.record.video.name)")
+                                Spacer()
+                                Button("移除记录", role: .destructive) {
+                                    deletion = BatchDeletionRequest(scope: .missingHistory, records: [row.record])
+                                }
+                                .accessibilityLabel("移除记录 \(row.record.video.name)")
+                                .accessibilityIdentifier("removeMissingRecord.\(row.id)")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(library.restoring)
                         }
                     }
                 } else {

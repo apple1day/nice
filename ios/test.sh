@@ -4,6 +4,14 @@ cd "$(dirname "$0")"
 # Run storage and playback regressions before the longer UI suite.
 # A plain invocation still runs every test.
 field_tests=(
+  NiceVideosUITests/UploadFilesPickerUITests
+  NiceVideosUITests/MissingLocalRecordUITests
+  NiceVideosTests/PickedFileUploadIntegrationTests
+  NiceVideosTests/PickedUploadDocumentTests
+  NiceVideosTests/LocalUploadManagerTests
+  NiceVideosTests/BatchDeletionTests/testClearMissingHistoryRefreshesRestoredMoviesAndOnlyForgetsAbsentConfirmedEntries
+  NiceVideosTests/BatchDeletionTests/testRemoveMissingRecordSkipsNewDownloadAttemptAndPreservesUserMovedFile
+  NiceVideosTests/BatchDeletionTests/testMissingCleanupKeepsHistoryAndBookmarksIfSavingFails
   NiceVideosTests/FilesIntegrationTests
   NiceVideosTests/SharedDownloadStorageTests
   NiceVideosTests/SharedDownloadAvailabilityTests

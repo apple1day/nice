@@ -647,6 +647,55 @@ extension VideoStore {
         }
         return deleted
     }
+    // A confirmed history cleanup may only change the private index. In particular,
+    // never invoke a file removal if Files restores or replaces an item mid-action.
+    func forgetMissingDownloads(_ request: BatchDeletionRequest) -> BatchDeletionResult {
+        var outcome = BatchDeletionResult(recordsOnly: true)
+        guard request.scope == .missingHistory, !restoring else { return outcome }
+        guard let disk else {
+            outcome.failures = request.records.map { "\($0.video.name)：本地存储不可用，原记录已保留。" }
+            return outcome
+        }
+        let current = request.records.compactMap { snapshot -> DownloadRecord? in
+            guard let record = recordsByID[snapshot.id], record.taskToken == snapshot.taskToken,
+                  record.publicFileName == snapshot.publicFileName, record.state == .missing,
+                  !isPlaybackProtected(record.id) else { return nil }
+            return record
+        }
+        // Check only the records confirmed by the user. A single-row removal
+        // should cost one lookup even in a large downloads folder.
+        var ids = Set<String>()
+        var changed = Set<String>()
+        outcome.skipped = request.records.count - current.count
+        for record in current {
+            switch disk.fileStatus(for: record) {
+            case .absent:
+                ids.insert(record.id)
+            case .available, .invalid:
+                changed.insert(record.id)
+                outcome.skipped += 1
+            case .unavailable:
+                outcome.failures.append("\(record.video.name)：文件夹暂时无法访问，记录已保留。")
+            }
+        }
+        if !ids.isEmpty {
+            let next = records.filter { !ids.contains($0.id) }
+            do {
+                try disk.saveRecords(next)
+                records = next
+                for record in current where ids.contains(record.id) {
+                    defaults.removeObject(forKey: "position." + record.id)
+                    outcome.removedTokens.insert(record.taskToken)
+                }
+                deletionNotice = nil
+            } catch {
+                let message = error.localizedDescription
+                outcome.failures += current.filter { ids.contains($0.id) }.map { "\($0.video.name)：保存失败，\(message)" }
+            }
+        }
+        if !changed.isEmpty { reconcileFiles(ids: changed) }
+        return outcome
+    }
     private func deleteLocally(_ record: DownloadRecord, saving next: [DownloadRecord]) throws -> String? {
         guard !isPlaybackProtected(record.id) else {
             throw ClientError("此视频仍在播放，请先关闭播放器后重试。")

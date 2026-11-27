@@ -12,6 +12,7 @@ struct LocalLibraryRow: Identifiable, Equatable {
 final class LocalLibraryModel: ObservableObject {
     @Published private(set) var visibleRows: [LocalLibraryRow] = []
     @Published private(set) var visibleTokens: [String] = []
+    private(set) var visibleMissingRecords: [DownloadRecord] = []
     @Published private(set) var filter: VideoListFilter = .all
     @Published private(set) var pendingRecords: [DownloadRecord] = []
     @Published private(set) var summary = "0 个视频 · 0 KB"
@@ -81,6 +82,7 @@ final class LocalLibraryModel: ObservableObject {
             filter.matches($0.record) &&
                 (search.isEmpty || $0.record.video.name.localizedCaseInsensitiveContains(search))
         }
+        visibleMissingRecords = next.compactMap { $0.record.state == .missing ? $0.record : nil }
         if visibleRows != next { visibleRows = next }
         let tokens = next.filter { $0.record.state == .complete }.map { $0.record.taskToken }
         if visibleTokens != tokens { visibleTokens = tokens }
