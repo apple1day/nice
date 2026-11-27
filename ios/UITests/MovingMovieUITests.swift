@@ -69,17 +69,30 @@ final class MovingMovieUITests: XCTestCase {
         try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC full SBS")
         revealControls(surface)
         format.tap()
+        let settings = app.navigationBars["VR 设置"]
+        try require(settings.waitForExistence(timeout: 5), app.debugDescription)
         let decoder = app.descendants(matching: .any)["vrCurrentDecoder"]
         for _ in 0..<6 {
             if decoder.exists && decoder.isHittable { break }
             app.swipeUp()
         }
         try require(decoder.value as? String == "系统播放器", "Unexpected 4K panorama decoder: " + app.debugDescription)
-        for _ in 0..<6 {
-            if app.buttons["exitPanoramaVR"].isHittable { break }
-            app.swipeDown()
-        }
-        app.buttons["exitPanoramaVR"].tap()
+        // The landscape form has scrolled past its exit row. The Done button
+        // stays in the navigation bar, and the player has a visible fullscreen exit.
+        settings.buttons["完成"].tap()
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: settings)
+        try require(XCTWaiter.wait(for: [dismissed], timeout: 5) == .completed, app.debugDescription)
+        revealControls(surface)
+        let exit = app.buttons["toggleFullscreenButton"]
+        let canExit = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true AND label == %@", "退出全屏"), object: exit)
+        try require(XCTWaiter.wait(for: [canExit], timeout: 5) == .completed, app.debugDescription)
+        exit.tap()
+        revealControls(surface)
+        let ordinary = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "普通播放"), object: format)
+        try require(XCTWaiter.wait(for: [ordinary], timeout: 5) == .completed, app.debugDescription)
+        let transport = app.buttons["togglePlaybackButton"]
+        if transport.label == "播放" { transport.tap() }
         try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC after leaving VR")
     }
 

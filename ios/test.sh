@@ -8,6 +8,7 @@ field_tests=(
   NiceVideosTests/DirectHEVCFrameTests
   NiceVideosTests/VLCFrameLossWatchTests
   NiceVideosTests/VLCHeadsetReplayTests/testSustainedFullHeight8K60VLCToMetalCadence
+  NiceVideosUITests/MovingMovieUITests/testSystemPlayerShowsChanging4KHEVCSamplesBeyond4GiBInOrdinaryAndVR
   NiceVideosUITests/MovingMovieUITests/testPickedPanoramaCanLookAroundRecenterAndPlayInBothEyes
   NiceVideosUITests/UploadFilesPickerUITests
   NiceVideosUITests/MissingLocalRecordUITests
