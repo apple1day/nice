@@ -8,7 +8,6 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.SystemClock;
 import android.provider.MediaStore;
-import android.view.accessibility.AccessibilityNodeInfo;
 
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
@@ -135,21 +134,6 @@ public final class BatchDeleteDownloadsTest {
         fail(condition);
     }
 
-    private void ui(String text, boolean click) {
-        await("No visible control or dialog text: " + text, 12, () -> {
-            AccessibilityNodeInfo root = ins.getUiAutomation().getRootInActiveWindow();
-            if (root == null) return false;
-            for (AccessibilityNodeInfo node : root.findAccessibilityNodeInfosByText(text)) {
-                if (node.getText() == null || !node.isVisibleToUser()) continue;
-                String label = node.getText().toString();
-                if (click && text.equals(label) && node.isEnabled()
-                        && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
-                if (!click && label.contains(text)) return true;
-            }
-            return false;
-        });
-    }
-
     private VideoLibrary.Entry enqueue(VideoSource service, String file, int length) throws IOException {
         String url = service.address(file);
         assertTrue(library.enqueue(new ServerVideos.Movie(prefix + file, length, url), null));
@@ -236,17 +220,18 @@ public final class BatchDeleteDownloadsTest {
                 assertArrayEquals(video, bytes(resolver.openInputStream(library.uri(first))));
 
                 // The operation covers completed downloads even when the current view only shows favorites.
-                ui("收藏", true);
-                ui(BUTTON, true);
-                ui("2 部", false);
-                ui("取消", true);
+                TestAppWindows controls = new TestAppWindows(scene);
+                controls.click("收藏");
+                controls.click(BUTTON);
+                controls.expectText("2 部");
+                controls.click("取消");
                 assertArrayEquals(video, bytes(resolver.openInputStream(library.uri(first))));
                 assertArrayEquals(video, bytes(resolver.openInputStream(library.uri(migrated))));
 
-                ui(BUTTON, true);
-                ui("2 部", false);
+                controls.click(BUTTON);
+                controls.expectText("2 部");
                 VideoLibrary.Entry later = migratedCopy("finished-after-dialog.mp4", video, service.address("later.mp4"));
-                ui("确认删除", true);
+                controls.click("确认删除");
                 await("Both confirmed records should disappear", 15,
                         () -> library.find(first.id) == null && library.find(migrated.id) == null);
                 await("DownloadProvider should remove the first public file", 10,

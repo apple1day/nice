@@ -2,6 +2,7 @@ package com.anxiong.nicevideos;
 
 import android.app.Instrumentation;
 import android.content.Context;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -92,12 +93,19 @@ public final class DirectDownloadTest {
         throw new AssertionError("Missing control: " + text);
     }
 
-    private VideoLibrary.Entry download(Endpoint endpoint, VideoLibrary library) {
-        assertTrue(control("视频直链", false).performAction(AccessibilityNodeInfo.ACTION_CLICK));
-        Bundle args = new Bundle();
-        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, endpoint.url + "#fragment");
-        assertTrue(control("URL", true).performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args));
-        assertTrue(control("开始下载", false).performAction(AccessibilityNodeInfo.ACTION_CLICK));
+    private VideoLibrary.Entry download(Endpoint endpoint, VideoLibrary library, ActivityScenario<MainActivity> scene) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            TestAppWindows controls = new TestAppWindows(scene);
+            controls.click("视频直链");
+            controls.enterText("https://example.com/video.mp4", endpoint.url + "#fragment");
+            controls.click("开始下载");
+        } else {
+            assertTrue(control("视频直链", false).performAction(AccessibilityNodeInfo.ACTION_CLICK));
+            Bundle args = new Bundle();
+            args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, endpoint.url + "#fragment");
+            assertTrue(control("URL", true).performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args));
+            assertTrue(control("开始下载", false).performAction(AccessibilityNodeInfo.ACTION_CLICK));
+        }
         long end = SystemClock.elapsedRealtime() + 60_000;
         VideoLibrary.Entry last = null;
         do {
@@ -122,7 +130,7 @@ public final class DirectDownloadTest {
              Endpoint fake = new Endpoint("<html>Login required</html>".getBytes(StandardCharsets.UTF_8), "video/mp4");
              ActivityScenario<MainActivity> scene = ActivityScenario.launch(MainActivity.class)) {
             try {
-                VideoLibrary.Entry ready = download(movie, library);
+                VideoLibrary.Entry ready = download(movie, library, scene);
                 assertNull(movie.failure); assertTrue(movie.served);
                 assertEquals(ready.error, VideoLibrary.READY, ready.state);
                 assertTrue(ready.publicDownload && ready.direct);
@@ -130,7 +138,7 @@ public final class DirectDownloadTest {
                 assertTrue(ready.disk.startsWith("sample clip"));
                 assertArrayEquals(sample, read(app.getContentResolver().openInputStream(library.uri(ready))));
                 assertFalse("An accessible public copy was removed", library.forgetIfMissing(ready.id));
-                VideoLibrary.Entry failed = download(fake, library);
+                VideoLibrary.Entry failed = download(fake, library, scene);
                 assertNull(fake.failure); assertTrue(fake.served);
                 assertEquals(VideoLibrary.FAILED, failed.state);
                 assertTrue(failed.error, failed.error.contains("视频"));

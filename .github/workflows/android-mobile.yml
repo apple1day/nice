@@ -98,6 +98,9 @@ jobs:
           path: |
             android/app/build/outputs/androidTest-results/
             android/app/build/reports/tests/
+      - name: Verify same distributed binary
+        working-directory: android
+        run: cmp NiceVideos-Mobile.apk app/build/outputs/apk/mobile/app-mobile.apk
       - name: Android 15 installation, deletion and transfers
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -113,10 +116,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Mobile-Android-15-tests
-          path: ${{ runner.temp }}/nice-mobile-api35-result.txt
-      - name: Verify same distributed binary
-        working-directory: android
-        run: cmp NiceVideos-Mobile.apk app/build/outputs/apk/mobile/app-mobile.apk
+          path: |
+            ${{ runner.temp }}/nice-mobile-api35-result.txt
+            ${{ runner.temp }}/owner-upgrade-test.txt
+            ${{ runner.temp }}/nice-ui-state.*
       - uses: actions/upload-artifact@v4
         with:
           name: NiceVideos-Mobile
