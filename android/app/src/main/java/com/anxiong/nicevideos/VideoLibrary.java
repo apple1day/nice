@@ -5,6 +5,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
 import android.net.Uri;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
@@ -34,7 +36,7 @@ final class VideoLibrary {
         final String id;
         String name = "", document = "", source = "", disk = "", state = READY, error = "";
         long bytes = -1, time, job = -1;
-        boolean favorite, publicDownload, restoredPrivate;
+        boolean favorite, publicDownload, restoredPrivate, direct;
         String publicUri = "";
         Entry(String id) { this.id = id; }
         boolean downloaded() { return !disk.isEmpty(); }
@@ -56,6 +58,7 @@ final class VideoLibrary {
             e.bytes = o.optLong("bytes", -1); e.time = o.optLong("time"); e.job = o.optLong("job", -1);
             e.favorite = o.optBoolean("favorite");
             e.publicDownload = o.optBoolean("publicDownload");
+            e.direct = o.optBoolean("direct");
             e.restoredPrivate = o.optBoolean("restoredPrivate");
             e.publicUri = o.optString("publicUri");
             return e;
@@ -81,7 +84,7 @@ final class VideoLibrary {
             o.put("id", e.id).put("name", e.name).put("document", e.document).put("source", e.source)
                 .put("disk", e.disk).put("state", e.state).put("error", e.error).put("bytes", e.bytes)
                 .put("time", e.time).put("job", e.job).put("favorite", e.favorite)
-                .put("publicDownload", e.publicDownload).put("publicUri", e.publicUri)
+                .put("publicDownload", e.publicDownload).put("publicUri", e.publicUri).put("direct", e.direct)
                 .put("restoredPrivate", e.restoredPrivate);
         } catch (JSONException ex) { throw new IllegalStateException(ex); }
         return prefs.edit().putString("movie." + e.id, o.toString());
@@ -226,6 +229,15 @@ final class VideoLibrary {
         }
     }
 
+    boolean forgetIfMissing(String id) {
+        synchronized (VideoLibrary.class) {
+            Entry current = find(id);
+            if (current == null || !missingPublicFile(current)) return false;
+            forget(current);
+            return true;
+        }
+    }
+
     void remove(Entry entry) throws IOException {
         synchronized (VideoLibrary.class) {
             Entry e = find(entry.id);
@@ -260,17 +272,18 @@ final class VideoLibrary {
         if (!f.delete() && f.exists()) throw new IOException("无法清理本机副本。");
     }
 
-    void enqueue(ServerVideos.Movie movie, Entry prior) throws IOException {
+    boolean enqueue(ServerVideos.Movie movie, Entry prior) throws IOException {
         synchronized (VideoLibrary.class) {
             // Activity recreation can leave a list row referring to an old record.
             for (Entry current : all()) {
                 if (current.source.equals(movie.url)) { prior = current; break; }
             }
-            if (prior != null && !FAILED.equals(prior.state) && !missingPublicFile(prior)) return;
+            if (prior != null && !FAILED.equals(prior.state) && !missingPublicFile(prior)) return false;
             if (prior != null && !prior.publicDownload) removeTransfer(prior);
             Entry e = prior == null ? new Entry(UUID.randomUUID().toString()) : prior;
             e.disk = nextDownloadName(movie.name);
-            e.name = movie.name; e.source = movie.url; e.bytes = movie.bytes;
+            e.direct = movie.direct || e.direct;
+            e.name = movie.name; e.source = movie.url; e.bytes = e.direct ? -1 : movie.bytes;
             e.publicDownload = true; e.publicUri = ""; e.restoredPrivate = false;
             long space = Environment.getExternalStorageDirectory().getUsableSpace();
             if (e.bytes > 0 && space > 0 && space < e.bytes) throw new IOException("本机剩余空间不足。");
@@ -288,12 +301,32 @@ final class VideoLibrary {
                 manager().remove(e.job);
                 throw new IOException("无法保存下载记录。");
             }
+            return true;
         }
     }
 
     static final class Transfer {
         String state = TRANSFER, label = "等待下载", publicUri = "", disk = "";
         long bytes, total;
+    }
+
+    private boolean containsVideo(ParcelFileDescriptor fd, String contentType) {
+        if (contentType != null) {
+            String mime = contentType.toLowerCase(Locale.ROOT);
+            if (mime.startsWith("text/html") || mime.contains("mpegurl") || mime.contains("dash+xml")
+                    || mime.startsWith("application/json") || mime.startsWith("application/xhtml")) return false;
+        }
+        MediaExtractor extractor = new MediaExtractor();
+        try {
+            extractor.setDataSource(fd.getFileDescriptor());
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                String type = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME);
+                if (type != null && type.startsWith("video/")) return true;
+            }
+            return false;
+        } catch (IOException | RuntimeException unreadable) {
+            return false;
+        } finally { extractor.release(); }
     }
 
     Transfer check(Entry e) throws IOException {
@@ -330,7 +363,11 @@ final class VideoLibrary {
                 }
                 try (ParcelFileDescriptor fd = openDownload(e)) {
                     long size = fd.getStatSize();
-                    if (size > 0 && (expected < 0 || size == expected)) {
+                    String mime = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_MEDIA_TYPE));
+                    if (e.direct && !containsVideo(fd, mime)) {
+                        t.state = FAILED; t.label = "链接未返回可识别的视频文件";
+                        manager().remove(e.job);
+                    } else if (size > 0 && (expected < 0 || size == expected)) {
                         t.state = READY;
                         t.bytes = size;
                     } else { t.state = FAILED; t.label = "文件不完整或已移除"; }

@@ -7,24 +7,44 @@ android {
     compileSdk 35
 
     defaultConfig {
-        applicationId 'com.anxiong.nicevideos.vr.preview'
+        applicationId 'com.anxiong.nicevideos'
         minSdk 26
         targetSdk 35
-        versionCode 6
-        versionName '1.3.0'
+        versionCode 22
+        versionName '1.3.10'
         manifestPlaceholders = [niceAppLabel: 'Nice 视频 VR']
         resValue 'bool', 'start_in_vr_library', 'false'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
+    signingConfigs {
+        if (System.getenv('NICE_MOBILE_STORE_FILE')) {
+            mobile {
+                storeFile file(System.getenv('NICE_MOBILE_STORE_FILE'))
+                storePassword System.getenv('NICE_MOBILE_STORE_PASS')
+                keyAlias 'nice-mobile'
+                keyPassword System.getenv('NICE_MOBILE_STORE_PASS')
+            }
+        }
+    }
     buildTypes {
+        debug { applicationIdSuffix '.vr.preview' }
+        release { applicationIdSuffix '.vr.preview' }
         vrPreview {
             initWith debug
-            applicationIdSuffix '.vrplayer'
+            applicationIdSuffix '.vr.preview.vrplayer'
             manifestPlaceholders = [niceAppLabel: 'Nice VR 播放器']
             resValue 'bool', 'start_in_vr_library', 'true'
             matchingFallbacks = ['debug']
         }
+        mobile {
+            initWith release
+            applicationIdSuffix '.mobile'
+            manifestPlaceholders = [niceAppLabel: 'Nice 视频']
+            if (signingConfigs.findByName('mobile')) signingConfig signingConfigs.mobile
+            matchingFallbacks = ['release']
+        }
     }
+    testBuildType = providers.gradleProperty('testMobile').isPresent() ? 'mobile' : 'debug'
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -40,7 +60,7 @@ def fixtures = tasks.register('generatePlaybackFixtures', Exec) {
     outputs.dir(destination)
     commandLine 'bash', script.absolutePath, destination.get().asFile.absolutePath, helper.absolutePath
 }
-tasks.matching { it.name == 'mergeDebugAndroidTestAssets' }.configureEach { dependsOn fixtures }
+tasks.matching { it.name in ['mergeDebugAndroidTestAssets', 'mergeMobileAndroidTestAssets'] }.configureEach { dependsOn fixtures }
 
 dependencies {
     implementation 'androidx.media3:media3-exoplayer:1.6.1'

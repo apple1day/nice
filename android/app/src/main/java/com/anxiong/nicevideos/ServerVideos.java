@@ -16,7 +16,38 @@ final class ServerVideos {
     static final class Movie {
         final String name, url;
         final long bytes;
-        Movie(String name, long bytes, String url) { this.name = name; this.bytes = bytes; this.url = url; }
+        final boolean direct;
+        Movie(String name, long bytes, String url) { this(name, bytes, url, false); }
+        Movie(String name, long bytes, String url, boolean direct) {
+            this.name = name; this.bytes = bytes; this.url = url; this.direct = direct;
+        }
+    }
+
+    static Movie direct(String raw, String suggestedName) throws IOException {
+        URI link;
+        try { link = new URI(raw == null ? "" : raw.trim()); }
+        catch (java.net.URISyntaxException ex) { throw new IOException("视频地址格式有误。"); }
+        String scheme = link.getScheme();
+        if (!("https".equalsIgnoreCase(scheme) || "http".equalsIgnoreCase(scheme))
+                || link.getHost() == null || link.getRawUserInfo() != null
+                || link.getPort() == 0 || link.getPort() > 65535)
+            throw new IOException("请输入以 https:// 或 http:// 开头的完整视频直链。");
+        // Preserve the signed path and query byte for byte. Fragments never reach the server.
+        String url = link.toASCIIString();
+        int fragment = url.indexOf('#');
+        if (fragment >= 0) url = url.substring(0, fragment);
+        url = scheme.toLowerCase(Locale.ROOT) + url.substring(scheme.length());
+        Uri uri = Uri.parse(url);
+        String original = uri.getLastPathSegment();
+        String name = suggestedName == null ? "" : suggestedName.trim();
+        if (name.isEmpty()) {
+            String filename = uri.getQueryParameter("filename");
+            name = filename == null || filename.trim().isEmpty() ? original : filename;
+        }
+        if (name == null || name.trim().isEmpty()) name = "video";
+        if (playlist(original == null ? "" : original) || playlist(name))
+            throw new IOException("这是播放列表，请使用单个视频文件的下载地址。");
+        return new Movie(VideoLibrary.safePublicName(name), -1, url, true);
     }
 
     static String address(String raw) throws IOException {
