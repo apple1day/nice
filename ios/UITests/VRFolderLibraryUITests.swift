@@ -88,8 +88,8 @@ final class VRFolderLibraryUITests: XCTestCase {
         toggle.tap()
         waitFor("The real movie did not pause") { toggle.exists && toggle.label == "播放" && toggle.isHittable }
         // No mode menu was opened: the folder row directly entered immersive viewing.
-        XCTAssertTrue(app.buttons["vrHeadsetButton"].isHittable)
-        XCTAssertEqual(app.buttons["videoFormatButton"].value as? String, "180° 全景")
+        XCTAssertFalse(app.buttons["vrHeadsetButton"].exists)
+        XCTAssertEqual(app.buttons["videoFormatButton"].value as? String, "360° · 左右 SBS · 双眼")
         let close = app.buttons["closeFullscreenPlayer"]
         XCTAssertTrue(close.isHittable)
         close.tap()
@@ -181,14 +181,9 @@ final class VRFolderLibraryUITests: XCTestCase {
         XCTAssertTrue(control("afterglowOpenVideo").exists)
         attachVRScreen("Afterglow XR entry")
         control("afterglowOpenSettings").tap()
-        let headset = app.switches.matching(identifier: "vrHeadsetToggle").firstMatch
-        XCTAssertTrue(headset.waitForExistence(timeout: 6), app.debugDescription)
+        XCTAssertTrue(control("fixedVRFormat").waitForExistence(timeout: 6), app.debugDescription)
+        XCTAssertFalse(control("vrHeadsetToggle").exists)
         attachVRScreen("Afterglow XR playback presets")
-        if headset.value as? String == "1" {
-            headset.coordinate(withNormalizedOffset: CGVector(dx: 0.88, dy: 0.5)).tap()
-        }
-        let singleScreen = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '0'"), object: headset)
-        XCTAssertEqual(XCTWaiter.wait(for: [singleScreen], timeout: 5), .completed)
         XCTAssertTrue(control("afterglowFrameRate").exists)
         restoreDecoder = true
         chooseDecoder("VLC 软件解码")
@@ -211,8 +206,8 @@ final class VRFolderLibraryUITests: XCTestCase {
         let paused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "播放"), object: toggle)
         XCTAssertEqual(XCTWaiter.wait(for: [paused], timeout: 6), .completed, app.debugDescription)
         let format = control("videoFormatButton")
-        XCTAssertEqual(format.value as? String, "360° 全景")
-        XCTAssertEqual(control("vrHeadsetButton").label, "切换双眼眼镜")
+        XCTAssertEqual(format.value as? String, "360° · 左右 SBS · 双眼")
+        XCTAssertFalse(control("vrHeadsetButton").exists)
         format.tap()
         XCTAssertTrue(control("copyPlaybackDiagnostics").waitForExistence(timeout: 6))
         let decoder = control("vrCurrentDecoder")

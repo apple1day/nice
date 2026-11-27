@@ -109,11 +109,6 @@ struct NiceVideosApp: App {
                     if resume360 {
                         // Reproduce a saved headset movie opened well beyond its first frame.
                         let key = PlaybackRequest(pickedFile: file).key
-                        var profile = VRMoviePreferences()
-                        profile.projection = .vr360
-                        profile.eyes = .sideBySide
-                        profile.headset = true
-                        profile.save(key: key)
                         UserDefaults.standard.set(143.0, forKey: "position." + key)
                     }
                     try store.playPickedFile(file, startMode: resume360 ? .panorama : .standard)

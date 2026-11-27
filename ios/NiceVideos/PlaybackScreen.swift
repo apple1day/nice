@@ -423,7 +423,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     // to cancel the current native tracking session synchronously before actions.
     @State private var scrubber = PlaybackScrubController()
     @State private var showsPlaylist = false
-    @State private var showsVideoFormats = false
+    @State private var showsPlaybackOptions = false
     @State private var diagnosticCopyNotice: UUID?
     @State private var showsVRSettings = false
     @State private var showsCompatiblePicker = false
@@ -459,7 +459,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         _afterglowViewing = State(initialValue: afterglow)
         _outputOverride = State(initialValue: afterglow ? .afterglow : nil)
         _vrProfile = State(initialValue: profile)
-        _displayMode = State(initialValue: request.startMode == .standard ? .standard : profile.mode)
+        _displayMode = State(initialValue: request.startMode == .standard ? .standard : VRMoviePreferences.mode)
         _camera = StateObject(wrappedValue: VRGestureCamera(fieldOfView: profile.fieldOfView))
     }
 
@@ -474,8 +474,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
     private var isFullscreen: Bool { controls.isFullscreen || displayMode != .standard }
     private var immersive: Bool { if case .immersive = displayMode { return true }; return false }
-    private var isPanorama: Bool { immersive && vrProfile.projection != .flat }
-    private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist || showsVideoFormats || showsVRSettings }
+    private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist || showsPlaybackOptions || showsVRSettings }
     private var isLibraryVideo: Bool { request.pickedFile == nil }
     private var showsPause: Bool { model.phase == .playing || model.phase == .opening }
     private var canInteract: Bool { scenePhase == .active && store.errorMessage == nil && !showsPlaylist && !showsVRSettings &&
@@ -493,8 +492,8 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                     Color.black.ignoresSafeArea()
                     MovieVideoSurface(model: model, mode: displayMode, standardOutput: standardOutput,
                                       decoderPolicy: immersive ? vrDecoderPolicy : .automatic,
-                                      camera: camera, followHead: isPanorama && (afterglowViewing ? afterglowGyro : followHead) && scenePhase == .active && !showsVRSettings,
-                                      wakeGesture: vrProfile.headset && canInteract && !hasMessage ? wakeGesture : .off,
+                                      camera: camera, followHead: immersive && (afterglowViewing ? afterglowGyro : followHead) && scenePhase == .active && !showsVRSettings,
+                                      wakeGesture: immersive && canInteract && !hasMessage ? wakeGesture : .off,
                                       nativeResolution: nativeResolution,
                                       renderScalePercent: afterglowViewing ? afterglowRenderScale : nil,
                                       targetFrameRate: afterglowViewing ? afterglowFrameRate : 60)
@@ -505,7 +504,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                         .accessibilityIdentifier("offlineVideoSurface")
                     Group {
                         if immersive {
-                            VRPanoramaSurface(camera: camera, panorama: isPanorama, headset: vrProfile.headset,
+                            VRPanoramaSurface(camera: camera,
                                               response: pinchResponse, onTap: toggleControls, onDoubleTap: doubleTapped,
                                               onZoomEnd: { fov in
                                 vrProfile.fieldOfView = fov
@@ -522,7 +521,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                     .accessibilityAddTraits(.isButton)
                     .accessibilityAction { toggleControls() }
                     .accessibilityActions {
-                        if isPanorama { Button("视角回正") { camera.recenter() } }
+                        if immersive { Button("视角回正") { camera.recenter() } }
                         if isLibraryVideo {
                             Button("上一个视频") { navigate(.previous) }
                             Button("下一个视频") { navigate(.next) }
@@ -570,7 +569,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                 .frame(width: 0, height: 0).allowsHitTesting(false).accessibilityHidden(true)
         }
         .onReceive(camera.controlsRequested) { _ in
-            if immersive && vrProfile.headset && canInteract && !hasMessage { revealControls() }
+            if immersive && canInteract && !hasMessage { revealControls() }
         }
         .sheet(isPresented: $showsPlaylist) { playlistSheet }
         .sheet(isPresented: $showsVRSettings) { immersiveSettings }
@@ -676,7 +675,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     }
     private func transportControls(isLandscape: Bool) -> some View {
         VStack(spacing: 4) {
-            if displayMode != .standard && (!immersive || vrProfile.headset) && !isLandscape {
+            if immersive && !isLandscape {
                 Text("请将手机横放后放入 VR 眼镜").font(.caption)
             }
             if model.phase == .opening { ProgressView("打开本地文件…").tint(.white).font(.caption) }
@@ -715,7 +714,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                     .accessibilityLabel("本地播放列表 \(playlist.positionLabel)")
                     .accessibilityIdentifier("openLocalPlaylistButton")
                 }
-                if immersive && isPanorama {
+                if immersive {
                     Button { camera.recenter(); revealControls() } label: {
                         Image(systemName: "scope").frame(minWidth: 44, minHeight: 44)
                     }.accessibilityLabel("视角回正").accessibilityIdentifier("vrRecenterButton")
@@ -730,18 +729,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                     .accessibilityIdentifier("afterglowCurrentVideo")
                 }
                 videoFormatButton
-                if immersive {
-                    Button {
-                        var next = vrProfile
-                        next.headset.toggle()
-                        applyProfile(next)
-                        revealControls()
-                    } label: {
-                        Image(systemName: vrProfile.headset ? "rectangle" : "visionpro")
-                            .frame(minWidth: 44, minHeight: 44)
-                    }.accessibilityLabel(vrProfile.headset ? "切换单屏观看" : "切换双眼眼镜")
-                        .accessibilityIdentifier("vrHeadsetButton")
-                }
+                if !immersive { ordinaryPlaybackOptions }
                 Spacer(minLength: 4)
                 if isLibraryVideo && !isLandscape { navigationButton(.next, compact: false) }
             }
@@ -821,33 +809,32 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
 
     private var videoFormatButton: some View {
         Button { performTransportAction {
-            if immersive { showsVRSettings = true } else { showsVideoFormats = true }
+            if immersive { showsVRSettings = true } else { enterPanorama() }
         } } label: {
-            Text(immersive ? "VR 设置" : (displayMode == .standard ? "VR" : "VR ✓"))
+            Text(immersive ? "VR 设置" : "VR")
                 .font(.subheadline.bold())
                 .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Rectangle())
         }
         .disabled(!canInteract)
-        .accessibilityLabel("VR 播放格式")
-        .accessibilityValue(immersive ? vrProfile.projection.label : (displayMode == .standard ? "普通播放" : (displayMode == .half ? "半宽 SBS" : "全宽 SBS")))
+        .accessibilityLabel(immersive ? "VR 设置" : "进入全景 VR")
+        .accessibilityValue(immersive ? VRMoviePreferences.formatLabel : "普通播放")
         .accessibilityIdentifier("videoFormatButton")
-        .confirmationDialog("视频显示方式", isPresented: $showsVideoFormats, titleVisibility: .visible) {
-            Button("进入全景 VR") { enterPanorama() }
-            Button("半宽 SBS（Half SBS）") { displayMode = .half }
-            Button("全宽 SBS（Full SBS）") { displayMode = .full }
-            if displayMode != .standard {
-                Button("退出 VR，普通播放") { displayMode = .standard }
-                if activeOutput == .system {
-                    Button("VR：切换到 VLC 解码") { selectOutput(.vlcFrames) }
-                }
-            } else {
-                if activeOutput != .vlcNative {
-                    Button("普通播放：切换到原生显示") { selectOutput(.vlcNative) }
-                }
-                if activeOutput != .vlcFrames {
-                    Button("普通播放：切换到兼容显示") { selectOutput(.vlcFrames) }
-                }
+    }
+
+    private var ordinaryPlaybackOptions: some View {
+        Button { performTransportAction { showsPlaybackOptions = true } } label: {
+            Image(systemName: "ellipsis.circle").frame(minWidth: 44, minHeight: 44)
+        }
+        .disabled(!canInteract)
+        .accessibilityLabel("播放选项")
+        .accessibilityIdentifier("ordinaryPlaybackOptions")
+        .confirmationDialog("播放选项", isPresented: $showsPlaybackOptions, titleVisibility: .visible) {
+            if activeOutput != .vlcNative {
+                Button("普通播放：切换到原生显示") { selectOutput(.vlcNative) }
+            }
+            if activeOutput != .vlcFrames {
+                Button("普通播放：切换到兼容显示") { selectOutput(.vlcFrames) }
             }
             if defaultOutput == .system && activeOutput != .system {
                 Button("切换到系统播放器") { selectOutput(.system) }
@@ -857,9 +844,10 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text(["当前解码：\(activeOutput.title)。", model.videoDetails, "每只眼的画面被横向压缩时选半宽，保持原比例时选全宽。"].compactMap { $0 }.joined(separator: "\n"))
+            Text(["当前解码：\(activeOutput.title)。", model.videoDetails].compactMap { $0 }.joined(separator: "\n"))
         }
     }
+
     private func enterAfterglow() {
         afterglowViewing = true
         selectOutput(.afterglow, retry: false)
@@ -870,15 +858,8 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         vrProfile = afterglowViewing ? AfterglowPreset.load() : VRMoviePreferences(key: request.key)
         camera.recenter()
         camera.setFOV(vrProfile.fieldOfView)
-        displayMode = vrProfile.mode
+        displayMode = VRMoviePreferences.mode
         revealControls()
-    }
-
-    private func applyProfile(_ next: VRMoviePreferences) {
-        if next.projection != vrProfile.projection { camera.recenter() }
-        vrProfile = next
-        displayMode = next.mode
-        saveCurrentProfile()
     }
 
     private func saveCurrentProfile() {
@@ -889,7 +870,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     private func doubleTapped() {
         switch doubleTap {
         case .recenter:
-            if isPanorama { camera.recenter() } else { toggleControls() }
+            if immersive { camera.recenter() } else { toggleControls() }
         case .playback: performTransportAction { model.toggle() }
         case .controls: toggleControls()
         }
@@ -899,7 +880,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         guard immersive && canInteract && !hasMessage else { return }
         switch command {
         case .playPause: performTransportAction { model.toggle() }
-        case .recenter: if isPanorama { camera.recenter() }
+        case .recenter: if immersive { camera.recenter() }
         case .toggleControls: toggleControls()
         case .backward: performTransportAction { model.seek(to: model.seconds - 15) }
         case .forward: performTransportAction { model.seek(to: model.seconds + 15) }
@@ -927,8 +908,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         let action: String? = appleActive ? "尝试 VLC 解码" :
             (afterglowViewing || defaultOutput == .system ? retryTitle : nil)
         let gyro: Binding<Bool> = afterglowViewing ? $afterglowGyro : $followHead
-        let profile = Binding<VRMoviePreferences>(get: { vrProfile }, set: { applyProfile($0) })
-        return VRViewerSettingsView(profile: profile, followHead: gyro, nativeResolution: $nativeResolution,
+        return VRViewerSettingsView(followHead: gyro, nativeResolution: $nativeResolution,
                              doubleTap: $doubleTap, pinchResponse: $pinchResponse, wakeGesture: $wakeGesture,
                              decoderPolicy: Binding(get: { vrDecoderPolicy }, set: changeVRDecoder),
                              sensorAvailable: camera.sensorAvailable, decoder: vrDecoderPolicy == .software && model.videoOutput == .vlcFrames

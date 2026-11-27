@@ -169,26 +169,33 @@ struct VLCImmersiveFrameRateWatch {
     private struct Sample {
         let host: TimeInterval
         let media: Double
+        let offered: UInt64
         let delivered: UInt64
+        let bufferMisses: UInt64
+        let staleSource: UInt64
         let formatSetups: UInt64
     }
 
     private var previous: Sample?
     private var window: Sample?
     private var previousSlowRate: Double?
+    private var previousSlowInput = false
+    private(set) var needsSmallerOutput = false
+    private(set) var deliveredFPS: Double?
     private(set) var slowRate: Double?
 
     mutating func reset() { self = Self() }
 
-    mutating func sample(host: TimeInterval, media: Double, delivered: UInt64, formatSetups: UInt64,
-                         nominalFPS: Double, active: Bool) {
+    mutating func sample(host: TimeInterval, media: Double, offered: UInt64, delivered: UInt64,
+                         bufferMisses: UInt64, staleSource: UInt64, formatSetups: UInt64, nominalFPS: Double, active: Bool) {
         guard active, nominalFPS.isFinite, nominalFPS >= 48, host.isFinite, media.isFinite,
               delivered > 0, formatSetups > 0 else { reset(); return }
-        let current = Sample(host: host, media: media, delivered: delivered, formatSetups: formatSetups)
+        let current = Sample(host: host, media: media, offered: offered, delivered: delivered,
+                             bufferMisses: bufferMisses, staleSource: staleSource, formatSetups: formatSetups)
         defer { previous = current }
         guard let previous, let window, host > previous.host, host - previous.host <= 3.5,
               media >= previous.media, media - previous.media <= host - previous.host + 1.25,
-              delivered >= previous.delivered, formatSetups == previous.formatSetups else {
+              offered >= previous.offered, delivered >= previous.delivered, formatSetups == previous.formatSetups else {
             reset()
             self.window = current
             return
@@ -202,11 +209,22 @@ struct VLCImmersiveFrameRateWatch {
         self.window = current
         let mediaTime = media - window.media
         let fps = Double(delivered - window.delivered) / time
-        guard mediaTime >= 0.8 * time, mediaTime <= time + 1.25, fps > 0, fps < 8 else {
+        deliveredFPS = mediaTime >= 0.8 * time && mediaTime <= time + 1.25 ? fps : nil
+        guard deliveredFPS != nil, fps > 0, fps < 8 else {
             previousSlowRate = nil
+            previousSlowInput = false
+            needsSmallerOutput = false
             slowRate = nil
             return
         }
+        // Reduce the output only if VLC also offered few pictures in both
+        // windows. A busy main thread or exhausted surface pool can instead
+        // make delivery slow while decoding and conversion are healthy.
+        let inputFPS = Double(offered - window.offered) / time
+        let slowInput = inputFPS > 0 && inputFPS < 8 &&
+            bufferMisses == window.bufferMisses && staleSource == window.staleSource
+        needsSmallerOutput = previousSlowInput && slowInput
+        previousSlowInput = slowInput
         slowRate = previousSlowRate.map { ($0 + fps) / 2 }
         previousSlowRate = fps
     }
@@ -297,6 +315,9 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
             // panorama available for presentation, with at most one pending
             // picture in our renderer. Leave VLC's original audio clock intact.
             options.append("--no-drop-late-frames")
+            // In VLC 3, mode 0 is fast bilinear. Panorama already samples a
+            // bounded surface; spend the conversion budget on fresh frames.
+            options.append("--swscale-mode=0")
             // The avcodec hurry-up path can discard a *compressed* reference
             // block after 11 late frames, producing a cascade of missing POCs.
             // Preserve the reference chain; the decoder's 5 s late-block
@@ -618,9 +639,11 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         if (now - lastStatsTime >= 1 || sampleEnd) && (monitorLoss || rateEligible || diagnostics != nil) {
             lastStatsTime = now
             if !preserveRateAtEnd, let stats {
-                deliveryRate.sample(host: now, media: rawSeconds, delivered: stats.delivered,
+                deliveryRate.sample(host: now, media: rawSeconds, offered: stats.offered, delivered: stats.delivered,
+                                    bufferMisses: stats.bufferMisses, staleSource: stats.staleSource,
                                     formatSetups: stats.formatSetups, nominalFPS: nominalFrameRate, active: rateEligible)
             }
+            retryWithSmallerFrames = canReduce && deliveryRate.needsSmallerOutput
             let native = nativeLifetime?.resource?.videoStatistics
             if monitorLoss, let stats, let native {
                 let stalled = frameLossWatch.needsSmallerOutput(.init(
@@ -628,7 +651,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
                     lost: native.lost, offered: stats.offered, delivered: stats.delivered,
                     bufferMisses: stats.bufferMisses, staleSource: stats.staleSource, formatSetups: stats.formatSetups),
                     nominalFrameRate: preferSmallerPanoramaFrames ? nominalFrameRate : 0)
-                retryWithSmallerFrames = canReduce && stalled
+                retryWithSmallerFrames = retryWithSmallerFrames || (canReduce && stalled)
                 // A repeated native timestamp can defer a reopen. Keep a confirmed
                 // warning stable until new samples clear the underlying pattern.
                 if reducedFrameOutput && (!sampleEnd || frameLossWatch.pattern != .none) {
@@ -644,6 +667,9 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
                 if preferSmallerPanoramaFrames {
                     let module = nativeLifetime?.resource?.observedVideoDecoder ?? "unreported"
                     status += " observedVideoDecoder=\(module)"
+                }
+                if let fps = deliveryRate.deliveredFPS {
+                    status += String(format: " deliveredFPS=%.1f", fps)
                 }
                 if let fps = deliveryRate.slowRate {
                     status += String(format: " slowDeliveredFPS=%.1f", fps)

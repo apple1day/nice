@@ -28,25 +28,24 @@ final class MovingMovieUITests: XCTestCase {
         revealControls(surface)
         let formats = app.buttons["videoFormatButton"]
         formats.tap()
-        app.buttons["全宽 SBS（Full SBS）"].tap()
         try assertChangingEyes(in: app, surface: surface, mode: "full SBS")
         revealControls(surface)
-        try require(formats.value as? String == "全宽 SBS", "Expected full SBS")
+        try require(formats.value as? String == "360° · 左右 SBS · 双眼", "Expected immersive stereo")
         try checkPosition(elapsed, after: before)
 
         formats.tap()
-        app.buttons["退出 VR，普通播放"].tap()
+        app.buttons["exitPanoramaVR"].tap()
         try assertChangingEyes(in: app, surface: surface, mode: "back to normal")
         revealControls(surface)
         try require(formats.value as? String == "普通播放", "Expected ordinary projection")
         try checkPosition(elapsed, after: before)
 
-        formats.tap()
+        app.buttons["ordinaryPlaybackOptions"].tap()
         app.buttons["普通播放：切换到原生显示"].tap()
         try assertChangingEyes(in: app, surface: surface, mode: "native ordinary landscape")
         revealControls(surface)
         try checkPosition(elapsed, after: before)
-        formats.tap()
+        app.buttons["ordinaryPlaybackOptions"].tap()
         try require(app.buttons["普通播放：切换到兼容显示"].exists, app.debugDescription)
     }
 
@@ -61,15 +60,26 @@ final class MovingMovieUITests: XCTestCase {
         let systemRoute = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "当前解码：系统播放器")).firstMatch
         try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC ordinary")
         revealControls(surface)
-        format.tap()
+        app.buttons["ordinaryPlaybackOptions"].tap()
         try require(systemRoute.exists, app.debugDescription)
-        app.buttons["全宽 SBS（Full SBS）"].tap()
+        app.buttons.matching(NSPredicate(format: "label IN %@", ["取消", "Cancel"])).firstMatch.tap()
+        revealControls(surface)
+        format.tap()
 
         try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC full SBS")
         revealControls(surface)
         format.tap()
-        try require(systemRoute.exists, app.debugDescription)
-        app.buttons["退出 VR，普通播放"].tap()
+        let decoder = app.descendants(matching: .any)["vrCurrentDecoder"]
+        for _ in 0..<6 {
+            if decoder.exists && decoder.isHittable { break }
+            app.swipeUp()
+        }
+        try require(decoder.value as? String == "系统播放器", "Unexpected 4K panorama decoder: " + app.debugDescription)
+        for _ in 0..<6 {
+            if app.buttons["exitPanoramaVR"].isHittable { break }
+            app.swipeDown()
+        }
+        app.buttons["exitPanoramaVR"].tap()
         try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC after leaving VR")
     }
 
@@ -82,26 +92,20 @@ final class MovingMovieUITests: XCTestCase {
         revealControls(surface)
         let formats = app.buttons["videoFormatButton"]
         formats.tap()
-        let enter = app.buttons["进入全景 VR"]
-        try require(enter.waitForExistence(timeout: 5), app.debugDescription)
-        enter.tap()
-
-        func checkChart(_ description: String, stereo: Bool = false,
-                        moving: Bool = false, panned: Bool = false) throws {
+        func checkChart(_ description: String, moving: Bool = false, panned: Bool = false) throws {
             var phases = Set<Int>()
             var last = ""
             let deadline = Date().addingTimeInterval(10)
             while Date() < deadline {
                 let pair = try sampleEyes(image: XCUIScreen.main.screenshot().image,
-                                          viewport: surface.frame, window: app.frame,
-                                          fractions: stereo ? (0.25, 0.75) : (0.5, 0.5))
+                                          viewport: surface.frame, window: app.frame)
                 last = "\(pair)"
                 let eye = pair.0
                 let longitudeMatches = panned ? eye.r > 148 : abs(eye.r - 128) < 16
                 if longitudeMatches && abs(eye.g - 128) < 16 && (20...96).contains(eye.b) {
                     let phase = eye.b < 58 ? 0 : 1
-                    if !stereo || (abs(pair.1.r - 128) < 16 && abs(pair.1.g - 128) < 16
-                        && abs((pair.1.b - eye.b) - 128) < 12) {
+                    if abs(pair.1.r - eye.r) < 14 && abs(pair.1.g - eye.g) < 14
+                        && abs((pair.1.b - eye.b) - 128) < 12 {
                         phases.insert(phase)
                         if !moving || phases.count == 2 { return }
                     }
@@ -115,33 +119,15 @@ final class MovingMovieUITests: XCTestCase {
             throw MotionFailure("\(description): phases=\(phases), RGB=\(last)")
         }
 
-        let transport = app.buttons.matching(identifier: "togglePlaybackButton")
-        let pause = transport.matching(NSPredicate(format: "label == %@", "暂停")).firstMatch
-        let play = transport.matching(NSPredicate(format: "label == %@", "播放")).firstMatch
-        func pauseForControls() throws {
-            // Paused playback keeps the toolbar visible. A tap during its fade
-            // can reveal the toolbar instead, so confirm the actual transport state.
-            for _ in 0..<2 {
-                if play.exists && play.isHittable { return }
-                if !pause.exists || !pause.isHittable { revealControls(surface) }
-                if pause.waitForExistence(timeout: 2) && pause.isHittable { pause.tap() }
-                if play.waitForExistence(timeout: 2) && play.isHittable { return }
-            }
-            throw MotionFailure("Could not pause panorama with its transport button: " + app.debugDescription)
-        }
-
-        try checkChart("single-eye panorama updates", moving: true)
+        try checkChart("both eyes move in sync on first entering VR", moving: true)
         let from = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.5))
         let to = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.38, dy: 0.5))
         from.press(forDuration: 0.15, thenDragTo: to)
         try checkChart("leftward drag turns right", panned: true)
-        try pauseForControls()
+        revealControls(surface)
         app.buttons["vrRecenterButton"].tap()
-        try checkChart("recenter shows forward ray")
-        app.buttons["vrHeadsetButton"].tap()
-        play.tap()
-        try checkChart("both eyes move in sync", stereo: true, moving: true)
-        try pauseForControls()
+        try checkChart("recenter restores moving forward rays in both eyes", moving: true)
+        revealControls(surface)
         formats.tap()
         try require(app.navigationBars["VR 设置"].waitForExistence(timeout: 5), app.debugDescription)
         let copy = app.buttons["copyPlaybackDiagnostics"]
@@ -150,12 +136,6 @@ final class MovingMovieUITests: XCTestCase {
         let copied = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@", "已复制"), object: copy)
         try require(XCTWaiter.wait(for: [copied], timeout: 4) == .completed, "Diagnostics did not copy")
         let exitVR = app.buttons["exitPanoramaVR"]
-        // A landscape Form only materializes its visible rows. Scroll inside
-        // the sheet until its exit action is on screen, as a viewer would.
-        for _ in 0..<8 {
-            if exitVR.exists && exitVR.isHittable { break }
-            app.swipeUp()
-        }
         try require(exitVR.exists && exitVR.isHittable, "VR exit action unavailable: " + app.debugDescription)
         exitVR.tap()
         let normal = XCTNSPredicateExpectation(
@@ -177,7 +157,7 @@ final class MovingMovieUITests: XCTestCase {
         let elapsed = try seconds(app.staticTexts["playbackElapsedTime"])
         try require(elapsed >= 142, "Expected a saved playback position near 02:23, got \(elapsed)")
         let format = app.buttons["videoFormatButton"]
-        try require(format.value as? String == "360° 全景", app.debugDescription)
+        try require(format.value as? String == "360° · 左右 SBS · 双眼", app.debugDescription)
         try assertChangingEyes(in: app, surface: surface, mode: "both projected eyes after resume")
 
     }

@@ -9,10 +9,7 @@ enum AfterglowPreset {
     static let frameRateKey = "vr.afterglow.targetFrameRate"
 
     static func load(defaults: UserDefaults = .standard) -> VRMoviePreferences {
-        var initial = VRMoviePreferences()
-        initial.projection = .vr360
-        initial.headset = true
-        return VRMoviePreferences(values: defaults.dictionary(forKey: profileKey), fallback: initial)
+        VRMoviePreferences(values: defaults.dictionary(forKey: profileKey))
     }
 
     static func save(_ profile: VRMoviePreferences, defaults: UserDefaults = .standard) {
@@ -31,17 +28,16 @@ struct AfterglowPresetView: View {
         NavigationStack {
             Form {
                 Section("打开影片时使用") {
-                    VRProjectionFields(profile: $profile)
+                    LabeledContent("VR 格式", value: VRMoviePreferences.formatLabel)
+                        .accessibilityIdentifier("fixedVRFormat")
                     VRDecoderPolicyPicker(selection: $decoderPolicy)
                 }
                 Section("观看设置") {
-                    if profile.projection != .flat {
-                        Toggle("陀螺仪跟随", isOn: $followHead).disabled(!sensorAvailable)
-                        LabeledContent("初始视场角", value: "\(Int(profile.fieldOfView))°")
-                        Slider(value: $profile.fieldOfView, in: 45...110, step: 1)
-                            .accessibilityLabel("初始视场角")
-                            .accessibilityValue("\(Int(profile.fieldOfView)) 度")
-                    }
+                    Toggle("陀螺仪跟随", isOn: $followHead).disabled(!sensorAvailable)
+                    LabeledContent("初始视场角", value: "\(Int(profile.fieldOfView))°")
+                    Slider(value: $profile.fieldOfView, in: 45...110, step: 1)
+                        .accessibilityLabel("初始视场角")
+                        .accessibilityValue("\(Int(profile.fieldOfView)) 度")
                     AfterglowRenderFields()
                 }
             }

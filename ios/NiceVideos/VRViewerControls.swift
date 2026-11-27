@@ -3,57 +3,25 @@ import Combine
 import simd
 import UIKit
 
-/// Projection belongs to the movie; gesture and output preferences belong to the viewer.
+/// The viewing angle is saved per movie. Every VR entry uses the same packed format.
 struct VRMoviePreferences: Equatable {
-    var projection = VRProjection.vr180
-    var eyes = VREyeLayout.sideBySide
-    var headset = false
+    static let mode = SBSDisplayMode.immersive(.vr360, .sideBySide, headset: true)
+    static let formatLabel = "360° · 左右 SBS · 双眼"
     var fieldOfView: Float = 80
-
-    var mode: SBSDisplayMode { .immersive(projection, eyes, headset: headset) }
 
     init() {}
     init(key: String, defaults: UserDefaults = .standard) {
         self.init(values: defaults.dictionary(forKey: "vr.movie." + key))
     }
 
-    init(values: [String: Any]?, fallback: Self = Self()) {
-        self = fallback
-        guard let values else { return }
-        if let value = values["projection"] as? Int, let saved = VRProjection(rawValue: value) { projection = saved }
-        if let value = values["eyes"] as? Int, let saved = VREyeLayout(rawValue: value) { eyes = saved }
-        headset = values["headset"] as? Bool ?? headset
-        if let fov = values["fov"] as? Double, fov.isFinite { fieldOfView = Float(min(110, max(45, fov))) }
+    init(values: [String: Any]?) {
+        if let fov = values?["fov"] as? Double, fov.isFinite { fieldOfView = Float(min(110, max(45, fov))) }
     }
 
-    var values: [String: Any] {
-        ["projection": projection.rawValue, "eyes": eyes.rawValue, "headset": headset, "fov": Double(fieldOfView)]
-    }
+    var values: [String: Any] { ["fov": Double(fieldOfView)] }
 
     func save(key: String, defaults: UserDefaults = .standard) {
         defaults.set(values, forKey: "vr.movie." + key)
-    }
-}
-
-extension VRProjection {
-    var label: String {
-        switch self {
-        case .vr180: return "180° 全景"
-        case .vr360: return "360° 全景"
-        case .fisheye180: return "180° 鱼眼"
-        case .flat: return "平面影院"
-        }
-    }
-}
-
-extension VREyeLayout {
-    var label: String {
-        switch self {
-        case .mono: return "单画面"
-        case .sideBySide: return "左右分屏"
-        case .halfSideBySide: return "半宽左右分屏"
-        case .topBottom: return "上下分屏"
-        }
     }
 }
 
@@ -170,8 +138,6 @@ enum VRPinchResponse: String, CaseIterable {
 
 @MainActor struct VRPanoramaSurface: UIViewRepresentable {
     let camera: VRGestureCamera
-    let panorama: Bool
-    let headset: Bool
     let response: VRPinchResponse
     let onTap: () -> Void
     let onDoubleTap: () -> Void
@@ -185,15 +151,14 @@ enum VRPinchResponse: String, CaseIterable {
         @objc func singleTap() { owner.onTap() }
         @objc func doubleTap() { owner.onDoubleTap() }
         @objc func pan(_ gesture: UIPanGestureRecognizer) {
-            guard owner.panorama, let view = gesture.view else { return }
+            guard let view = gesture.view else { return }
             if gesture.state == .changed || gesture.state == .ended {
                 let delta = gesture.translation(in: view)
                 gesture.setTranslation(.zero, in: view)
-                owner.camera.pan(by: delta, in: view.bounds.size, headset: owner.headset)
+                owner.camera.pan(by: delta, in: view.bounds.size, headset: true)
             }
         }
         @objc func pinch(_ gesture: UIPinchGestureRecognizer) {
-            guard owner.panorama else { return }
             switch gesture.state {
             case .began: initialFOV = owner.camera.fieldOfView
             case .changed: owner.camera.zoom(from: initialFOV, scale: gesture.scale, response: owner.response)
@@ -241,7 +206,6 @@ enum VRPinchResponse: String, CaseIterable {
 
 @MainActor struct VRViewerSettingsView: View {
     @Environment(\.dismiss) private var dismiss
-    @Binding var profile: VRMoviePreferences
     @Binding var followHead: Bool
     @Binding var nativeResolution: Bool
     @Binding var doubleTap: VRDoubleTapAction
@@ -269,18 +233,17 @@ enum VRPinchResponse: String, CaseIterable {
                         Label(didCopyDiagnostics ? "已复制播放诊断" : "复制播放诊断", systemImage: "doc.on.doc")
                     }
                     .accessibilityIdentifier("copyPlaybackDiagnostics")
+                    Button("退出全景 VR") { onExit(); dismiss() }
+                        .accessibilityIdentifier("exitPanoramaVR")
                 }
-                Section("当前影片") { VRProjectionFields(profile: $profile) }
-                if profile.projection != .flat {
-                    Section("环顾") {
-                        Toggle("陀螺仪跟随", isOn: $followHead).disabled(!sensorAvailable)
-                        if profile.headset && followHead && sensorAvailable {
-                            VRHandsFreeSettingRow(selection: $wakeGesture)
-                        }
-                        if !sensorAvailable { Text("当前设备可用手指拖动环顾。").font(.footnote) }
-                        Picker("双指缩放幅度", selection: $pinchResponse) {
-                            ForEach(VRPinchResponse.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                        }
+                Section("环顾") {
+                    Toggle("陀螺仪跟随", isOn: $followHead).disabled(!sensorAvailable)
+                    if followHead && sensorAvailable {
+                        VRHandsFreeSettingRow(selection: $wakeGesture)
+                    }
+                    if !sensorAvailable { Text("当前设备可用手指拖动环顾。").font(.footnote) }
+                    Picker("双指缩放幅度", selection: $pinchResponse) {
+                        ForEach(VRPinchResponse.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                     }
                 }
                 Section("观看偏好") {
@@ -309,26 +272,10 @@ enum VRPinchResponse: String, CaseIterable {
                         Button("用 Afterglow XR 播放") { onOpenAfterglow(); dismiss() }
                     }
                 }
-                Button("退出全景 VR") { onExit(); dismiss() }
-                    .accessibilityIdentifier("exitPanoramaVR")
             }
             .navigationTitle("VR 设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
         }
-    }
-}
-
-struct VRProjectionFields: View {
-    @Binding var profile: VRMoviePreferences
-    var body: some View {
-        Picker("投影", selection: $profile.projection) {
-            ForEach(VRProjection.allCases, id: \.self) { Text($0.label).tag($0) }
-        }.accessibilityIdentifier("vrProjectionPicker")
-        Picker("片源排布", selection: $profile.eyes) {
-            ForEach(VREyeLayout.allCases, id: \.self) { Text($0.label).tag($0) }
-        }.accessibilityIdentifier("vrEyeLayoutPicker")
-        Toggle("双眼眼镜", isOn: $profile.headset)
-            .accessibilityIdentifier("vrHeadsetToggle")
     }
 }

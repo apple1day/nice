@@ -8,16 +8,16 @@ import XCTest
     }
 
     func testFullHeight8K60PanoramaNegotiatesSmallerFramesAndChangesBothEyes() async throws {
-        try await checkMovingPanorama("stereo8k60-full", width: 1600, height: 800, startAt: 0, reduced: false)
+        try await checkMovingPanorama("stereo8k60-full", width: 1600, height: 800, startAt: 0, reduced: false, biPlanar: true)
     }
 
     func testForcedSoftwareDecodesMain10FullHeight8KWithMovingStereoEyes() async throws {
         try await checkMovingPanorama("vr8k-main10-hev1", width: 1600, height: 800, startAt: 0,
-                                      reduced: false, decoderPolicy: .software)
+                                      reduced: false, biPlanar: true, decoderPolicy: .software)
     }
 
     private func checkMovingPanorama(_ fixture: String, width expectedWidth: Int, height expectedHeight: Int,
-                                     startAt: Double, reduced: Bool,
+                                     startAt: Double, reduced: Bool, biPlanar: Bool = false,
                                      decoderPolicy: VLCDecoderPolicy = .automatic) async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: fixture, withExtension: "mp4", subdirectory: "Fixtures"))
@@ -46,16 +46,38 @@ import XCTest
             XCTAssertEqual(height, expectedHeight)
             guard CVPixelBufferLockBaseAddress(frame, .readOnly) == kCVReturnSuccess else { return }
             defer { CVPixelBufferUnlockBaseAddress(frame, .readOnly) }
-            guard let base = CVPixelBufferGetBaseAddress(frame) else { return }
-            let row = base.advanced(by: (height / 2) * CVPixelBufferGetBytesPerRow(frame)).assumingMemoryBound(to: UInt8.self)
-            let left = (width / 4) * 4, right = (3 * width / 4) * 4
-            // Decode the fixture's two known eye pairs at their centers.
+            // The same moving eye chart must survive the two-plane vmem copy,
+            // including independent Y/UV strides and interleaved Cb/Cr ordering.
             let pair: Int
-            if row[left + 2] > 180 && row[left + 1] < 70 && row[right] > 180 {
-                pair = 0
-            } else if row[left + 1] > 180 && row[left + 2] < 70 && row[right + 2] > 180 && row[right + 1] > 180 {
-                pair = 1
-            } else { return }
+            if biPlanar {
+                guard CVPixelBufferGetPixelFormatType(frame) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                      CVPixelBufferGetPlaneCount(frame) == 2,
+                      let y = CVPixelBufferGetBaseAddressOfPlane(frame, 0),
+                      let uv = CVPixelBufferGetBaseAddressOfPlane(frame, 1) else {
+                    XCTFail("Expected VLC to deliver an NV12 IOSurface"); return
+                }
+                let luma = y.advanced(by: height / 2 * CVPixelBufferGetBytesPerRowOfPlane(frame, 0))
+                    .assumingMemoryBound(to: UInt8.self)
+                let chroma = uv.advanced(by: height / 4 * CVPixelBufferGetBytesPerRowOfPlane(frame, 1))
+                    .assumingMemoryBound(to: UInt8.self)
+                let left = width / 4, right = 3 * width / 4
+                // Red/blue, then lime/yellow in the fixture (limited-range YUV).
+                if luma[left] < 110 && luma[right] < 90 && chroma[left + 1] > 175 && chroma[right] > 175 {
+                    pair = 0
+                } else if luma[left] > 115 && luma[right] > 170 && chroma[left + 1] < 95 && chroma[right] < 90 {
+                    pair = 1
+                } else { return }
+            } else {
+                guard CVPixelBufferGetPixelFormatType(frame) == kCVPixelFormatType_32BGRA,
+                      let base = CVPixelBufferGetBaseAddress(frame) else { XCTFail("Expected packed BGRA"); return }
+                let row = base.advanced(by: (height / 2) * CVPixelBufferGetBytesPerRow(frame)).assumingMemoryBound(to: UInt8.self)
+                let left = (width / 4) * 4, right = (3 * width / 4) * 4
+                if row[left + 2] > 180 && row[left + 1] < 70 && row[right] > 180 {
+                    pair = 0
+                } else if row[left + 1] > 180 && row[left + 2] < 70 && row[right + 2] > 180 && row[right + 1] > 180 {
+                    pair = 1
+                } else { return }
+            }
             if let previousPair, pair != previousPair { transitions += 1 }
             previousPair = pair
             if firstClock == nil { firstClock = clock }

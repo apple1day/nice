@@ -11,16 +11,33 @@ final class VLCFrameLossWatchTests: XCTestCase {
             let delivered = UInt64(1 + min(second, 5) * 3 + max(0, second - 5) * 5)
             let counters = sample(second, frames: delivered, displayed: Int32(delivered), lost: 0)
             XCTAssertFalse(loss.needsSmallerOutput(counters, nominalFrameRate: 59.94))
-            rate.sample(host: counters.host, media: counters.clock, delivered: counters.delivered,
+            rate.sample(host: counters.host, media: counters.clock, offered: delivered, delivered: delivered, bufferMisses: 0, staleSource: 0,
                         formatSetups: counters.formatSetups, nominalFPS: 59.94, active: true)
             if second < 10 { XCTAssertNil(rate.slowRate) }
         }
         XCTAssertEqual(rate.slowRate, 4.0)
+        XCTAssertTrue(rate.needsSmallerOutput, "A real 5 fps input can have zero native losses.")
         for second in 11...15 {
-            rate.sample(host: Double(second), media: Double(second), delivered: UInt64(41 + (second - 10) * 30),
+            rate.sample(host: Double(second), media: Double(second), offered: UInt64(41 + (second - 10) * 30),
+                        delivered: UInt64(41 + (second - 10) * 30), bufferMisses: 0, staleSource: 0,
                         formatSetups: 1, nominalFPS: 59.94, active: true)
         }
+        XCTAssertFalse(rate.needsSmallerOutput)
+        XCTAssertEqual(rate.deliveredFPS, 30.0)
         XCTAssertNil(rate.slowRate, "Normal delivery clears the copy suggestion")
+    }
+
+    func testSlowMainQueueOrMissedSurfacesDoNotReopenDecoder() {
+        for (offeredFPS, misses, stale) in [(60, 0, 0), (5, 1, 0), (5, 0, 1)] {
+            var watch = VLCImmersiveFrameRateWatch()
+            for t in 0...12 {
+                watch.sample(host: Double(t), media: Double(t), offered: UInt64(1 + t * offeredFPS),
+                             delivered: UInt64(1 + t * 5), bufferMisses: UInt64(t * misses),
+                             staleSource: UInt64(t * stale), formatSetups: 1, nominalFPS: 59.94, active: true)
+            }
+            XCTAssertEqual(watch.slowRate, 5)
+            XCTAssertFalse(watch.needsSmallerOutput)
+        }
     }
 
     func testHighRateSourceAndContinuousMovingDeliveryAreRequiredForSlowPictureSuggestion() {
@@ -28,7 +45,8 @@ final class VLCFrameLossWatchTests: XCTestCase {
                                                     (60.0, 30, 1.0), (60.0, 0, 1.0), (60.0, 4, 0.0)] {
             var watch = VLCImmersiveFrameRateWatch()
             for i in 0...15 {
-                watch.sample(host: Double(i), media: Double(i) * clockRate, delivered: UInt64(10 + i * actualFPS),
+                watch.sample(host: Double(i), media: Double(i) * clockRate, offered: UInt64(10 + i * actualFPS),
+                             delivered: UInt64(10 + i * actualFPS), bufferMisses: 0, staleSource: 0,
                              formatSetups: 1, nominalFPS: sourceFPS, active: true)
                 XCTAssertNil(watch.slowRate)
             }
@@ -39,14 +57,16 @@ final class VLCFrameLossWatchTests: XCTestCase {
         for discontinuity in ["inactive", "forward seek", "reverse seek", "missed samples", "format", "counters"] {
             var watch = VLCImmersiveFrameRateWatch()
             for i in 0...7 {
-                watch.sample(host: Double(i), media: 40 + Double(i), delivered: UInt64(90 + i * 4),
+                watch.sample(host: Double(i), media: 40 + Double(i), offered: UInt64(90 + i * 4),
+                             delivered: UInt64(90 + i * 4), bufferMisses: 0, staleSource: 0,
                              formatSetups: 1, nominalFPS: 60, active: true)
             }
             for i in 8...14 {
                 let host = Double(i) + (discontinuity == "missed samples" ? 5 : 0)
                 let media = Double(i) + (discontinuity == "forward seek" ? 300 : (discontinuity == "reverse seek" ? 0 : 40))
                 let count = UInt64(i * 4 + (discontinuity == "counters" ? 0 : 90))
-                watch.sample(host: host, media: media, delivered: count, formatSetups: discontinuity == "format" ? 2 : 1,
+                watch.sample(host: host, media: media, offered: count, delivered: count,
+                             bufferMisses: 0, staleSource: 0, formatSetups: discontinuity == "format" ? 2 : 1,
                              nominalFPS: 60, active: !(discontinuity == "inactive" && i == 8))
                 XCTAssertNil(watch.slowRate, discontinuity)
             }

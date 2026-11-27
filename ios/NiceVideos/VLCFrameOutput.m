@@ -160,8 +160,8 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
 // One instance per negotiated vout format. The VLC 3 vmem plugin runs its
 // lock/unlock (Prepare), display and cleanup serially for this specific vout.
 @interface NICEVLCFrameFormat : NSObject
-@property (nonatomic, readonly) size_t pitch;
-- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry source:(id<NICEVLCTrackSource>)source delivery:(NICEVLCFrameDelivery *)delivery;
+- (void)describePlanesWithPitches:(unsigned *)pitches lines:(unsigned *)lines;
+- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry biPlanar:(BOOL)biPlanar source:(id<NICEVLCTrackSource>)source delivery:(NICEVLCFrameDelivery *)delivery;
 - (void *)lockPlane:(void **)planes;
 - (void)unlockPicture:(void *)picture;
 - (void)displayPicture:(void *)picture;
@@ -172,18 +172,23 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
     id<NICEVLCTrackSource> _source;
     CVPixelBufferPoolRef _pool;
     CVPixelBufferRef _scratch;
-    void *_scratchBase;
+    BOOL _scratchLocked;
+    unsigned _planeCount;
+    unsigned _pitches[2];
+    unsigned _lines[2];
+    void *_scratchPlanes[2];
     CVPixelBufferRef _picture;
     NSDictionary *_poolLimits;
     NSDictionary *_displayDimensions;
 }
 
-- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry source:(id<NICEVLCTrackSource>)source delivery:(NICEVLCFrameDelivery *)delivery {
+- (instancetype)initWithGeometry:(NICEFrameGeometry)geometry biPlanar:(BOOL)biPlanar source:(id<NICEVLCTrackSource>)source delivery:(NICEVLCFrameDelivery *)delivery {
     self = [super init];
     if (!self) { return nil; }
     _delivery = delivery;
     _source = source;
     unsigned width = geometry.width, height = geometry.height;
+    _planeCount = biPlanar ? 2 : 1;
     _displayDimensions = @{
         (__bridge NSString *)kCVImageBufferDisplayWidthKey: @(width * geometry.pixelAspect),
         (__bridge NSString *)kCVImageBufferDisplayHeightKey: @(height)
@@ -191,7 +196,7 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
     NSDictionary *attributes = @{
         (__bridge NSString *)kCVPixelBufferWidthKey: @(width),
         (__bridge NSString *)kCVPixelBufferHeightKey: @(height),
-        (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(biPlanar ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA),
         (__bridge NSString *)kCVPixelBufferBytesPerRowAlignmentKey: @64,
         (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
@@ -205,22 +210,35 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
         CVPixelBufferLockBaseAddress(_scratch, 0) != kCVReturnSuccess) {
         return nil;
     }
-    _scratchBase = CVPixelBufferGetBaseAddress(_scratch);
-    _pitch = CVPixelBufferGetBytesPerRow(_scratch);
-    _poolLimits = @{ (__bridge NSString *)kCVPixelBufferPoolAllocationThresholdKey: @5 }; // includes scratch
-    if (!_scratchBase || (uintptr_t)_scratchBase % 32 || _pitch % 32 || _pitch < width * 4) {
-        CVPixelBufferUnlockBaseAddress(_scratch, 0);
-        _scratchBase = NULL;
-        return nil;
+    _scratchLocked = YES;
+    if (biPlanar && CVPixelBufferGetPlaneCount(_scratch) != 2) { return nil; }
+    for (unsigned i = 0; i < _planeCount; i++) {
+        void *base = biPlanar ? CVPixelBufferGetBaseAddressOfPlane(_scratch, i) : CVPixelBufferGetBaseAddress(_scratch);
+        size_t pitch = biPlanar ? CVPixelBufferGetBytesPerRowOfPlane(_scratch, i) : CVPixelBufferGetBytesPerRow(_scratch);
+        size_t rows = biPlanar ? CVPixelBufferGetHeightOfPlane(_scratch, i) : CVPixelBufferGetHeight(_scratch);
+        // libvlc 3 vmem writes each plane using the pitches set during negotiation.
+        if (!base || (uintptr_t)base % 32 || pitch % 32 || pitch > INT_MAX ||
+            pitch < (size_t)width * (biPlanar ? 1 : 4) || rows != (i == 0 ? height : height / 2)) {
+            return nil;
+        }
+        _scratchPlanes[i] = base;
+        _pitches[i] = (unsigned)pitch;
+        _lines[i] = (unsigned)rows;
     }
+    _poolLimits = @{ (__bridge NSString *)kCVPixelBufferPoolAllocationThresholdKey: @5 }; // includes scratch
     return self;
+}
+
+- (void)describePlanesWithPitches:(unsigned *)pitches lines:(unsigned *)lines {
+    memcpy(pitches, _pitches, _planeCount * sizeof(*pitches));
+    memcpy(lines, _lines, _planeCount * sizeof(*lines));
 }
 
 - (void *)lockPlane:(void **)planes {
     // Drop an undisplayed but already unlocked frame if VLC skips Display.
     if (_picture) { CVPixelBufferRelease(_picture); }
     _picture = NULL;
-    planes[0] = _scratchBase;
+    memcpy(planes, _scratchPlanes, sizeof(void *) * _planeCount);
     CVPixelBufferRef candidate = NULL;
     if (CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(NULL, _pool, (__bridge CFDictionaryRef)_poolLimits,
                                                            &candidate) != kCVReturnSuccess) {
@@ -228,10 +246,17 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
         return NULL;
     }
     if (CVPixelBufferLockBaseAddress(candidate, 0) == kCVReturnSuccess) {
-        void *base = CVPixelBufferGetBaseAddress(candidate);
-        if (base && (uintptr_t)base % 32 == 0 && CVPixelBufferGetBytesPerRow(candidate) == _pitch) {
+        BOOL biPlanar = _planeCount == 2;
+        BOOL valid = !biPlanar || CVPixelBufferGetPlaneCount(candidate) == 2;
+        void *addresses[2];
+        for (unsigned i = 0; valid && i < _planeCount; i++) {
+            addresses[i] = biPlanar ? CVPixelBufferGetBaseAddressOfPlane(candidate, i) : CVPixelBufferGetBaseAddress(candidate);
+            size_t pitch = biPlanar ? CVPixelBufferGetBytesPerRowOfPlane(candidate, i) : CVPixelBufferGetBytesPerRow(candidate);
+            valid = addresses[i] && (uintptr_t)addresses[i] % 32 == 0 && pitch == _pitches[i];
+        }
+        if (valid) {
             _picture = candidate;
-            planes[0] = base;
+            memcpy(planes, addresses, sizeof(void *) * _planeCount);
             return candidate;
         }
         CVPixelBufferUnlockBaseAddress(candidate, 0);
@@ -257,7 +282,7 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
 
 - (void)dealloc {
     if (_picture) { CVPixelBufferRelease(_picture); }
-    if (_scratchBase) { CVPixelBufferUnlockBaseAddress(_scratch, 0); }
+    if (_scratchLocked) { CVPixelBufferUnlockBaseAddress(_scratch, 0); }
     if (_scratch) { CVPixelBufferRelease(_scratch); }
     if (_pool) { CVPixelBufferPoolRelease(_pool); }
 }
@@ -280,11 +305,19 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         const double scale = MIN(1.0, (double)limit / MAX(geometry.width, geometry.height));
         *width = geometry.width = (unsigned)MAX(1.0, round(geometry.width * scale));
         *height = geometry.height = (unsigned)MAX(1.0, round(geometry.height * scale));
-        NICEVLCFrameFormat *format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry source:source delivery:delivery];
+        // Keep both eyes packed. Let Metal perform YCbCr -> RGB when sampling;
+        // converting the whole downscaled 8K movie to BGRA costs extra bandwidth.
+        BOOL biPlanar = fullHeight8K && delivery.preferSmallerPanoramaFrames &&
+                        (*width % 2 == 0) && (*height % 2 == 0);
+        NICEVLCFrameFormat *format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry biPlanar:biPlanar
+                                                                           source:source delivery:delivery];
+        if (!format && biPlanar) {
+            biPlanar = NO;
+            format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry biPlanar:NO source:source delivery:delivery];
+        }
         if (!format) { return 0; }
-        memcpy(chroma, "BGRA", 4);
-        pitches[0] = (unsigned)format.pitch;
-        lines[0] = *height;
+        memcpy(chroma, biPlanar ? "NV12" : "BGRA", 4);
+        [format describePlanesWithPitches:pitches lines:lines];
         *opaque = (void *)CFBridgingRetain(format);
         [delivery recordFormatSetupForMedia:source longEdge:MAX(*width, *height) limit:limit panoramaLimit:panoramaLimit];
         return 1;
