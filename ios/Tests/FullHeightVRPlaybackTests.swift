@@ -24,7 +24,14 @@ final class FullHeightVRPlaybackTests: XCTestCase {
             previous?.makeKey()
         }
         var snapshot = PlaybackSnapshot(phase: .idle)
-        engine.onUpdate = { snapshot = $0 }
+        var checkingResume = false
+        var resumedTimes: [Double] = []
+        engine.onUpdate = { update in
+            snapshot = update
+            if checkingResume && update.phase == .playing && update.seekable {
+                resumedTimes.append(update.seconds)
+            }
+        }
         host.configure(mode: VRMoviePreferences.mode, standardOutput: .system, decoderPolicy: .automatic)
         let renderer = try XCTUnwrap(host.renderer)
         engine.attach(to: host)
@@ -65,6 +72,7 @@ final class FullHeightVRPlaybackTests: XCTestCase {
         XCTAssertEqual(snapshot.seconds, target, accuracy: 0.45)
 
         let framesAtResume = renderer.completedVideoFrameCount
+        checkingResume = true
         engine.play()
         let resumed = try await waitFor {
             snapshot.phase == .playing && snapshot.hasVideo &&
@@ -72,6 +80,7 @@ final class FullHeightVRPlaybackTests: XCTestCase {
         }
         let report = engine.playbackDiagnosticReport() ?? ""
         XCTAssertTrue(resumed, report)
+        XCTAssertTrue(resumedTimes.allSatisfy { $0 >= target - 0.45 }, report)
         XCTAssertTrue(engine.currentOutput == .system || engine.currentOutput == .vlcFrames, report)
         let probes = report.components(separatedBy: "probing hardware VideoToolbox").count - 1
         XCTAssertLessThanOrEqual(probes, 1, report)
