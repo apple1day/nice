@@ -54,7 +54,7 @@ public final class ServerDownloadTest {
         final List<String> transferEvents = new CopyOnWriteArrayList<>();
         volatile int listedSize;
         volatile Exception failure;
-        volatile boolean downloaded, rejectDeletion, removed;
+        volatile boolean downloaded, rejectDeletion, removed, truncateFirst;
         LocalServer() throws Exception {
             try (InputStream input = InstrumentationRegistry.getInstrumentation().getContext()
                     .getAssets().open("moving-sbs.mp4"); ByteArrayOutputStream buffer = new ByteArrayOutputStream()) {
@@ -104,7 +104,7 @@ public final class ServerDownloadTest {
                             if (!rejectDeletion && NAME.equals(target)) removed = true;
                         }
                         byte[] response = list ? index() : movie ? (path.endsWith(NAME)
-                                ? Arrays.copyOf(media, listedSize) : media) : new byte[0];
+                                ? Arrays.copyOf(media, truncateFirst ? listedSize - 8 : listedSize) : media) : new byte[0];
                         String status = list || movie || delete ? "200 OK" : "404 Not Found";
                         if (delete && rejectDeletion) status = "500 Internal Server Error";
                         String headers = "HTTP/1.1 " + status
@@ -250,6 +250,32 @@ public final class ServerDownloadTest {
                 }
                 assertEquals(2, library.all().stream().filter(e -> e.source.startsWith(base + "/")
                         && VideoLibrary.READY.equals(e.state)).count());
+            } finally {
+                for (VideoLibrary.Entry e : library.all()) if (e.source.startsWith(base + "/")) library.remove(e);
+                library.prefs.edit().putString("server", previous).commit();
+            }
+        }
+    }
+
+    @Test @SdkSuppress(minSdkVersion = 29)
+    public void oneTapKeepsFailedOriginalAndContinuesWithNextMovie() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        VideoLibrary library = new VideoLibrary(context);
+        String previous = library.prefs.getString("server", null);
+        try (LocalServer server = new LocalServer()) {
+            String base = server.address();
+            library.prefs.edit().putString("server", base).commit();
+            server.truncateFirst = true;
+            try (ActivityScenario<MainActivity> app = ActivityScenario.launch(MainActivity.class)) {
+                click(app, "服务器");
+                click(app, "一键下载然后删除远程视频");
+                await("Second movie should be deleted", 90, () -> server.deletes.size() == 1);
+                assertEquals(Collections.singletonList(REMOTE_ONLY), server.deletes);
+                assertFalse(server.removed);
+                assertTrue(library.all().stream().anyMatch(e -> e.source.startsWith(base + "/")
+                        && NAME.equals(e.name) && VideoLibrary.FAILED.equals(e.state)));
+                assertTrue(library.all().stream().anyMatch(e -> e.source.startsWith(base + "/")
+                        && REMOTE_ONLY.equals(e.name) && VideoLibrary.READY.equals(e.state)));
             } finally {
                 for (VideoLibrary.Entry e : library.all()) if (e.source.startsWith(base + "/")) library.remove(e);
                 library.prefs.edit().putString("server", previous).commit();
