@@ -68,6 +68,15 @@ final class MovingMovieUITests: XCTestCase {
 
         try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC full SBS")
         revealControls(surface)
+        // The live screenshot probe may finish near the HUD's auto-hide deadline.
+        // Pause through the real transport before opening and inspecting settings.
+        let transport = app.buttons["togglePlaybackButton"]
+        let canPause = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true AND enabled == true AND label == %@", "暂停"), object: transport)
+        try require(XCTWaiter.wait(for: [canPause], timeout: 5) == .completed, app.debugDescription)
+        transport.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        let paused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "播放"), object: transport)
+        try require(XCTWaiter.wait(for: [paused], timeout: 5) == .completed, app.debugDescription)
         format.tap()
         let settings = app.navigationBars["VR 设置"]
         try require(settings.waitForExistence(timeout: 5), app.debugDescription)
@@ -91,7 +100,6 @@ final class MovingMovieUITests: XCTestCase {
         revealControls(surface)
         let ordinary = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "普通播放"), object: format)
         try require(XCTWaiter.wait(for: [ordinary], timeout: 5) == .completed, app.debugDescription)
-        let transport = app.buttons["togglePlaybackButton"]
         if transport.label == "播放" { transport.tap() }
         try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC after leaving VR")
     }
