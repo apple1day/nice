@@ -231,13 +231,18 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
 }
 
 - (BOOL)decode:(CMSampleBufferRef)source clock:(double)clock error:(NSError **)error {
+    CMItemCount sampleCount = CMSampleBufferGetNumSamples(source);
+    CMBlockBufferRef data = CMSampleBufferGetDataBuffer(source);
     CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(source);
     if (!_session && (!format || ![self openSession:format error:error])) {
         if (!*error) *error = DecodeError(@"missing HEVC format", -5);
         return NO;
     }
-    if (!format || !CFEqual(format, _sourceFormat) || CMSampleBufferGetNumSamples(source) != 1 || !CMSampleBufferGetDataBuffer(source)) {
-        *error = DecodeError(@"changed or unsupported HEVC sample format", -6);
+    BOOL sameFormat = format && CFEqual(format, _sourceFormat);
+    if (!sameFormat || sampleCount != 1 || !data) {
+        NSString *detail = [NSString stringWithFormat:@"unsupported HEVC packet at %.3fs: samples=%ld bytes=%zu sameFormat=%d",
+                            clock, (long)sampleCount, data ? CMBlockBufferGetDataLength(data) : 0, sameFormat];
+        *error = DecodeError(detail, -6);
         return NO;
     }
     CMSampleTimingInfo timing;
@@ -336,6 +341,13 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
         if (!_next) {
             if (_reader.status == AVAssetReaderStatusFailed) *error = _reader.error ?: DecodeError(@"compressed read", -8);
             break;
+        }
+        // A zero-sample timeline marker has no compressed picture to decode.
+        // Consume it without dropping the reordered pictures still due at EOF.
+        if (CMSampleBufferGetNumSamples(_next) == 0 && CMSampleBufferGetTotalSampleSize(_next) == 0) {
+            CFRelease(_next);
+            _next = NULL;
+            continue;
         }
         double dts = CMTimeGetSeconds(OutputDTS(_next));
         if (dts > seconds &&
