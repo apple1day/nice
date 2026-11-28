@@ -34,6 +34,17 @@ struct Failure: LocalizedError {
     @Published var loading = false
     @Published var message = ""
     @Published var current = ""
+    @Published var deletingRemote = false
+    @Published var marked = Set(UserDefaults.standard.stringArray(forKey: "pendingDeletion") ?? [])
+    var markedItems: [LocalVideo] { local.filter { marked.contains($0.name) } }
+    var markedBytes: Int64 { markedItems.reduce(Int64(0)) { $0 + $1.size } }
+    var remoteCandidates: [Video] { videos.filter { $0.supported && downloaded($0) } }
+    private func saveMarks() { UserDefaults.standard.set(Array(marked), forKey: "pendingDeletion") }
+    func toggleMark(_ item: LocalVideo) {
+        guard local.contains(where: { $0.id == item.id }) else { return }
+        if marked.contains(item.name) { marked.remove(item.name) } else { marked.insert(item.name) }
+        saveMarks()
+    }
     @Published var batchTotal = 0
     @Published var batchProcessed = 0
     @Published var batchFailed = 0
@@ -62,6 +73,8 @@ struct Failure: LocalizedError {
                 guard let v = try? $0.resourceValues(forKeys: [.isRegularFileKey,.fileSizeKey]), v.isRegularFile == true else { return nil }
                 return LocalVideo(url: $0, size: Int64(v.fileSize ?? 0))
             }.sorted { $0.name < $1.name }
+            marked.formIntersection(Set(local.map(\.name)))
+            saveMarks()
         } catch { message = error.localizedDescription }
     }
     func base() throws -> URL {
@@ -152,6 +165,68 @@ struct Failure: LocalizedError {
         if fm.fileExists(atPath: target.path) { _ = try fm.replaceItemAt(target, withItemAt: tmp) }
         else { try fm.moveItem(at: tmp, to: target) }
     }
+    func deleteDownloadedRemote() async {
+        guard !busy, !loading, let b = catalogBase, (try? base()) == b else {
+            message = "请先连接当前服务器并刷新列表"; return
+        }
+        scan()
+        let queue = remoteCandidates
+        guard !queue.isEmpty else { return }
+        busy = true; deletingRemote = true; batchTotal = 0
+        defer { busy = false; deletingRemote = false; current = "" }
+        var deleted = 0, skipped = 0
+        var failures: [String] = []
+        for video in queue {
+            current = video.name
+            let file = destination(video,b)
+            do {
+                let attrs = try fm.attributesOfItem(atPath: file.path)
+                guard attrs[.type] as? FileAttributeType == .typeRegular,
+                      (attrs[.size] as? NSNumber)?.int64Value == video.size else { skipped += 1; continue }
+                let handle = try FileHandle(forReadingFrom: file)
+                let header: Data
+                do { header = try handle.read(upToCount: 512) ?? Data() }
+                catch { try? handle.close(); throw error }
+                try? handle.close()
+                let prefix = String(decoding: header, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{feff}"))).lowercased()
+                guard !["#extm3u","<html","<!doctype","<?xml","<mpd","{","["].contains(where: { prefix.hasPrefix($0) }) else { skipped += 1; continue }
+                let route = "/api/download/"
+                guard video.downloadUrl.hasPrefix(route) else { throw Failure(message: "下载路径不符合删除接口") }
+                let encoded = String(video.downloadUrl.dropFirst(route.count))
+                guard !encoded.isEmpty, !encoded.contains("/"), !encoded.contains("?"), !encoded.contains("#"),
+                      encoded.removingPercentEncoding == video.name,
+                      video.name != ".", video.name != "..", !video.name.contains("/"),
+                      let url = URL(string: "/api/videos/" + encoded, relativeTo: b)?.absoluteURL,
+                      url.scheme == b.scheme, url.host == b.host, url.port == b.port else {
+                    throw Failure(message: "删除地址无效")
+                }
+                var request = URLRequest(url: url)
+                request.httpMethod = "DELETE"
+                request.timeoutInterval = 15
+                let (_, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                    throw Failure(message: "HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+                }
+                deleted += 1
+                videos.removeAll { $0.name == video.name && $0.size == video.size }
+            } catch { failures.append(video.name + "：" + error.localizedDescription) }
+        }
+        message = "远程删除成功 \(deleted) 个，跳过 \(skipped) 个，失败 \(failures.count) 个。本地副本保留。"
+        if !failures.isEmpty { message += "\n" + failures.joined(separator: "\n") }
+        scan()
+    }
+    func deleteMarked() {
+        guard !busy else { return }
+        scan()
+        let items = markedItems
+        var failed = 0
+        for item in items {
+            do { try fm.removeItem(at: item.url); marked.remove(item.name) }
+            catch { failed += 1 }
+        }
+        saveMarks(); scan()
+        message = "已删除待删除视频 \(items.count - failed) 个，失败 \(failed) 个"
+    }
     func deleteAll() {
         guard !busy else { return }
         scan()
@@ -171,6 +246,8 @@ struct Home: View {
     @ObservedObject var store: Store
     @State private var confirm = false
     @State private var confirmDownloadAll = false
+    @State private var confirmRemote = false
+    @State private var confirmMarked = false
     @State private var selected: LocalVideo?
     @State private var search = ""
     var body: some View {
@@ -181,7 +258,7 @@ struct Home: View {
                         TextField("服务器地址", text: $store.address).autocapitalization(.none).disableAutocorrection(true).keyboardType(.URL).disabled(store.busy || store.loading)
                         Button("连接 / 刷新") { Task { await store.refresh() } }.disabled(store.busy || store.loading)
                         if store.loading { ProgressView() }
-                        if store.busy { ProgressView("正在下载：\(store.current)") }
+                        if store.busy { ProgressView(store.deletingRemote ? "正在删除远程：\(store.current)" : "正在下载：\(store.current)") }
                         if store.busy && store.batchTotal > 0 {
                             ProgressView(value: Double(store.batchProcessed), total: Double(store.batchTotal))
                             Text("已处理 \(store.batchProcessed)/\(store.batchTotal)，失败 \(store.batchFailed)")
@@ -189,6 +266,8 @@ struct Home: View {
                         }
                         Button("一键下载全部视频") { confirmDownloadAll = true }
                             .disabled(store.busy || store.loading || store.pending.isEmpty)
+                        Button(role: .destructive) { confirmRemote = true } label: { Text("删除已经下载的远程视频（\(store.remoteCandidates.count)）") }
+                            .disabled(store.busy || store.loading || store.remoteCandidates.isEmpty)
                         Text("待下载：\(store.pending.count) 个 · \(ByteCountFormatter.string(fromByteCount: store.pendingBytes, countStyle: .file))")
                             .font(.footnote)
                         Text("本地已下载：\(store.local.count) 个 · 占用 \(store.storageLabel)")
@@ -210,6 +289,10 @@ struct Home: View {
                         }
                     }
                 }.searchable(text: $search).navigationTitle("服务器视频")
+                    .confirmationDialog("删除服务器源文件？", isPresented: $confirmRemote, titleVisibility: .visible) {
+                        Button("删除远程视频", role: .destructive) { Task { await store.deleteDownloadedRemote() } }
+                        Button("取消", role: .cancel) {}
+                    } message: { Text("仅删除当前服务器上已有完整本地副本的 \(store.remoteCandidates.count) 个视频。服务器文件不可恢复，本地副本保留。") }
                     .alert("下载全部视频？", isPresented: $confirmDownloadAll) {
                         Button("下载") { Task { await store.downloadAll() } }
                         Button("取消", role: .cancel) {}
@@ -222,6 +305,7 @@ struct Home: View {
                     Section {
                         Text("已下载：\(store.local.count) 个文件")
                         Text("存储占用：\(store.storageLabel)").font(.headline)
+                        Text("待删除：\(store.markedItems.count) 个 · \(ByteCountFormatter.string(fromByteCount: store.markedBytes, countStyle: .file))").foregroundColor(.orange)
                         Button(role: .destructive) { confirm = true } label: { Text("一键删除已下载视频") }
                             .disabled(store.busy || store.local.isEmpty)
                         if !store.message.isEmpty { Text(store.message).font(.footnote) }
@@ -230,24 +314,60 @@ struct Home: View {
                         Button { selected = item } label: {
                             VStack(alignment: .leading) {
                                 Text(String(item.name.dropFirst(17))).foregroundColor(.primary)
+                                if store.marked.contains(item.name) { Label("待删除", systemImage: "trash").foregroundColor(.orange).font(.caption) }
                                 Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)).font(.caption)
                             }
                         }
                     }
+                }.safeAreaInset(edge: .bottom) {
+                    HStack {
+                        Spacer()
+                        Button { confirmMarked = true } label: {
+                            Label("一键删除待删除（\(store.markedItems.count)）", systemImage: "trash")
+                                .font(.subheadline.bold()).padding(12).foregroundColor(.white)
+                                .background(store.markedItems.isEmpty || store.busy ? Color.gray : Color.red).clipShape(Capsule())
+                        }.disabled(store.busy || store.markedItems.isEmpty).padding(.trailing, 12)
+                    }.padding(.vertical, 6)
                 }.navigationTitle("已下载").onAppear { store.scan() }
+                    .confirmationDialog("删除已标记的本地视频？", isPresented: $confirmMarked, titleVisibility: .visible) {
+                        Button("删除待删除视频", role: .destructive) { store.deleteMarked() }
+                        Button("取消", role: .cancel) {}
+                    } message: { Text("删除 \(store.markedItems.count) 个已标记视频，其他本地视频不受影响。") }
                     .alert("删除全部本地下载？", isPresented: $confirm) {
                         Button("删除", role: .destructive) { store.deleteAll() }
                         Button("取消", role: .cancel) {}
                     } message: { Text("仅删除本 App 的本地文件，不会删除服务器视频。") }
-                    .sheet(item: $selected) { item in LocalPlayer(url: item.url) }
+                    .sheet(item: $selected) { item in LocalPlayer(store: store, item: item) }
             }.navigationViewStyle(.stack).tabItem { Label("已下载", systemImage: "folder") }
         }.task { await store.refresh() }
     }
 }
 struct LocalPlayer: View {
+    @ObservedObject var store: Store
+    let item: LocalVideo
     @State private var player: AVPlayer
-    init(url: URL) { _player = State(initialValue: AVPlayer(url: url)) }
+    @Environment(\.dismiss) private var dismiss
+    init(store: Store, item: LocalVideo) {
+        self.store = store; self.item = item
+        _player = State(initialValue: AVPlayer(url: item.url))
+    }
     var body: some View {
-        VideoPlayer(player: player).onAppear { player.play() }.onDisappear { player.pause() }
+        VStack(spacing: 0) {
+            HStack { Spacer(); Button("关闭") { dismiss() }.padding() }
+            VideoPlayer(player: player)
+            HStack {
+                Spacer()
+                Button {
+                    store.toggleMark(item)
+                } label: {
+                    Label(store.marked.contains(item.name) ? "已标记 · 取消待删除" : "待删除",
+                          systemImage: store.marked.contains(item.name) ? "checkmark.circle.fill" : "trash")
+                        .padding(12).foregroundColor(.white)
+                        .background(store.marked.contains(item.name) ? Color.orange : Color.gray)
+                        .clipShape(Capsule())
+                }.padding()
+            }
+        }.background(Color.black).foregroundColor(.white)
+        .onAppear { player.play() }.onDisappear { player.pause() }
     }
 }
