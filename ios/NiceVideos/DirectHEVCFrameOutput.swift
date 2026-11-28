@@ -7,6 +7,8 @@ final class DirectHEVCFrameOutput: NSObject {
     private let reader: DirectHEVCReader
     private let queue = DispatchQueue(label: "NiceVideos.direct-hevc", qos: .userInitiated, autoreleaseFrequency: .workItem)
     private let clock: () -> (seconds: Double, playing: Bool)?
+    private let minimumFPS: Double
+    private let pictureTimeout: TimeInterval
     private let awaitingClock: () -> Bool
     private let deliver: (CVPixelBuffer, Double) -> Void
     private let fail: (String) -> Void
@@ -20,9 +22,12 @@ final class DirectHEVCFrameOutput: NSObject {
     private(set) var hasFrame = false
     private(set) var deliveredFPS: Double?
 
-    init(track: AVAssetTrack, asset: AVAsset, clock: @escaping () -> (Double, Bool)?,
+    init(track: AVAssetTrack, asset: AVAsset, frameRate: Float?, clock: @escaping () -> (Double, Bool)?,
          awaitingClock: @escaping () -> Bool, deliver: @escaping (CVPixelBuffer, Double) -> Void, fail: @escaping (String) -> Void) {
         reader = DirectHEVCReader(track: track, asset: asset, requireHardware: true)
+        let fps = Double(frameRate ?? 0)
+        minimumFPS = fps.isFinite && fps > 0 ? min(8, fps / 2) : 8
+        pictureTimeout = fps.isFinite && fps > 0 ? max(6, 3 / fps) : 6
         self.clock = clock
         self.awaitingClock = awaitingClock
         self.deliver = deliver
@@ -71,17 +76,18 @@ final class DirectHEVCFrameOutput: NSObject {
             if let lastTick, now - lastTick > 1 { suspendWatch() }
             lastTick = now
             if noProgressSince == nil { noProgressSince = now }
-            if now - (noProgressSince ?? now) > 6 {
+            let deadline = hasFrame ? pictureTimeout : 6
+            if now - (noProgressSince ?? now) > deadline {
                 stop()
-                fail("no fresh picture for six seconds")
+                fail(String(format: "no fresh picture for %.1f seconds", deadline))
                 return
             }
-            if hasFrame, let checkpoint, t.seconds - checkpoint.seconds >= 8 {
+            if hasFrame, let checkpoint, t.seconds - checkpoint.seconds >= max(8, pictureTimeout) {
                 let fps = Double(frameCount - checkpoint.frames) / (t.seconds - checkpoint.seconds)
                 deliveredFPS = fps
-                if fps < 8 {
+                if fps < minimumFPS {
                     stop()
-                    fail(String(format: "delivered %.1f fps over eight seconds", fps))
+                    fail(String(format: "delivered %.1f fps over %.1f seconds", fps, t.seconds - checkpoint.seconds))
                     return
                 }
                 self.checkpoint = nil

@@ -53,6 +53,7 @@ final class VLCHeadsetReplayTests: XCTestCase {
                 try await Task.sleep(nanoseconds: 120_000_000)
             }
             if playthrough == 1 {
+                XCTAssertTrue(renderer.frameDiagnostics.contains("input=1600x400:420v"), renderer.frameDiagnostics)
                 XCTAssertTrue(model.videoDetails?.contains("8192×2048") == true,
                               "The source track should be reported separately from the scaled VR buffer.")
                 XCTAssertTrue(model.videoDetails?.contains("24.00 fps") == true)
@@ -68,16 +69,26 @@ final class VLCHeadsetReplayTests: XCTestCase {
     // Count only completed draws to the normal full-size drawable during the
     // timed interval. The small eye-color readbacks run beforehand so a GPU
     // readback never stalls the main queue while we're measuring cadence.
+    func testSustainedWide8K24VLCToMetalCadence() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "stereo8k-replay", withExtension: "mp4", subdirectory: "Fixtures"))
+        // The 24 fps case should clear the severe-slow threshold in each
+        // interval. Use actual wall time so a delayed test wakeup can't inflate fps.
+        try await measurePlayback(url, color: nil, input: "1600x400:420v", label: "8K24", minimumFPS: 12)
+    }
+
     func testSustainedFullHeight8K60VLCToMetalCadence() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "stereo8k60-full", withExtension: "mp4", subdirectory: "Fixtures"))
         // Hold the source, decoder policy, scaler, render size and probe fixed.
         // Only change the vmem output. Report both rates on the same host.
-        try await measureFullHeightPlayback(url, color: .packedRGB, fourCC: "BGRA")
-        try await measureFullHeightPlayback(url, color: .ycbcr(kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String), fourCC: "420v")
+        try await measurePlayback(url, color: .packedRGB, input: "1600x800:BGRA", label: "8K60")
+        try await measurePlayback(url, color: .ycbcr(kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String),
+                                  input: "1600x800:420v", label: "8K60")
     }
 
-    private func measureFullHeightPlayback(_ url: URL, color: VLCFrameColor, fourCC: String) async throws {
+    private func measurePlayback(_ url: URL, color: VLCFrameColor?, input: String, label: String,
+                                 minimumFPS: Double = 0) async throws {
         let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
             .first { $0.activationState == .foregroundActive }
         let window = scene.map { UIWindow(windowScene: $0) } ?? UIWindow(frame: UIScreen.main.bounds)
@@ -117,30 +128,38 @@ final class VLCHeadsetReplayTests: XCTestCase {
             try await Task.sleep(nanoseconds: 40_000_000)
         }
         guard sawRedBlue, sawGreenYellow, renderer.completedVideoFrameCount > 0 else {
-            XCTFail("Full-height 8K60 did not render both color pairs to an active viewer. " + renderer.frameDiagnostics)
+            XCTFail("\(label) did not render both color pairs to an active viewer. " + renderer.frameDiagnostics)
             return
         }
         let start = ProcessInfo.processInfo.systemUptime
         let receivedStart = renderer.receivedFrameID, completedStart = renderer.completedVideoFrameCount
         try await Task.sleep(nanoseconds: 2_000_000_000)
+        let middle = ProcessInfo.processInfo.systemUptime
         let completedMiddle = renderer.completedVideoFrameCount
         try await Task.sleep(nanoseconds: 2_000_000_000)
-        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        let end = ProcessInfo.processInfo.systemUptime
+        let elapsed = end - start
         let received = renderer.receivedFrameID - receivedStart
         let completedEnd = renderer.completedVideoFrameCount
         let completed = completedEnd - completedStart
-        let report = String(format: "8K60 VLC/Metal \(fourCC) wall=%.3fs delivered=%llu deliveredFPS=%.2f uniqueGPUFrames=%llu uniqueGPUFPS=%.2f",
-                            elapsed, received, Double(received) / elapsed, completed, Double(completed) / elapsed)
+        let firstFPS = Double(completedMiddle - completedStart) / (middle - start)
+        let secondFPS = Double(completedEnd - completedMiddle) / (end - middle)
+        let report = String(format: "\(label) VLC/Metal \(input) wall=%.3fs delivered=%llu deliveredFPS=%.2f uniqueGPUFrames=%llu uniqueGPUFPS=%.2f firstWindowFPS=%.2f secondWindowFPS=%.2f",
+                            elapsed, received, Double(received) / elapsed, completed, Double(completed) / elapsed, firstFPS, secondFPS)
             + " " + renderer.frameDiagnostics
         print(report)
         let attachment = XCTAttachment(string: report)
-        attachment.name = "8K60 immersive VLC cadence \(fourCC)"
+        attachment.name = "\(label) immersive VLC cadence \(input)"
         attachment.lifetime = .keepAlways
         add(attachment)
-        XCTAssertTrue(renderer.frameDiagnostics.contains("input=1600x800:\(fourCC)"), report)
+        XCTAssertTrue(renderer.frameDiagnostics.contains("input=\(input)"), report)
         XCTAssertGreaterThan(received, 1, report)
         XCTAssertGreaterThan(completedMiddle, completedStart, report)
         XCTAssertGreaterThan(completedEnd, completedMiddle, report)
+        if minimumFPS > 0 {
+            XCTAssertGreaterThanOrEqual(firstFPS, minimumFPS, report)
+            XCTAssertGreaterThanOrEqual(secondFPS, minimumFPS, report)
+        }
     }
 
     private func makeProjectedColorsProbe(_ renderer: SBSMetalView) throws -> () throws -> [UInt8] {

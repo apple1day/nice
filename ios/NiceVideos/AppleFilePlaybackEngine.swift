@@ -16,7 +16,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     private let player = AVPlayer()
     private let afterglow: Bool
     private var preparingItem: AVPlayerItem?
-    private var afterglowSourceSize = CGSize.zero
+    private var sourceSize: CGSize?
     private var firstPictureWatch = AfterglowFirstPictureWatch()
     private var firstPictureTimer: DispatchSourceTimer?
     private var surface: AppleVideoSurface?
@@ -77,6 +77,10 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         guard !stopped else { return }
         let returningToLayer = frameHandler != nil && handler == nil
         frameHandler = handler
+        if returningToLayer {
+            stopFirstPictureTimer()
+            firstPictureWatch = AfterglowFirstPictureWatch()
+        }
         if direct != nil {
             if returningToLayer {
                 // This handoff only disqualifies the native layer. The same file
@@ -90,8 +94,8 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             return
         }
         frameWatch = AppleVideoFrameWatch()
-        // Keep the native display alive under the opaque stereo view. A ready
-        // layer can be uncovered without an extra seek or decoder restart.
+        // Small system sources keep a warm layer. Large projected sources
+        // suppress layer rendering, so restore its readiness on return to 2D.
         let needsPreroll = MainActor.assumeIsolated {
             if afterglow { surface?.videoLayer.player = handler == nil ? player : nil }
             installStereoOutput()
@@ -106,6 +110,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             attach(to: host)
             return true
         }
+        updateFirstPictureTimer()
         if needsPreroll, let item = player.currentItem { preroll(item) }
     }
 
@@ -114,11 +119,11 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         stereo?.stop()
         stereo = nil
         guard let item = preparedItem ?? player.currentItem, let frameHandler else { return }
-        let format = afterglow ? AfterglowMovieOutput.Format(source: afterglowSourceSize, sdr: isSDR,
+        let format = afterglow ? AfterglowMovieOutput.Format(source: sourceSize ?? .zero, sdr: isSDR,
                                                              recovery: recovery) : nil
         stereo = AppleStereoFrameOutput(item: item, recovery: recovery, preferBiPlanar: { [weak self] in
             self?.isSDR == true
-        }, afterglowFormat: format, onAttach: { [weak self, weak item] in
+        }, trackSize: { [weak self] in self?.sourceSize }, afterglowFormat: format, onAttach: { [weak self, weak item] in
             // Item size, and hence the stereo output, can become available
             // several event turns after the user paused. Preroll it after attach.
             DispatchQueue.main.async {
@@ -130,7 +135,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             if self.afterglow && (self.seeking || self.pendingSeek != nil) { return }
             self.diagnostics?.decodedFrame(buffer, pts: pts)
             frameHandler(buffer)
-            if self.afterglow && !self.firstPictureWatch.delivered {
+            if !self.firstPictureWatch.delivered {
                 self.firstPictureWatch.receivedPicture()
                 self.stopFirstPictureTimer()
             }
@@ -203,10 +208,8 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             [weak self] _ in self?.publish()
         }
         let center = NotificationCenter.default
-        if afterglow {
-            notifications.append(center.addObserver(forName: UIApplication.willResignActiveNotification,
-                object: nil, queue: .main) { [weak self] _ in self?.firstPictureWatch.suspend() })
-        }
+        notifications.append(center.addObserver(forName: UIApplication.willResignActiveNotification,
+            object: nil, queue: .main) { [weak self] _ in self?.firstPictureWatch.suspend() })
         for name in [NSNotification.Name.AVPlayerItemDidPlayToEndTime, .AVPlayerItemFailedToPlayToEndTime, .AVPlayerItemPlaybackStalled] {
             notifications.append(center.addObserver(forName: name, object: item, queue: .main) { [weak self, weak item] note in
                 guard let self, let item, self.player.currentItem === item else { return }
@@ -240,7 +243,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                         let bitRate = try? await track.load(.estimatedDataRate)
                         let size = try? await track.load(.naturalSize)
                         var directCandidate = false
-                        if !decodable, let format = formats?.first, Self.isDirectCandidate(format, rate: rate) {
+                        if !decodable, let format = formats?.first, Self.isDirectCandidate(format) {
                             let transform = try? await track.load(.preferredTransform)
                             let audioTracks = try? await item.asset.loadTracks(withMediaType: .audio)
                             directCandidate = transform == .identity && audioTracks?.isEmpty == false
@@ -259,20 +262,20 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
                             return
                         }
                         if !decodable && !self.afterglow { continue }
+                        self.sourceSize = size ?? .zero
+                        if let format = formats?.first {
+                            let display = CMVideoFormatDescriptionGetPresentationDimensions(format,
+                                usePixelAspectRatio: true, useCleanAperture: true)
+                            if display.width > 0, display.height > 0 { self.sourceSize = display }
+                        }
+                        self.firstPictureWatch.classifyTrack(decodable: decodable)
                         if self.preparingItem === item {
-                            self.afterglowSourceSize = size ?? .zero
-                            if let format = formats?.first {
-                                let display = CMVideoFormatDescriptionGetPresentationDimensions(format,
-                                    usePixelAspectRatio: true, useCleanAperture: true)
-                                if display.width > 0, display.height > 0 { self.afterglowSourceSize = display }
-                            }
-                            guard AfterglowMovieOutput.Format(source: self.afterglowSourceSize, sdr: self.isSDR,
+                            guard AfterglowMovieOutput.Format(source: self.sourceSize ?? .zero, sdr: self.isSDR,
                                                                recovery: false) != nil else {
                                 self.failure = "Afterglow XR 无法读取该片的视频尺寸。"
                                 self.publish()
                                 return
                             }
-                            self.firstPictureWatch.classifyTrack(decodable: decodable)
                             self.diagnostics?.event("Afterglow: packed movie output; trackDecodable=\(decodable)")
                             self.installStereoOutput(on: item)
                             self.player.replaceCurrentItem(with: item)
@@ -298,10 +301,12 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         }
     }
 
-    private static func isDirectCandidate(_ format: CMFormatDescription, rate: Float?) -> Bool {
+    static func isDirectCandidate(_ format: CMFormatDescription) -> Bool {
         let codec = CMFormatDescriptionGetMediaSubType(format)
         let dims = CMVideoFormatDescriptionGetDimensions(format)
-        guard (codec == kCMVideoCodecType_HEVC || codec == 0x68657631), (rate ?? 0) >= 48,
+        // AVPlayer may reject the sample entry at any frame rate. Let the
+        // hardware-only VideoToolbox session verify the device's capability.
+        guard (codec == kCMVideoCodecType_HEVC || codec == 0x68657631), min(dims.width, dims.height) > 0,
               max(dims.width, dims.height) > 4096, max(dims.width, dims.height) <= 8192 else { return false }
         // Conventional SDR or unspecified tags. Preserve the native color path for HDR and wide gamut.
         let tags = CMFormatDescriptionGetExtensions(format) as? [String: Any]
@@ -327,7 +332,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             preparingItem = nil
         }
         diagnostics?.event("AV: packed HEVC track rejected by AVPlayer; probing hardware VideoToolbox")
-        direct = DirectHEVCFrameOutput(track: track, asset: item.asset, clock: { [weak self, weak item] in
+        direct = DirectHEVCFrameOutput(track: track, asset: item.asset, frameRate: frameRate, clock: { [weak self, weak item] in
             guard let self, let item, self.player.currentItem === item, !self.stopped, !self.ended,
                   self.failure == nil, self.visibleInForeground, item.status == .readyToPlay,
                   !self.seeking, self.pendingSeek == nil else { return nil }
@@ -489,7 +494,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
     }
 
     private func updateFirstPictureTimer() {
-        guard afterglow, direct == nil else { return }
+        guard direct == nil else { return }
         guard frameHandler != nil, wantsPlayback, !stopped, !ended, failure == nil,
               !firstPictureWatch.delivered, let item = player.currentItem ?? preparingItem else {
             if firstPictureTimer != nil { stopFirstPictureTimer() }
@@ -508,8 +513,9 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
             if let reason = self.firstPictureWatch.sample(at: ProcessInfo.processInfo.systemUptime,
                                                          active: active, playing: playing) {
                 self.stopFirstPictureTimer()
-                self.diagnostics?.event("Afterglow: no first picture (\(reason.rawValue)); requesting decoder fallback")
-                self.failure = "Afterglow XR 未能解出首帧，正在尝试兼容播放。"
+                let route = self.afterglow ? "Afterglow" : "AV"
+                self.diagnostics?.event("\(route): no first picture (\(reason.rawValue)); requesting decoder fallback")
+                self.failure = "全景播放未能解出首帧，正在尝试兼容播放。"
                 self.publish()
             }
         }
@@ -595,7 +601,7 @@ final class AppleFilePlaybackEngine: LocalPlaybackEngine {
         stopFirstPictureTimer()
         firstPictureWatch = AfterglowFirstPictureWatch()
         preparingItem = nil
-        afterglowSourceSize = .zero
+        sourceSize = nil
         observations.removeAll()
         notifications.forEach { NotificationCenter.default.removeObserver($0) }
         notifications.removeAll()

@@ -226,7 +226,7 @@ struct VLCImmersiveFrameRateWatch {
 
     mutating func sample(host: TimeInterval, media: Double, offered: UInt64, delivered: UInt64,
                          bufferMisses: UInt64, staleSource: UInt64, formatSetups: UInt64, nominalFPS: Double, active: Bool) {
-        guard active, nominalFPS.isFinite, nominalFPS >= 48, host.isFinite, media.isFinite,
+        guard active, nominalFPS.isFinite, nominalFPS >= 23, host.isFinite, media.isFinite,
               delivered > 0, formatSetups > 0 else { reset(); return }
         let current = Sample(host: host, media: media, offered: offered, delivered: delivered,
                              bufferMisses: bufferMisses, staleSource: staleSource, formatSetups: formatSetups)
@@ -240,15 +240,18 @@ struct VLCImmersiveFrameRateWatch {
         }
 
         // Two separate five-second windows must both advance at approximately
-        // playback speed. A startup delay, a held picture, or a burst following
-        // a seek cannot by itself qualify as continuous slow output.
+        // playback speed after the first actual picture. A completely frozen
+        // vout may report neither new pictures nor native losses.
         let time = host - window.host
         guard time >= 5 else { return }
         self.window = current
         let mediaTime = media - window.media
         let fps = Double(delivered - window.delivered) / time
         deliveredFPS = mediaTime >= 0.8 * time && mediaTime <= time + 1.25 ? fps : nil
-        guard deliveredFPS != nil, fps > 0, fps < 8 else {
+        // Judge against the lower of the source cadence and a 30 fps viewing
+        // target. Include 24000/1001 film and avoid downgrading healthy 24 fps.
+        let slowThreshold = min(nominalFPS, 30) / 2
+        guard deliveredFPS != nil, fps < slowThreshold else {
             previousSlowRate = nil
             previousSlowInput = false
             needsSmallerOutput = false
@@ -259,7 +262,7 @@ struct VLCImmersiveFrameRateWatch {
         // windows. A busy main thread or exhausted surface pool can instead
         // make delivery slow while decoding and conversion are healthy.
         let inputFPS = Double(offered - window.offered) / time
-        let slowInput = inputFPS > 0 && inputFPS < 8 &&
+        let slowInput = inputFPS < slowThreshold &&
             bufferMisses == window.bufferMisses && staleSource == window.staleSource
         needsSmallerOutput = previousSlowInput && slowInput
         previousSlowInput = slowInput
@@ -303,7 +306,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         guard let player, player.isSeekable,
               player.state == .playing || player.state == .paused,
               callbackLock.withLock({ seekGate.target == nil }) else { return false }
-        let clock = max(0, Double(player.time.intValue) / 1000)
+        let clock = playbackSeconds(player)
         return durationSeconds(player) - clock > 2
     }
     private var videoDetails: String?
@@ -452,6 +455,15 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         guard !stopped, pickedReadStatus === status else { return }
         player?.stop()
         publishNow()
+    }
+
+    // The VLCKit delegate can publish a cached time from before a paused seek.
+    // Read the same native input clock during confirmation and after resuming.
+    private func playbackSeconds(_ player: VLCMediaPlayer) -> Double {
+        if let milliseconds = nativeLifetime?.resource?.timeMilliseconds, milliseconds >= 0 {
+            return Double(milliseconds) / 1000
+        }
+        return max(0, Double(player.time.intValue) / 1000)
     }
 
     private func durationSeconds(_ player: VLCMediaPlayer) -> Double {
@@ -608,11 +620,7 @@ final class VLCPlaybackEngine: NSObject, SwitchableVideoEngine, VLCMediaPlayerDe
         default: phase = player.isPlaying ? .playing : .opening
         }
 
-        // Delegate changes can arrive late during a seek. Read the native input
-        // clock on every seek poll, including while VLC has stopped emitting ticks.
-        let awaitingNativeClock = callbackLock.withLock { seekGate.target != nil }
-        let nativeMS = awaitingNativeClock ? nativeLifetime?.resource?.timeMilliseconds ?? -1 : -1
-        let rawSeconds = max(0, nativeMS >= 0 ? Double(nativeMS) / 1000 : Double(player.time.intValue) / 1000)
+        let rawSeconds = playbackSeconds(player)
         let now = ProcessInfo.processInfo.systemUptime
         let duration = durationSeconds(player)
         let appState = MainActor.assumeIsolated { UIApplication.shared.applicationState }

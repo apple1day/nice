@@ -7,6 +7,7 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     private var handler: ((CVPixelBuffer, Double?, Bool) -> Void)?
     private var onAttach: (() -> Void)?
     private let preferBiPlanar: () -> Bool
+    private let trackSize: () -> CGSize?
     private let recovery: Bool
     private let afterglowFormat: AfterglowMovieOutput.Format?
     private var afterglowOutput: AfterglowMovieOutput?
@@ -24,10 +25,11 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
     var isParked: Bool { displayLink?.isPaused == true }
 
     init(item: AVPlayerItem, recovery: Bool, preferBiPlanar: @escaping () -> Bool,
-         afterglowFormat: AfterglowMovieOutput.Format? = nil,
+         trackSize: @escaping () -> CGSize?, afterglowFormat: AfterglowMovieOutput.Format? = nil,
          onAttach: @escaping () -> Void = {}, handler: @escaping (CVPixelBuffer, Double?, Bool) -> Void) {
         self.item = item
         self.preferBiPlanar = preferBiPlanar
+        self.trackSize = trackSize
         self.afterglowFormat = afterglowFormat
         self.recovery = recovery
         self.handler = handler
@@ -58,11 +60,20 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
             attach(next.output, description: format.description)
             return
         }
-        let size = item.presentationSize
+        // Some local HEVC items keep presentationSize at zero until an
+        // output is attached. The selected track already has its dimensions.
+        let presented = item.presentationSize
+        let metadata = trackSize()
+        let size = presented.width > 0 && presented.height > 0 ? presented : (metadata ?? .zero)
         guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
         let longest = max(size.width, size.height)
-        let scale = min(1, (recovery ? 1920 : 2560) / longest)
-        let biPlanar = (recovery || longest > 4096) && preferBiPlanar()
+        // Wait for color metadata before negotiating an 8K conversion.
+        // An early BGRA request costs bandwidth for the entire session.
+        let large = longest > 4096
+        guard !large || metadata != nil else { return }
+        let limit: CGFloat = large ? (recovery ? 1280 : 1920) : (recovery ? 1920 : 2560)
+        let scale = min(1, limit / longest)
+        let biPlanar = (recovery || large) && preferBiPlanar()
         let format = biPlanar ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA
         var width = max(2, Int((size.width * scale).rounded()))
         var height = max(1, Int((size.height * scale).rounded()))
@@ -78,6 +89,9 @@ final class AppleStereoFrameOutput: NSObject, AVPlayerItemOutputPullDelegate {
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
         ]
         let next = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
+        // For large tracks the visible Metal projection is the sole video
+        // destination. Smaller movies keep a warm layer for the return to 2D.
+        next.suppressesPlayerRendering = large
         item.add(next)
         attach(next, description: "\(biPlanar ? "420v" : "BGRA") \(width)x\(height)")
     }

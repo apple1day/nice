@@ -43,11 +43,11 @@ jobs:
         run: |
           if ! bash ios/test.sh vr-motion > ios/vr-motion.log 2>&1; then
             grep -E 'error:|Failing tests:|threw error|Test Case.*(failed|passed)|VR conversion test:|NiceVRConvert|unexpected exit' ios/vr-motion.log | tail -n 50 || true
-            grep -E 'error:|8K60 VLC/Metal |DirectHEVC source:' ios/vr-motion.log | tail -n 35 || true
+            grep -E 'error:|8K(24|60) VLC/Metal |DirectHEVC source:' ios/vr-motion.log | tail -n 35 || true
             tail -n 60 ios/vr-motion.log
             exit 1
           fi
-          grep -F '8K60 VLC/Metal ' ios/vr-motion.log || true
+          grep -E '8K(24|60) VLC/Metal ' ios/vr-motion.log || true
           grep 'Test Case.*passed' ios/vr-motion.log | tail -n 8
       - name: Run remaining app and UI tests
         if: ${{ !cancelled() && (steps.vr_motion.outcome == 'success' || steps.vr_motion.outcome == 'failure') }}

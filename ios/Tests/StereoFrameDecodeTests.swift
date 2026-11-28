@@ -22,7 +22,7 @@ import XCTest
     }
 
     func testReducedOutputResumes8KSourceWithSmallerStereoBuffers() async throws {
-        try await checkMovingPanorama("stereo8k-replay", width: 1280, height: 320, startAt: 2, reduced: true)
+        try await checkMovingPanorama("stereo8k-replay", width: 1280, height: 320, startAt: 2, reduced: true, biPlanar: true)
     }
 
     func testFullHeight8K60PanoramaNegotiatesSmallerFramesAndChangesBothEyes() async throws {

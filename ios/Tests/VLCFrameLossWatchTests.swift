@@ -27,6 +27,17 @@ final class VLCFrameLossWatchTests: XCTestCase {
         XCTAssertNil(rate.slowRate, "Normal delivery clears the copy suggestion")
     }
 
+    func testSingleHeldPictureCanRecoverWithZeroLossOnlyAfterPlaybackHasDeliveredAFrame() {
+        for delivered in [UInt64(0), 1] {
+            var watch = VLCImmersiveFrameRateWatch()
+            for second in 0...10 {
+                watch.sample(host: Double(second), media: Double(second), offered: delivered, delivered: delivered,
+                             bufferMisses: 0, staleSource: 0, formatSetups: 1, nominalFPS: 23.976, active: true)
+                XCTAssertEqual(watch.needsSmallerOutput, delivered != 0 && second == 10)
+            }
+        }
+    }
+
     func testSlowMainQueueOrMissedSurfacesDoNotReopenDecoder() {
         for (offeredFPS, misses, stale) in [(60, 0, 0), (5, 1, 0), (5, 0, 1)] {
             var watch = VLCImmersiveFrameRateWatch()
@@ -40,9 +51,23 @@ final class VLCFrameLossWatchTests: XCTestCase {
         }
     }
 
-    func testHighRateSourceAndContinuousMovingDeliveryAreRequiredForSlowPictureSuggestion() {
-        for (sourceFPS, actualFPS, clockRate) in [(24.0, 4, 1.0), (0.0, 4, 1.0), (60.0, 8, 1.0),
-                                                    (60.0, 30, 1.0), (60.0, 0, 1.0), (60.0, 4, 0.0)] {
+    func testFilmAndThirtyFPSRecoverAfterTwoLowCadenceWindowsWithNoNativeLoss() {
+        for sourceFPS in [24000.0 / 1001, 24, 30, 59.94] {
+            var watch = VLCImmersiveFrameRateWatch()
+            for second in 0...10 {
+                let count = UInt64(1 + second * 10)
+                watch.sample(host: Double(second), media: Double(second), offered: count, delivered: count,
+                             bufferMisses: 0, staleSource: 0, formatSetups: 1, nominalFPS: sourceFPS, active: true)
+                XCTAssertEqual(watch.needsSmallerOutput, second == 10)
+            }
+            XCTAssertEqual(watch.slowRate, 10)
+        }
+    }
+
+    func testKnownSourceAndContinuousSlowDeliveryAreRequiredForSlowPictureSuggestion() {
+        for (sourceFPS, actualFPS, clockRate) in [(12.0, 4, 1.0), (0.0, 4, 1.0), (23.976, 12, 1.0),
+                                                    (24.0, 24, 1.0), (30.0, 15, 1.0), (60.0, 15, 1.0),
+                                                    (60.0, 30, 1.0), (60.0, 4, 0.0)] {
             var watch = VLCImmersiveFrameRateWatch()
             for i in 0...15 {
                 watch.sample(host: Double(i), media: Double(i) * clockRate, offered: UInt64(10 + i * actualFPS),

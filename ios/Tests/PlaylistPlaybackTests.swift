@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import Combine
+import Observation
 @testable import NiceVideos
 
 private final class PlaylistTestEngine: LocalPlaybackEngine {
@@ -557,6 +558,27 @@ final class PlaylistPlaybackTests: XCTestCase {
         let subscription = f.model.player.objectWillChange.sink { _ in updates += 1 }
         for _ in 0..<100 { f.pool.engines[0].tick(12) }
         XCTAssertEqual(updates, 0)
+        withExtendedLifetime(subscription) {}
+    }
+
+    @MainActor func testAdvancingClockUpdatesProgressWithoutInvalidatingPlayerSurface() throws {
+        let f = try fixture()
+        let player = f.model.player
+        let engine = f.pool.engines[0]
+        player.attach(to: UIView())
+        engine.tick(12)
+        var playerUpdates = 0
+        let subscription = player.objectWillChange.sink { _ in playerUpdates += 1 }
+        let progressChanged = expectation(description: "elapsed time observer receives a new position")
+        let position = withObservationTracking { player.seconds } onChange: { progressChanged.fulfill() }
+        XCTAssertEqual(position, 12)
+
+        for tick in 1...100 { engine.tick(12 + Double(tick) / 10) }
+        XCTAssertEqual(XCTWaiter.wait(for: [progressChanged], timeout: 0), .completed)
+        XCTAssertEqual(player.seconds, 22)
+        XCTAssertEqual(playerUpdates, 0)
+        player.pause()
+        XCTAssertGreaterThan(playerUpdates, 0, "Transport changes still update the full player.")
         withExtendedLifetime(subscription) {}
     }
 }

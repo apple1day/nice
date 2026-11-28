@@ -6,6 +6,68 @@ import XCTest
 
 @MainActor
 final class AppleFilePlaybackEngineTests: XCTestCase {
+    func testSystemProjectionUsesTrackGeometryBeforeTheItemHasAPresentationSize() throws {
+        let item = AVPlayerItem(asset: AVMutableComposition())
+        XCTAssertEqual(item.presentationSize, .zero)
+        let output = AppleStereoFrameOutput(item: item, recovery: false, preferBiPlanar: { true },
+            trackSize: { CGSize(width: 8192, height: 2048) }) { _, _, _ in }
+        defer { output.stop() }
+        XCTAssertEqual(output.requestDescription, "420v 1920x480")
+        let videoOutput = try XCTUnwrap(item.outputs.first as? AVPlayerItemVideoOutput)
+        XCTAssertTrue(videoOutput.suppressesPlayerRendering)
+    }
+
+    func testFilmRate8KHEVCIsEligibleForTheHardwareTrial() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "stereo8k-replay", withExtension: "mp4", subdirectory: "Fixtures"))
+        let tracks = try await AVURLAsset(url: url).loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let rate = try await track.load(.nominalFrameRate)
+        XCTAssertEqual(rate, 24, accuracy: 0.01)
+        let formats = try await track.load(.formatDescriptions)
+        XCTAssertTrue(AppleFilePlaybackEngine.isDirectCandidate(try XCTUnwrap(formats.first)))
+    }
+
+    func testSystemProjectionFallsBackWhenNeitherPictureNorClockStarts() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "panorama-audio", withExtension: "mp4", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        let root = UIViewController()
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        let engine = AppleFilePlaybackEngine()
+        defer { engine.stop(); window.isHidden = true }
+        engine.attach(to: root.view)
+        let layer = try XCTUnwrap(root.view.subviews.first?.layer as? AVPlayerLayer)
+        let player = try XCTUnwrap(layer.player)
+        let ready = expectation(description: "Native layer has a paused preview")
+        engine.onUpdate = { state in
+            if state.phase == .paused && state.hasVideo { engine.onUpdate = nil; ready.fulfill() }
+        }
+        try engine.load(fileURL: url, startAt: 1, paused: true)
+        engine.play(waitForPausedFrame: true)
+        await fulfillment(of: [ready], timeout: 12)
+
+        let failed = expectation(description: "Foreground startup expires with a stationary clock")
+        engine.onUpdate = { state in
+            if player.rate != 0 { player.pause() }
+            if state.phase == .failed {
+                engine.onUpdate = nil
+                XCTAssertTrue(state.error?.contains("首帧") == true)
+                failed.fulfill()
+            }
+        }
+        let item = try XCTUnwrap(player.currentItem)
+        engine.setVideoFrameHandler { _ in XCTFail("A disconnected output cannot supply a picture") }
+        let output = try XCTUnwrap(item.outputs.compactMap { $0 as? AVPlayerItemVideoOutput }.first)
+        item.remove(output)
+        engine.play()
+        // Simulate AVFoundation never starting its timebase even though the
+        // user requested play. A media-clock-only watchdog cannot recover.
+        player.pause()
+        await fulfillment(of: [failed], timeout: 22)
+    }
+
     func testAudioOnlyMP4ReportsMissingVideoInsteadOfAdvancingToTheEnd() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "audio-only", withExtension: "mp4", subdirectory: "Fixtures"))
         let source = try await PickedVideoFile.open(url)

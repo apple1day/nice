@@ -396,7 +396,7 @@ final class SBSPlaybackEngine: LocalPlaybackEngine, PlaybackDiagnosticReporting,
         guard currentOutput == .vlcFrames, host.mode != .standard, hasStarted, wantsPlayback,
               phase == .playing || phase == .paused, !awaitingOutput, !openingPaused,
               pendingSeek == nil, vlc.needsPanoramaRenegotiation() else { return false }
-        diagnostics.event("VLC: resizing existing full-height 8K output for panorama at \(seconds)s")
+        diagnostics.event("VLC: resizing existing 8K output for panorama at \(seconds)s")
         retireSession()
         // Same movie and position: keep the existing texture visible until
         // the first smaller frame is delivered by the replacement session.

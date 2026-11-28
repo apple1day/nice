@@ -30,7 +30,7 @@
     if (self) {
         _handler = [handler copy];
         _maximumLongEdge = 2560;
-        // The two-plane path only applies to full-height 8K sources. An
+        // The two-plane path only applies to large 8K panoramas. An
         // untagged HD source's default matrix is independent of output scale.
         _panoramaYCbCrMatrix = (__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2;
     }
@@ -309,15 +309,18 @@ static unsigned NICEFrameSetup(void **opaque, char *chroma, unsigned *width, uns
         // Compute the panorama cap even in standard mode. The same VLC vout
         // can survive a projection change without negotiating another format.
         unsigned normalLimit = delivery.maximumLongEdge;
-        BOOL fullHeight8K = MAX(geometry.width, geometry.height) >= 7680 && MIN(geometry.width, geometry.height) >= 3840;
-        unsigned panoramaLimit = fullHeight8K ? MIN(normalLimit, 1600u) : normalLimit;
-        unsigned limit = delivery.preferSmallerPanoramaFrames ? panoramaLimit : normalLimit;
+        // Two 4096x2048 equirectangular eyes pack into 8192x2048. They
+        // need the panorama conversion budget just as an 8192x4096 pair does.
+        BOOL largePanorama = MAX(geometry.width, geometry.height) >= 7680 && MIN(geometry.width, geometry.height) >= 1920;
+        BOOL panoramaRequested = delivery.preferSmallerPanoramaFrames;
+        unsigned panoramaLimit = largePanorama ? MIN(normalLimit, 1600u) : normalLimit;
+        unsigned limit = panoramaRequested ? panoramaLimit : normalLimit;
         const double scale = MIN(1.0, (double)limit / MAX(geometry.width, geometry.height));
         *width = geometry.width = (unsigned)MAX(1.0, round(geometry.width * scale));
         *height = geometry.height = (unsigned)MAX(1.0, round(geometry.height * scale));
         // Keep both eyes packed. Let Metal perform YCbCr -> RGB when sampling;
         // converting the whole downscaled 8K movie to BGRA costs extra bandwidth.
-        NSString *matrix = fullHeight8K && delivery.preferSmallerPanoramaFrames &&
+        NSString *matrix = largePanorama && panoramaRequested &&
                            (*width % 2 == 0) && (*height % 2 == 0) && chroma[0] != 'J'
                            ? delivery.panoramaYCbCrMatrix : nil;
         NICEVLCFrameFormat *format = [[NICEVLCFrameFormat alloc] initWithGeometry:geometry matrix:matrix

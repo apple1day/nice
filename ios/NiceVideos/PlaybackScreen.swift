@@ -2,11 +2,22 @@ import SwiftUI
 import AVFoundation
 import UIKit
 import Combine
+import Observation
+
+// Only views displaying elapsed time subscribe to clock ticks. Transport buttons
+// read the same current position when tapped without invalidating the video surface.
+@Observable private final class PlaybackClock {
+    var seconds: Double = 0
+}
 
 // Main-queue confined. The engine is injected in lifecycle tests, not mocked via VLC internals.
 final class PlaybackModel: ObservableObject {
     @Published private(set) var phase: PlaybackPhase = .idle
-    @Published private(set) var seconds: Double = 0
+    private let clock = PlaybackClock()
+    private(set) var seconds: Double {
+        get { clock.seconds }
+        set { clock.seconds = newValue }
+    }
     @Published private(set) var duration: Double = 0
     @Published private(set) var seekable = false
     @Published private(set) var videoOutput: MovieOutput?
