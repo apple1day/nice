@@ -1,0 +1,37 @@
+name: iOS 15 video app
+on:
+  pull_request:
+    paths:
+      - 'ios15/**'
+      - '.github/workflows/ios15.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'ios15/**'
+      - '.github/workflows/ios15.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ios15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check download compatibility and deletion safeguards
+        run: |
+          xcrun swiftc -target "$(uname -m)-apple-macosx13.0" -parse-as-library Sources/VideoFiles.swift Tests/VideoFilesChecks.swift -o "$RUNNER_TEMP/video-files-checks"
+          "$RUNNER_TEMP/video-files-checks"
+      - name: Check download index, storage totals and saved marks
+        if: ${{ !cancelled() }}
+        run: |
+          xcrun swiftc -target "$(uname -m)-apple-macosx13.0" -parse-as-library Sources/VideoFiles.swift Sources/VideoStore.swift Tests/VideoStateChecks.swift -o "$RUNNER_TEMP/video-state-checks"
+          "$RUNNER_TEMP/video-state-checks"
+      - name: Build Release for iPhone with the iOS 15 deployment target
+        if: ${{ !cancelled() }}
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate
+          xcodebuild -quiet -project NiceVideos15.xcodeproj -scheme NiceVideos15 -configuration Release -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
