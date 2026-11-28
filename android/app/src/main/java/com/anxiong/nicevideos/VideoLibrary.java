@@ -12,6 +12,10 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.provider.DocumentsContract;
+import android.system.OsConstants;
+import android.system.ErrnoException;
+import android.system.Os;
 import org.json.JSONObject;
 import org.json.JSONException;
 import java.io.File;
@@ -47,6 +51,17 @@ final class VideoLibrary {
     VideoLibrary(Context c) {
         context = c.getApplicationContext();
         prefs = c.getSharedPreferences("video_library", Context.MODE_PRIVATE);
+    }
+
+    String serverAddress() {
+        String saved = prefs.getString("server", "");
+        return saved.isEmpty() ? ServerVideos.DEFAULT_ADDRESS : saved;
+    }
+
+    // A new size under the same server filename is a different version. Direct links
+    // have no catalogue size, so their exact original URL identifies the transfer.
+    static String downloadKey(String url, boolean direct, long bytes) {
+        return (direct ? "link" : Long.toString(bytes)) + " " + url;
     }
 
     private Entry parse(String value) {
@@ -261,12 +276,77 @@ final class VideoLibrary {
         }
     }
 
+    // A missing download record is not sufficient proof that the underlying file is gone.
+    private static boolean absentOnDisk(File file) {
+        try { Os.stat(file.getAbsolutePath()); return false; }
+        catch (ErrnoException ex) { return ex.errno == OsConstants.ENOENT; }
+        catch (RuntimeException ex) { return false; }
+    }
+
+    private boolean missingLocalFile(Entry e) {
+        if (!READY.equals(e.state)) return false;
+        String storage = Environment.getExternalStorageState();
+        boolean mounted = Environment.MEDIA_MOUNTED.equals(storage) || Environment.MEDIA_MOUNTED_READ_ONLY.equals(storage);
+        try {
+            if (e.downloaded()) {
+                if (!e.publicDownload) {
+                    return (e.restoredPrivate || mounted) && absentOnDisk(file(e));
+                }
+                if (!mounted || !missingPublicFile(e)) return false;
+                File recorded = publicFile(Uri.fromFile(new File(publicDirectory(), e.disk)));
+                if (!absentOnDisk(recorded)) return false;
+                if (e.publicUri.isEmpty()) {
+                    // An untracked or renamed DownloadManager file is not automatically removed.
+                    if (e.job < 0) return false;
+                    try (Cursor c = manager().query(new DownloadManager.Query().setFilterById(e.job))) {
+                        if (c == null) return false;
+                        if (!c.moveToFirst()) return true;
+                        String path = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI));
+                        return path != null && "file".equals(Uri.parse(path).getScheme())
+                                && recorded.equals(publicFile(Uri.parse(path)));
+                    }
+                }
+                Uri uri = Uri.parse(e.publicUri);
+                if ("file".equals(uri.getScheme())) return recorded.equals(publicFile(uri));
+                if (!MediaStore.AUTHORITY.equals(uri.getAuthority())) return false;
+                try (Cursor c = context.getContentResolver().query(uri,
+                        new String[]{MediaStore.MediaColumns.DATA}, null, null, null)) {
+                    if (c == null) return false;
+                    if (!c.moveToFirst()) return true;
+                    String path = c.getString(0);
+                    // A MediaStore URI may follow a moved file; preserve uncertain locations.
+                    return path != null && recorded.equals(new File(path).getCanonicalFile());
+                }
+            }
+            // Only primary-volume documents with a retained read grant can be
+            // positively classified. Revoked permissions, USB/SD/cloud files are retained.
+            if (!mounted || e.document.isEmpty()) return false;
+            Uri uri = Uri.parse(e.document);
+            if (!"com.android.externalstorage.documents".equals(uri.getAuthority())
+                    || !DocumentsContract.isDocumentUri(context, uri)) return false;
+            boolean grant = context.getContentResolver().getPersistedUriPermissions().stream()
+                    .anyMatch(p -> p.isReadPermission() && uri.equals(p.getUri()));
+            if (!grant) return false;
+            String id = DocumentsContract.getDocumentId(uri);
+            if (!id.startsWith("primary:") || id.length() <= 8) return false;
+            File root = Environment.getExternalStorageDirectory().getCanonicalFile();
+            File document = new File(root, id.substring(8)).getCanonicalFile();
+            if (!document.getPath().startsWith(root.getPath() + File.separator)) return false;
+            try (ParcelFileDescriptor fd = context.getContentResolver().openFileDescriptor(uri, "r")) {
+                return false;
+            } catch (FileNotFoundException ex) {
+                return absentOnDisk(document);
+            }
+        } catch (IOException | RuntimeException ex) {
+            return false;
+        }
+    }
+
     boolean forgetIfMissing(String id) {
         synchronized (VideoLibrary.class) {
             Entry current = find(id);
-            if (current == null || !missingPublicFile(current)) return false;
-            forget(current);
-            return true;
+            if (current == null || !missingLocalFile(current)) return false;
+            return prefs.edit().remove("movie." + id).commit();
         }
     }
 
@@ -315,8 +395,12 @@ final class VideoLibrary {
         synchronized (VideoLibrary.class) {
             // Activity recreation can leave a list row referring to an old record.
             for (Entry current : all()) {
-                if (current.source.equals(movie.url)) { prior = current; break; }
+                if (current.source.equals(movie.url) && current.direct == movie.direct
+                        && (movie.direct || current.bytes == movie.bytes)) { prior = current; break; }
             }
+            if (prior != null) prior = find(prior.id);
+            if (prior != null && (!prior.source.equals(movie.url) || prior.direct != movie.direct
+                    || (!movie.direct && prior.bytes != movie.bytes))) prior = null;
             if (prior != null && !FAILED.equals(prior.state) && !missingPublicFile(prior)) return false;
             if (prior != null && !prior.publicDownload) removeTransfer(prior);
             Entry e = prior == null ? new Entry(UUID.randomUUID().toString()) : prior;
@@ -330,6 +414,7 @@ final class VideoLibrary {
             // so that a literal #, +, or % on the server also reaches the filesystem unchanged.
             String subPath = PUBLIC_FOLDER + "/" + Uri.encode(e.disk);
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(e.source)).setTitle(e.name)
+                    .addRequestHeader("Accept-Encoding", "identity")
                     .setDescription("Nice 视频 · Download/" + PUBLIC_FOLDER)
                     .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                     .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, subPath);
@@ -349,12 +434,24 @@ final class VideoLibrary {
         long bytes, total;
     }
 
-    private boolean containsVideo(ParcelFileDescriptor fd, String contentType) {
-        if (contentType != null) {
-            String mime = contentType.toLowerCase(Locale.ROOT);
-            if (mime.startsWith("text/html") || mime.contains("mpegurl") || mime.contains("dash+xml")
-                    || mime.startsWith("application/json") || mime.startsWith("application/xhtml")) return false;
-        }
+    static boolean invalidVideoPayload(ParcelFileDescriptor fd, String contentType) throws IOException {
+        String mime = contentType == null ? "" : contentType.toLowerCase(Locale.ROOT);
+        if (mime.startsWith("text/") || mime.contains("json") || mime.contains("mpegurl")
+                || mime.contains("dash+xml") || mime.contains("xhtml")) return true;
+        byte[] prefix = new byte[512];
+        try {
+            int n = Os.pread(fd.getFileDescriptor(), prefix, 0, prefix.length, 0);
+            if (n <= 0) return true;
+            String text = new String(prefix, 0, n, StandardCharsets.UTF_8).trim();
+            if (text.startsWith("\uFEFF")) text = text.substring(1).trim();
+            text = text.toLowerCase(Locale.ROOT);
+            return text.startsWith("#extm3u") || text.startsWith("[") || text.startsWith("{")
+                    || text.startsWith("<?xml") || text.startsWith("<mpd") || text.startsWith("<asx")
+                    || text.startsWith("<html") || text.startsWith("<!doctype");
+        } catch (ErrnoException ex) { throw new IOException("无法核对已下载的文件。", ex); }
+    }
+
+    private boolean containsVideo(ParcelFileDescriptor fd) {
         MediaExtractor extractor = new MediaExtractor();
         try {
             extractor.setDataSource(fd.getFileDescriptor());
@@ -403,7 +500,7 @@ final class VideoLibrary {
                 try (ParcelFileDescriptor fd = openDownload(e)) {
                     long size = fd.getStatSize();
                     String mime = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_MEDIA_TYPE));
-                    if (e.direct && !containsVideo(fd, mime)) {
+                    if (invalidVideoPayload(fd, mime) || (e.direct && !containsVideo(fd))) {
                         t.state = FAILED; t.label = "链接未返回可识别的视频文件";
                         manager().remove(e.job);
                     } else if (size > 0 && (expected < 0 || size == expected)) {

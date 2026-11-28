@@ -42,7 +42,7 @@ import static org.junit.Assert.*;
 @RunWith(AndroidJUnit4.class)
 @SdkSuppress(minSdkVersion = 29)
 public final class BatchDeleteDownloadsTest {
-    private static final String BUTTON = "一键删除已下载视频";
+    private static final String BUTTON = "批量删除本机副本";
     private final Instrumentation ins = InstrumentationRegistry.getInstrumentation();
     private final Context app = ins.getTargetContext();
     private final VideoLibrary library = new VideoLibrary(app);
@@ -170,6 +170,36 @@ public final class BatchDeleteDownloadsTest {
     private boolean exists(Uri row) {
         try (Cursor c = resolver.query(row, new String[]{"_id"}, null, null, null)) {
             return c != null && c.moveToFirst();
+        }
+    }
+
+    @Test public void localListAutomaticallyRemovesDeletedRecordsButPreservesExistingAndPending() throws Exception {
+        byte[] data = {1, 2, 3, 4};
+        VideoLibrary.Entry gone = migratedCopy("gone.mp4", data, "https://example.org/gone.mp4");
+        VideoLibrary.Entry kept = migratedCopy("kept.mp4", data, "https://example.org/kept.mp4");
+        VideoLibrary.Entry pending = migratedCopy("pending.mp4", data, "https://example.org/pending.mp4");
+        pending.state = VideoLibrary.TRANSFER;
+        library.saveCommitted(pending);
+        try {
+            assertEquals(1, resolver.delete(Uri.parse(gone.publicUri), null, null));
+            assertEquals(1, resolver.delete(Uri.parse(pending.publicUri), null, null));
+            assertFalse(library.forgetIfMissing(pending.id));
+            // Keep the deliberately incomplete record out of the activity's DownloadManager poll.
+            pending.state = VideoLibrary.FAILED;
+            library.saveCommitted(pending);
+            try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
+                await("Missing record should be pruned automatically", 15, () -> library.find(gone.id) == null);
+                assertNotNull(library.find(kept.id));
+                assertNotNull(library.find(pending.id));
+                assertArrayEquals(data, bytes(resolver.openInputStream(Uri.parse(kept.publicUri))));
+                assertEquals(1, resolver.delete(Uri.parse(kept.publicUri), null, null));
+                await("Foreground rescan should prune externally deleted file", 15, () -> library.find(kept.id) == null);
+            }
+        } finally {
+            library.forget(gone);
+            library.forget(kept);
+            library.forget(pending);
+            for (Uri row : publicRows) if (exists(row)) resolver.delete(row, null, null);
         }
     }
 

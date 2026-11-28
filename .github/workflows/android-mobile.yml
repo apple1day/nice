@@ -73,7 +73,7 @@ jobs:
           sdk="$ANDROID_HOME/build-tools/35.0.0"
           "$sdk/apksigner" verify --verbose --print-certs NiceVideos-Mobile.apk
           "$sdk/aapt" dump badging NiceVideos-Mobile.apk > "$RUNNER_TEMP/badging"
-          grep -F "package: name='$MOBILE_ID' versionCode='23' versionName='1.3.11'" "$RUNNER_TEMP/badging"
+          grep -F "package: name='$MOBILE_ID' versionCode='24' versionName='1.3.12'" "$RUNNER_TEMP/badging"
           if [[ "$MOBILE_ID" == com.anxiong.nicevideos.mobile ]]; then
             "$sdk/apksigner" verify --print-certs NiceVideos-Mobile.apk | grep -F 'certificate SHA-256 digest: 94b219553d6b9f07108b25d9be09764e94445e9f140200635e33ba7626f6a21b'
           fi
@@ -142,7 +142,7 @@ jobs:
           sdk="$ANDROID_HOME/build-tools/35.0.0"
           "$sdk/zipalign" -c -P 16 4 "$kit/payload.apk"
           "$sdk/aapt" dump badging "$kit/payload.apk" > "$RUNNER_TEMP/payload.badging"
-          grep -F "package: name='com.anxiong.nicevideos.mobile' versionCode='23' versionName='1.3.11'" "$RUNNER_TEMP/payload.badging"
+          grep -F "package: name='com.anxiong.nicevideos.mobile' versionCode='24' versionName='1.3.12'" "$RUNNER_TEMP/payload.badging"
           cp "$sdk/lib/apksigner.jar" "$kit/apksigner.jar"
           cp tools/sign_mobile_update.command "$kit/更新安装包.command"
           tmpgo=$(mktemp -d)
