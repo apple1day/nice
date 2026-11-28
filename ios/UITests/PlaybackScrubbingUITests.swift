@@ -35,9 +35,7 @@ import XCTest
     }
 
     func testPausedPlaybackRemainsPausedAfterDragging() throws {
-        try ensureControlsVisible()
-        element("togglePlaybackButton").tap()
-        waitUntil("Pause should reach the playback model") {
+        tapTransport("togglePlaybackButton", expecting: "Pause should reach the playback model") {
             self.element("uiTestPlaybackPhase").label == "paused"
         }
         let target = try dragProgress(from: 0.30, to: 0.62, phase: "paused")
@@ -46,9 +44,7 @@ import XCTest
     }
 
     func testSBSFormatSwitchKeepsPausedPositionAndExitsFullscreen() throws {
-        try ensureControlsVisible()
-        element("togglePlaybackButton").tap()
-        waitUntil("Pause before changing the video format") {
+        tapTransport("togglePlaybackButton", expecting: "Pause before changing the video format") {
             self.element("uiTestPlaybackPhase").label == "paused"
         }
         let pausedAt = try number("uiTestPlaybackSeconds")
@@ -74,10 +70,9 @@ import XCTest
     }
 
     func testFullscreenLandscapeAndNextVideoKeepDraggingAvailable() throws {
-        try ensureControlsVisible()
-        element("toggleFullscreenButton").tap()
-        waitUntil("The production player should enter fullscreen") {
-            self.element("toggleFullscreenButton").value as? String == "全屏"
+        let fullscreen = app.buttons["toggleFullscreenButton"]
+        tapTransport("toggleFullscreenButton", expecting: "The production player should enter fullscreen") {
+            fullscreen.exists && fullscreen.value as? String == "全屏"
         }
         _ = try dragProgress(from: 0.32, to: 0.68, phase: "playing")
 
@@ -159,6 +154,32 @@ import XCTest
         XCTAssertTrue(snapshot.isEnabled, "Visible progress is disabled: \(snapshot.dictionaryRepresentation)",
                       file: file, line: line)
         return snapshot.frame
+    }
+
+    private func tapTransport(_ identifier: String, expecting message: String,
+                              file: StaticString = #filePath, line: UInt = #line,
+                              _ completed: @escaping () -> Bool) {
+        let surface = element("playbackSurfaceToggle")
+        let button = app.buttons[identifier]
+        let bounds = app.frame
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        for _ in 0..<3 {
+            if completed() { return }
+            // Renew the four-second overlay deadline, then take one snapshot
+            // of this button. Resolving a separate slider first can use up
+            // the entire deadline on a busy simulator.
+            surface.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.95)).tap()
+            guard button.exists, let snapshot = try? button.snapshot(), snapshot.isEnabled else { continue }
+            let frame = snapshot.frame
+            guard !frame.isEmpty, frame.midX.isFinite, frame.midY.isFinite,
+                  bounds.contains(CGPoint(x: frame.midX, y: frame.midY)) else { continue }
+            // Use the observed screen point directly. XCUIElement.tap() would
+            // ask AX to calculate a hit point again on a disappearing element.
+            origin.withOffset(CGVector(dx: frame.midX - bounds.minX, dy: frame.midY - bounds.minY)).tap()
+            let result = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in completed() }, object: nil)
+            if XCTWaiter.wait(for: [result], timeout: 2) == .completed { return }
+        }
+        waitUntil(message, file: file, line: line, completed)
     }
 
     private func element(_ identifier: String) -> XCUIElement {

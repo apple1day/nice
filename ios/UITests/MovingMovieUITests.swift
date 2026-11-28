@@ -51,26 +51,40 @@ final class MovingMovieUITests: XCTestCase {
 
     func testSystemPlayerShowsChanging4KHEVCSamplesBeyond4GiBInOrdinaryAndVR() throws {
         XCUIDevice.shared.orientation = .landscapeLeft
-        let app = try launchMovie("moving4k-index", fileExtension: "bin", samples: "moving4k-samples")
+        let app = try launchMovie("moving4k-index", fileExtension: "bin", samples: "moving4k-samples", extendedControls: true)
         defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
 
         let surface = app.descendants(matching: .any)["playbackSurfaceToggle"]
         try require(surface.waitForExistence(timeout: 15), app.debugDescription)
         let format = app.buttons["videoFormatButton"]
+        func tapControl(_ button: XCUIElement, until result: @escaping () -> Bool) throws {
+            for _ in 0..<3 {
+                if result() { return }
+                // A hidden SwiftUI control can still appear in an AX snapshot.
+                // Give the transport a fresh visible interval before touching it.
+                revealControls(surface)
+                guard button.waitForExistence(timeout: 2) else { continue }
+                button.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+                let changed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in result() }, object: nil)
+                if XCTWaiter.wait(for: [changed], timeout: 3) == .completed { return }
+            }
+            throw MotionFailure("Control action did not take effect: " + button.debugDescription)
+        }
+        func checkMotion(_ mode: String) throws {
+            if format.exists {
+                surface.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.23)).tap()
+            }
+            try assertChangingEyes(in: app, surface: surface, mode: mode)
+        }
         let systemRoute = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "当前解码：系统播放器")).firstMatch
-        try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC ordinary")
-        revealControls(surface)
-        app.buttons["ordinaryPlaybackOptions"].tap()
-        try require(systemRoute.exists, app.debugDescription)
+        try checkMotion("4K HEVC ordinary")
+        try tapControl(app.buttons["ordinaryPlaybackOptions"]) { systemRoute.exists }
         app.buttons.matching(NSPredicate(format: "label IN %@", ["取消", "Cancel"])).firstMatch.tap()
-        revealControls(surface)
-        format.tap()
+        try tapControl(format) { format.exists && format.value as? String == "360° · 左右 SBS · 双眼" }
 
-        try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC full SBS")
-        revealControls(surface)
-        format.tap()
+        try checkMotion("4K HEVC full SBS")
         let settings = app.navigationBars["VR 设置"]
-        try require(settings.waitForExistence(timeout: 5), app.debugDescription)
+        try tapControl(format) { settings.exists }
         let decoder = app.descendants(matching: .any)["vrCurrentDecoder"]
         for _ in 0..<6 {
             if decoder.exists && decoder.isHittable { break }
@@ -82,18 +96,13 @@ final class MovingMovieUITests: XCTestCase {
         settings.buttons["完成"].tap()
         let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: settings)
         try require(XCTWaiter.wait(for: [dismissed], timeout: 5) == .completed, app.debugDescription)
-        revealControls(surface)
         let exit = app.buttons["toggleFullscreenButton"]
-        let canExit = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND hittable == true AND label == %@", "退出全屏"), object: exit)
-        try require(XCTWaiter.wait(for: [canExit], timeout: 5) == .completed, app.debugDescription)
-        exit.tap()
-        revealControls(surface)
-        let ordinary = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "普通播放"), object: format)
-        try require(XCTWaiter.wait(for: [ordinary], timeout: 5) == .completed, app.debugDescription)
+        try tapControl(exit) { format.exists && format.value as? String == "普通播放" }
         let transport = app.buttons["togglePlaybackButton"]
-        if transport.label == "播放" { transport.tap() }
-        try assertChangingEyes(in: app, surface: surface, mode: "4K HEVC after leaving VR")
+        if transport.label == "播放" {
+            try tapControl(transport) { transport.label == "暂停" }
+        }
+        try checkMotion("4K HEVC after leaving VR")
     }
 
     func testPickedPanoramaCanLookAroundRecenterAndPlayInBothEyes() throws {
@@ -176,7 +185,7 @@ final class MovingMovieUITests: XCTestCase {
     }
 
     private func launchMovie(_ resource: String, fileExtension: String, samples: String? = nil,
-                             resume360: Bool = false) throws -> XCUIApplication {
+                             resume360: Bool = false, extendedControls: Bool = false) throws -> XCUIApplication {
         let bundle = Bundle(for: Self.self)
         func encoded(_ name: String) throws -> String {
             let url = try XCTUnwrap(bundle.url(forResource: name, withExtension: fileExtension))
@@ -186,6 +195,7 @@ final class MovingMovieUITests: XCTestCase {
         }
         let app = XCUIApplication()
         app.launchArguments = ["--ui-test-moving-video"]
+        if extendedControls { app.launchArguments.append("--ui-test-extended-control-time") }
         if resume360 { app.launchEnvironment["NICE_UI_TEST_RESUME_360"] = "1" }
         app.launchEnvironment["NICE_UI_TEST_MOVIE"] = try encoded(resource)
         if let samples { app.launchEnvironment["NICE_UI_TEST_SAMPLES"] = try encoded(samples) }

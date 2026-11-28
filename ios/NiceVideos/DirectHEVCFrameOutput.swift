@@ -1,6 +1,25 @@
 import AVFoundation
 import UIKit
 
+// Display ticks and completions run on the main queue. Keep one pending
+// request, so a decode that finishes just after vsync can start its successor
+// immediately with the current audio time.
+enum DirectHEVCReadDemand {
+    case idle, reading, readingWithPendingTick
+
+    mutating func beginRead() -> Bool {
+        let idle = self == .idle
+        self = idle ? .reading : .readingWithPendingTick
+        return idle
+    }
+
+    mutating func finishRead() -> Bool {
+        let pending = self == .readingWithPendingTick
+        self = .idle
+        return pending
+    }
+}
+
 /// The AVPlayer audio item owns seeking and playback time. The serial reader
 /// decodes references in DTS order; the renderer receives only pictures due now.
 final class DirectHEVCFrameOutput: NSObject {
@@ -13,7 +32,7 @@ final class DirectHEVCFrameOutput: NSObject {
     private let deliver: (CVPixelBuffer, Double) -> Void
     private let fail: (String) -> Void
     private var displayLink: CADisplayLink?
-    private var busy = false
+    private var demand = DirectHEVCReadDemand.idle
     private var generation = 0
     private var checkpoint: (seconds: Double, frames: Int)?
     private var noProgressSince: CFTimeInterval?
@@ -97,15 +116,19 @@ final class DirectHEVCFrameOutput: NSObject {
             suspendWatch()
             if hasFrame { return }
         }
-        guard !busy else { return }
-        busy = true
+        guard demand.beginRead() else { return }
         let request = generation
         queue.async { [weak self, reader] in
             let picture = reader.copyPicture(at: t.seconds)
             let error = reader.error
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.busy = false
+                let readAgain = self.demand.finishRead()
+                defer {
+                    // Recheck play/pause, visibility and the audio clock after
+                    // delivery. Never restart an old seek or a failed output.
+                    if readAgain, self.displayLink != nil, self.generation == request { self.tick() }
+                }
                 guard self.displayLink != nil, self.generation == request else { return }
                 if let error {
                     self.stop()

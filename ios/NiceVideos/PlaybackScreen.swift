@@ -459,6 +459,13 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     init(playlist: PlaylistPlaybackModel, model: PlaybackModel) {
         self.playlist = playlist
         self.model = model
+        #if DEBUG
+        // The large-file simulator test samples live pixels and inspects the
+        // decoder between gestures. Leave enough time for its AX round trips.
+        if ProcessInfo.processInfo.arguments.contains("--ui-test-extended-control-time") {
+            _controls = State(initialValue: PlaybackControlsState(hideDelay: 60))
+        }
+        #endif
         let request = playlist.current
         let afterglow = request.startMode == .afterglow
         let profile: VRMoviePreferences
