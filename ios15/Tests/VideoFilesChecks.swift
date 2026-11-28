@@ -35,7 +35,8 @@ struct VideoFilesChecks {
         try expect(try Data(contentsOf: item.url) == binary, "download installation")
         try expect(try await files.existing(entry) == item, "installed size lookup")
         try expect(try await files.verified(entry), "complete binary file")
-        try expect(try await files.scan() == [item], "scan discovers installed file")
+        let scanned = try await files.scan()
+        try expect(scanned == [item], "scan discovers installed file: expected \(item), found \(scanned)")
 
         let unsupportedData = Data("#EXTM3U".utf8) + Data(repeating: 32, count: 17)
         try unsupportedData.write(to: item.url)

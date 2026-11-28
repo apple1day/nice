@@ -25,10 +25,12 @@ jobs:
           xcrun swiftc -target "$(uname -m)-apple-macosx13.0" -parse-as-library Sources/VideoFiles.swift Tests/VideoFilesChecks.swift -o "$RUNNER_TEMP/video-files-checks"
           "$RUNNER_TEMP/video-files-checks"
       - name: Check download index, storage totals and saved marks
+        if: ${{ !cancelled() }}
         run: |
           xcrun swiftc -target "$(uname -m)-apple-macosx13.0" -parse-as-library Sources/VideoFiles.swift Sources/VideoStore.swift Tests/VideoStateChecks.swift -o "$RUNNER_TEMP/video-state-checks"
           "$RUNNER_TEMP/video-state-checks"
       - name: Build Release for iPhone with the iOS 15 deployment target
+        if: ${{ !cancelled() }}
         run: |
           command -v xcodegen >/dev/null || brew install xcodegen
           xcodegen generate

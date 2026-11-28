@@ -87,7 +87,10 @@ actor VideoFiles {
                 let values = try url.resourceValues(forKeys: keys)
                 guard values.isRegularFile == true, values.isSymbolicLink != true,
                       let size = values.fileSize else { return nil }
-                return LocalVideo(url: url, size: Int64(size))
+                // Directory enumeration can return base-relative URLs or expand /var to /private/var.
+                // Construct list identities the same way as freshly installed downloads.
+                let file = folder.appendingPathComponent(url.lastPathComponent, isDirectory: false)
+                return LocalVideo(url: file, size: Int64(size))
             } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
                 return nil // A Files app edit may race the directory enumeration.
             }
