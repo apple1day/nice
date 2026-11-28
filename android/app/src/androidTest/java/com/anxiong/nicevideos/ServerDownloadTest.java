@@ -51,6 +51,7 @@ public final class ServerDownloadTest {
         final Thread worker;
         final byte[] media;
         final List<String> deletes = new CopyOnWriteArrayList<>();
+        final List<String> transferEvents = new CopyOnWriteArrayList<>();
         volatile int listedSize;
         volatile Exception failure;
         volatile boolean downloaded, rejectDeletion, removed;
@@ -99,6 +100,7 @@ public final class ServerDownloadTest {
                         if (delete) {
                             String target = path.substring("/api/videos/".length());
                             deletes.add(target);
+                            transferEvents.add("DELETE " + target);
                             if (!rejectDeletion && NAME.equals(target)) removed = true;
                         }
                         byte[] response = list ? index() : movie ? (path.endsWith(NAME)
@@ -112,7 +114,10 @@ public final class ServerDownloadTest {
                         out.write(headers.getBytes(StandardCharsets.US_ASCII));
                         if (!"HEAD".equals(request[0])) out.write(response);
                         out.flush();
-                        if (movie && "GET".equals(request[0])) downloaded = true;
+                        if (movie && "GET".equals(request[0])) {
+                            downloaded = true;
+                            transferEvents.add("GET " + path.substring("/api/download/".length()));
+                        }
                     }
                 }
             } catch (Exception ex) { if (!socket.isClosed()) failure = ex; }
@@ -215,6 +220,36 @@ public final class ServerDownloadTest {
                 assertEquals(1, newVersions);
                 assertEquals(1, otherMovies);
                 assertTrue(server.deletes.isEmpty());
+            } finally {
+                for (VideoLibrary.Entry e : library.all()) if (e.source.startsWith(base + "/")) library.remove(e);
+                library.prefs.edit().putString("server", previous).commit();
+            }
+        }
+    }
+
+    @Test @SdkSuppress(minSdkVersion = 29)
+    public void oneTapDownloadsAndDeletesEachMovieBeforeStartingTheNext() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        VideoLibrary library = new VideoLibrary(context);
+        String previous = library.prefs.getString("server", null);
+        try (LocalServer server = new LocalServer()) {
+            String base = server.address();
+            library.prefs.edit().putString("server", base).commit();
+            try (ActivityScenario<MainActivity> app = ActivityScenario.launch(MainActivity.class)) {
+                click(app, "服务器");
+                click(app, "一键下载然后删除远程视频");
+                await("Both originals should be deleted", 90, () -> server.deletes.size() == 2);
+                assertEquals(Arrays.asList("GET " + NAME, "DELETE " + NAME,
+                        "GET " + REMOTE_ONLY, "DELETE " + REMOTE_ONLY), server.transferEvents);
+                for (VideoLibrary.Entry e : library.all()) {
+                    if (!e.source.startsWith(base + "/")) continue;
+                    assertEquals(VideoLibrary.READY, e.state);
+                    try (android.os.ParcelFileDescriptor fd = library.openMovie(e)) {
+                        assertEquals(server.media.length, fd.getStatSize());
+                    }
+                }
+                assertEquals(2, library.all().stream().filter(e -> e.source.startsWith(base + "/")
+                        && VideoLibrary.READY.equals(e.state)).count());
             } finally {
                 for (VideoLibrary.Entry e : library.all()) if (e.source.startsWith(base + "/")) library.remove(e);
                 library.prefs.edit().putString("server", previous).commit();

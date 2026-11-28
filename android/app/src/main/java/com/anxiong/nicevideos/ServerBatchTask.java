@@ -16,18 +16,29 @@ final class ServerBatchTask {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile int generation;
-    private boolean running;
+    private boolean running, moving;
+    private volatile boolean stopRequested;
     private String server = "", status = "";
     private Listener listener;
 
     ServerBatchTask(VideoLibrary library) { this.library = library; }
     void listen(Listener listener) { this.listener = listener; }
     boolean running() { return running; }
+    boolean moving() { return moving; }
+    boolean stopping() { return moving && stopRequested; }
+    void stopMove() {
+        if (!moving || stopRequested) return;
+        stopRequested = true;
+        status = "正在停止：已交给系统的下载可继续，停止后不再自动删除。";
+        if (listener != null) listener.changed(false);
+    }
     String status(String base) { return server.equals(base) ? status : ""; }
 
     void serverChanged() {
         generation++;
         running = false;
+        moving = false;
+        stopRequested = true;
         status = "";
     }
 
@@ -55,6 +66,21 @@ final class ServerBatchTask {
                 current -> DownloadedServerDeletion.run(plan, library, current).summary());
     }
 
+    void move(String base, List<ServerVideos.Movie> movies) {
+        if (running || !base.equals(library.serverAddress())) return;
+        moving = true;
+        stopRequested = false;
+        final int ticket = generation + 1;
+        start(base, "准备逐部下载并删除…", true, current ->
+                new DownloadThenDelete(library).run(base, movies,
+                        () -> current.getAsBoolean() && !stopRequested,
+                        (message, refresh) -> main.post(() -> {
+                            if (generation != ticket || !moving || stopRequested) return;
+                            status = message;
+                            if (listener != null) listener.changed(refresh);
+                        })));
+    }
+
     private void start(String base, String message, boolean refresh, Function<BooleanSupplier, String> action) {
         if (running || !base.equals(library.serverAddress())) return;
         int ticket = ++generation;
@@ -71,6 +97,7 @@ final class ServerBatchTask {
             main.post(() -> {
                 if (generation != ticket) return;
                 running = false;
+                moving = false;
                 status = finalStatus;
                 if (listener != null) listener.changed(refresh);
             });
