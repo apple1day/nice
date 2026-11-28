@@ -57,15 +57,18 @@ final class MovingMovieUITests: XCTestCase {
         let surface = app.descendants(matching: .any)["playbackSurfaceToggle"]
         try require(surface.waitForExistence(timeout: 15), app.debugDescription)
         let format = app.buttons["videoFormatButton"]
-        func tapVisibleControl(_ button: XCUIElement) throws {
-            if !button.exists { revealControls(surface) }
-            try require(button.waitForExistence(timeout: 5), "Missing control: " + button.debugDescription)
-            let frame = try button.snapshot().frame
-            let bounds = app.frame
-            let center = CGPoint(x: frame.midX, y: frame.midY)
-            try require(!frame.isEmpty && bounds.contains(center), "Offscreen control: " + button.debugDescription)
-            app.coordinate(withNormalizedOffset: .zero)
-                .withOffset(CGVector(dx: center.x - bounds.minX, dy: center.y - bounds.minY)).tap()
+        func tapControl(_ button: XCUIElement, until result: @escaping () -> Bool) throws {
+            for _ in 0..<3 {
+                if result() { return }
+                // A hidden SwiftUI control can still appear in an AX snapshot.
+                // Give the transport a fresh visible interval before touching it.
+                revealControls(surface)
+                guard button.waitForExistence(timeout: 2) else { continue }
+                button.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+                let changed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in result() }, object: nil)
+                if XCTWaiter.wait(for: [changed], timeout: 3) == .completed { return }
+            }
+            throw MotionFailure("Control action did not take effect: " + button.debugDescription)
         }
         func checkMotion(_ mode: String) throws {
             if format.exists {
@@ -75,15 +78,13 @@ final class MovingMovieUITests: XCTestCase {
         }
         let systemRoute = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "当前解码：系统播放器")).firstMatch
         try checkMotion("4K HEVC ordinary")
-        try tapVisibleControl(app.buttons["ordinaryPlaybackOptions"])
-        try require(systemRoute.exists, app.debugDescription)
+        try tapControl(app.buttons["ordinaryPlaybackOptions"]) { systemRoute.exists }
         app.buttons.matching(NSPredicate(format: "label IN %@", ["取消", "Cancel"])).firstMatch.tap()
-        try tapVisibleControl(format)
+        try tapControl(format) { format.exists && format.value as? String == "360° · 左右 SBS · 双眼" }
 
         try checkMotion("4K HEVC full SBS")
-        try tapVisibleControl(format)
         let settings = app.navigationBars["VR 设置"]
-        try require(settings.waitForExistence(timeout: 5), app.debugDescription)
+        try tapControl(format) { settings.exists }
         let decoder = app.descendants(matching: .any)["vrCurrentDecoder"]
         for _ in 0..<6 {
             if decoder.exists && decoder.isHittable { break }
@@ -96,14 +97,11 @@ final class MovingMovieUITests: XCTestCase {
         let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: settings)
         try require(XCTWaiter.wait(for: [dismissed], timeout: 5) == .completed, app.debugDescription)
         let exit = app.buttons["toggleFullscreenButton"]
-        let canExit = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND hittable == true AND label == %@", "退出全屏"), object: exit)
-        try require(XCTWaiter.wait(for: [canExit], timeout: 5) == .completed, app.debugDescription)
-        try tapVisibleControl(exit)
-        let ordinary = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "普通播放"), object: format)
-        try require(XCTWaiter.wait(for: [ordinary], timeout: 5) == .completed, app.debugDescription)
+        try tapControl(exit) { format.exists && format.value as? String == "普通播放" }
         let transport = app.buttons["togglePlaybackButton"]
-        if transport.label == "播放" { try tapVisibleControl(transport) }
+        if transport.label == "播放" {
+            try tapControl(transport) { transport.label == "暂停" }
+        }
         try checkMotion("4K HEVC after leaving VR")
     }
 
