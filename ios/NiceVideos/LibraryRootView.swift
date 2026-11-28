@@ -2,7 +2,7 @@ import SwiftUI
 import Combine
 
 // Presentation changes are infrequent. Download progress must not invalidate the
-// entire tab hierarchy, and foreground activation must not scan the media folder.
+// entire tab hierarchy. File availability is refreshed separately on activation.
 private final class LibraryPresentationModel: ObservableObject {
     @Published private(set) var playback: PlaybackRequest?
     @Published private(set) var errorMessage: String?
@@ -16,6 +16,7 @@ private final class LibraryPresentationModel: ObservableObject {
 }
 
 struct LibraryRootView: View {
+    @Environment(\.scenePhase) private var scenePhase
     let store: VideoStore
     @StateObject private var presentation: LibraryPresentationModel
     init(store: VideoStore) {
@@ -29,6 +30,16 @@ struct LibraryRootView: View {
                     .safeAreaInset(edge: .top, spacing: 0) { SigningExpiryBanner() }
             }
                 .tabItem { Label("本地", systemImage: "internaldrive") }
+            NavigationStack {
+                VRFolderTab { file, startMode in
+                    do { try store.playPickedFile(file, startMode: startMode) }
+                    catch { store.errorMessage = error.localizedDescription }
+                }
+            }
+                .toolbarBackground(Color(red: 0.05, green: 0.05, blue: 0.06), for: .tabBar)
+                .toolbarBackground(.visible, for: .tabBar)
+                .toolbarColorScheme(.dark, for: .tabBar)
+                .tabItem { Label("VR", systemImage: "eyeglasses").accessibilityIdentifier("vrFolderTab") }
             NavigationStack { ServerCatalogView() }
                 .tabItem { Label("服务器", systemImage: "server.rack") }
             NavigationStack { TransfersView() }
@@ -38,10 +49,13 @@ struct LibraryRootView: View {
             NavigationStack { SettingsView() }
                 .tabItem { Label("设置", systemImage: "gearshape") }
         }
+        .task(id: scenePhase) {
+            if scenePhase == .active { await store.refreshDownloadedFiles() }
+        }
         .background { SigningLifecycleView() }
         .fullScreenCover(item: Binding(
             get: { presentation.playback }, set: { store.playback = $0 }
-        )) { request in
+        ), onDismiss: store.openQueuedCompatibleCopy) { request in
             PlaybackScreen(request: request).environmentObject(store)
         }
         .alert("提示", isPresented: Binding(

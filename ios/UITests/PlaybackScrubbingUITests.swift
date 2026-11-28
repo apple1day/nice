@@ -45,6 +45,34 @@ import XCTest
         XCTAssertEqual(element("uiTestPlaybackPhase").label, "paused")
     }
 
+    func testSBSFormatSwitchKeepsPausedPositionAndExitsFullscreen() throws {
+        try ensureControlsVisible()
+        element("togglePlaybackButton").tap()
+        waitUntil("Pause before changing the video format") {
+            self.element("uiTestPlaybackPhase").label == "paused"
+        }
+        let pausedAt = try number("uiTestPlaybackSeconds")
+        let formats = element("videoFormatButton")
+        let fullscreen = element("toggleFullscreenButton")
+        XCTAssertEqual(formats.value as? String, "普通播放")
+        formats.tap()
+        waitUntil("VR enters the fixed stereo panorama without restarting playback") {
+            formats.value as? String == "360° · 左右 SBS · 双眼" && fullscreen.value as? String == "全屏"
+        }
+        XCTAssertEqual(element("uiTestPlaybackPhase").label, "paused")
+        XCTAssertEqual(try number("uiTestPlaybackSeconds"), pausedAt, accuracy: 0.01)
+        formats.tap()
+        app.buttons["exitPanoramaVR"].tap()
+        waitUntil("Leaving VR restores ordinary playback") {
+            formats.value as? String == "普通播放" && fullscreen.value as? String == "普通"
+        }
+        XCTAssertEqual(element("uiTestPlaybackPhase").label, "paused")
+        XCTAssertEqual(try number("uiTestPlaybackSeconds"), pausedAt, accuracy: 0.01)
+        XCTAssertEqual(try integer("uiTestAttachCount"), 1)
+        XCTAssertEqual(try integer("uiTestLoadCount"), 1)
+        XCTAssertEqual(try integer("uiTestStopCount"), 0)
+    }
+
     func testFullscreenLandscapeAndNextVideoKeepDraggingAvailable() throws {
         try ensureControlsVisible()
         element("toggleFullscreenButton").tap()

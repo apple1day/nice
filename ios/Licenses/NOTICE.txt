@@ -15,3 +15,17 @@ into this folder, which is bundled in the application and readable offline.
 本项目没有复制 VLC for iOS 的应用界面代码。
 发布/分发前必须完成所选库和底层依赖的许可合规检查，包括适用的源码及重链接义务；
 仅展示此通知不能替代相应义务。当前交付是待真机验收的开发版本，不是 App Store 发布包。
+
+Google Cardboard SDK v1.36.0 — Copyright 2019 Google LLC, Apache License 2.0.
+NiceVideos includes the unmodified sdk/polynomial_radial_distortion.h and .cc.
+The fixed viewer uses the radial coefficients from sdk/qrcode/cardboard_v1/cardboard_v1.h.
+Source: https://github.com/googlevr/cardboard/tree/8bd424da7f1e399255a1b6e7c02be8e281ecc974
+License: Google-Cardboard-LICENSE.txt
+
+Afterglow / Afterglow XR — Afterglow contributors, Apache License 2.0.
+Upstream packed-movie player:
+https://github.com/blaineam/Afterglow/blob/fac3236d61b3196846c63fc4bcc4188da4691142/app/Afterglow/Media/VideoPlayer.swift
+NiceVideos adapts the file movie output and display-time frame pull in
+AfterglowMovieOutput.swift. Local range reading, bounded SDR/BGRA surfaces,
+playback recovery, projections and stereo display are integrated with NiceVideos.
+License: Afterglow-LICENSE.txt

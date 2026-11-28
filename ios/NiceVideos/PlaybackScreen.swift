@@ -2,14 +2,28 @@ import SwiftUI
 import AVFoundation
 import UIKit
 import Combine
+import Observation
+
+// Only views displaying elapsed time subscribe to clock ticks. Transport buttons
+// read the same current position when tapped without invalidating the video surface.
+@Observable private final class PlaybackClock {
+    var seconds: Double = 0
+}
 
 // Main-queue confined. The engine is injected in lifecycle tests, not mocked via VLC internals.
 final class PlaybackModel: ObservableObject {
     @Published private(set) var phase: PlaybackPhase = .idle
-    @Published private(set) var seconds: Double = 0
+    private let clock = PlaybackClock()
+    private(set) var seconds: Double {
+        get { clock.seconds }
+        set { clock.seconds = newValue }
+    }
     @Published private(set) var duration: Double = 0
     @Published private(set) var seekable = false
+    @Published private(set) var videoOutput: MovieOutput?
+    @Published private(set) var videoDetails: String?
     @Published private(set) var message: String?
+    @Published private(set) var suggestsCompatibleCopy = false
     var onPlaybackEnded: (() -> Void)?
     private let request: PlaybackRequest
     private let engine: LocalPlaybackEngine
@@ -18,6 +32,7 @@ final class PlaybackModel: ObservableObject {
     private var started = false
     private var pauseRequested = false
     private var closed = false
+    private var copyingDiagnostics = false
     private var reportedPlaybackEnd = false
     private var pendingPlaybackEnd: UUID?
     private var rearmPlaybackEndOnPlaying = false
@@ -33,7 +48,7 @@ final class PlaybackModel: ObservableObject {
     init(request: PlaybackRequest, engine: LocalPlaybackEngine? = nil,
          defaults: UserDefaults = .standard, manageAudioSession: Bool = true) {
         self.request = request
-        self.engine = engine ?? VLCPlaybackEngine()
+        self.engine = engine ?? SBSPlaybackEngine(pickedFile: request.pickedFile)
         self.defaults = defaults
         self.manageAudioSession = manageAudioSession
         self.engine.onUpdate = { [weak self] snapshot in self?.receive(snapshot) }
@@ -90,8 +105,8 @@ final class PlaybackModel: ObservableObject {
                 if pendingRestartSeek == nil { seconds = 0 }
                 restoredPosition = true
                 phase = .opening
-                // VLCKit 3.7.3 play() alone retains an EOF input. Replacing only
-                // its media reopens this local file without replacing the view.
+                // VLCKit 3.7.3 play() alone retains an EOF input. Reload the
+                // file on the existing playback surface before resuming.
                 try engine.load(fileURL: request.url)
             }
             engine.play()
@@ -148,8 +163,30 @@ final class PlaybackModel: ObservableObject {
         }
         savePosition()
     }
+    @MainActor func copyPlaybackDiagnostics() async -> Bool {
+        guard !closed, !copyingDiagnostics, let reporting = engine as? PlaybackDiagnosticReporting else { return false }
+        copyingDiagnostics = true
+        defer { copyingDiagnostics = false }
+        guard let report = await reporting.capturePlaybackDiagnosticReport(), !closed else { return false }
+        UIPasteboard.general.string = report
+        UIAccessibility.post(notification: .announcement, argument: "播放诊断已复制")
+        return true
+    }
+
+    @MainActor func prepareOutputChange(to output: MovieOutput, retry: Bool = true) {
+        if phase == .failed {
+            message = nil
+            phase = .opening
+        }
+        guard retry else { return }
+        if output == .system { (engine as? SystemOutputRetrying)?.retrySystemOutput() }
+        if output == .afterglow { (engine as? SystemOutputRetrying)?.retryAfterglowOutput() }
+    }
+
     private func receive(_ snapshot: PlaybackSnapshot) {
         guard !closed, phase != .failed else { return }
+        if let output = snapshot.videoOutput, videoOutput != output { videoOutput = output }
+        if let details = snapshot.videoDetails, videoDetails != details { videoDetails = details }
         // Native stop notifications may follow EOF. Preserve the terminal state
         // and cleared bookmark until an explicit replay or seek actually starts.
         if playbackInputEnded || pendingRestartSeek != nil, snapshot.phase == .idle { return }
@@ -187,6 +224,7 @@ final class PlaybackModel: ObservableObject {
         if duration != nextDuration { duration = nextDuration }
         if seekable != nextSeekable { seekable = nextSeekable }
         if message != snapshot.error { message = snapshot.error }
+        if suggestsCompatibleCopy != snapshot.suggestsCompatibleCopy { suggestsCompatibleCopy = snapshot.suggestsCompatibleCopy }
         if manageAudioSession {
             let disabled = phase == .playing ? true : previousIdleTimer
             if UIApplication.shared.isIdleTimerDisabled != disabled {
@@ -272,19 +310,40 @@ final class PlaybackModel: ObservableObject {
     }
 }
 
-private struct VLCVideoSurface: UIViewRepresentable {
+private struct MovieVideoSurface: UIViewRepresentable {
     let model: PlaybackModel
-    func makeCoordinator() -> PlaybackModel { model }
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
-        view.backgroundColor = .black
-        DispatchQueue.main.async { [weak model, weak view] in
-            if let view = view { model?.attach(to: view) }
+    let mode: SBSDisplayMode
+    let standardOutput: MovieOutput
+    let decoderPolicy: VLCDecoderPolicy
+    let camera: VRGestureCamera
+    let followHead: Bool
+    let wakeGesture: VRWakeGesture
+    let nativeResolution: Bool
+    let renderScalePercent: Int?
+    let targetFrameRate: Int
+
+    @MainActor private func configure(_ view: SBSPlaybackView) {
+        view.configure(mode: mode, standardOutput: standardOutput, decoderPolicy: decoderPolicy)
+        if let renderer = view.renderer {
+            if renderer.nativeResolution != nativeResolution { renderer.nativeResolution = nativeResolution }
+            if renderer.renderScalePercent != renderScalePercent { renderer.renderScalePercent = renderScalePercent }
+            if renderer.targetFrameRate != targetFrameRate { renderer.targetFrameRate = targetFrameRate }
         }
+        if case .immersive = mode { camera.connect(to: view.renderer, followHead: followHead, wake: wakeGesture) }
+        else { camera.connect(to: nil, followHead: false) }
+    }
+    func makeCoordinator() -> PlaybackModel { model }
+    func makeUIView(context: Context) -> SBSPlaybackView {
+        let view = SBSPlaybackView(frame: .zero)
+        configure(view)
+        view.startPlaybackWhenReady { [weak model] view in model?.attach(to: view) }
         return view
     }
-    func updateUIView(_ view: UIView, context: Context) {}
-    static func dismantleUIView(_ view: UIView, coordinator: PlaybackModel) { coordinator.close() }
+    func updateUIView(_ view: SBSPlaybackView, context: Context) { configure(view) }
+    static func dismantleUIView(_ view: SBSPlaybackView, coordinator: PlaybackModel) {
+        view.cancelPendingStart()
+        coordinator.close()
+    }
 }
 
 // Draft changes stay in this small view, without store/playlist traversal or
@@ -375,11 +434,62 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     // to cancel the current native tracking session synchronously before actions.
     @State private var scrubber = PlaybackScrubController()
     @State private var showsPlaylist = false
+    @State private var showsPlaybackOptions = false
+    @State private var diagnosticCopyNotice: UUID?
+    @State private var showsVRSettings = false
+    @State private var showsCompatiblePicker = false
+    @State private var compatibleSelection: PickedVideoFile.Selection?
+    @State private var preparingCompatibleCopy: Task<Void, Never>?
+    @State private var resumeAfterCopyPicker = false
+    @StateObject private var camera: VRGestureCamera
+    @State private var vrProfile: VRMoviePreferences
+    @AppStorage("vr.viewer.gyro") private var followHead = false
+    @AppStorage("vr.viewer.nativeResolution") private var nativeResolution = false
+    @AppStorage("vr.viewer.wakeGesture") private var wakeGesture: VRWakeGesture = .off
+    @AppStorage("vr.viewer.doubleTap") private var doubleTap: VRDoubleTapAction = .recenter
+    @AppStorage("vr.viewer.pinch") private var pinchResponse: VRPinchResponse = .regular
+    @AppStorage(AfterglowPreset.decoderKey) private var vrDecoderPolicy: VLCDecoderPolicy = .automatic
+    @AppStorage(AfterglowPreset.gyroKey) private var afterglowGyro = true
+    @AppStorage(AfterglowPreset.renderScaleKey) private var afterglowRenderScale = 75
+    @AppStorage(AfterglowPreset.frameRateKey) private var afterglowFrameRate = 30
+    @State private var afterglowViewing: Bool
+    @State private var displayMode: SBSDisplayMode
+    @State private var outputOverride: MovieOutput?
+
+    init(playlist: PlaylistPlaybackModel, model: PlaybackModel) {
+        self.playlist = playlist
+        self.model = model
+        let request = playlist.current
+        let afterglow = request.startMode == .afterglow
+        let profile: VRMoviePreferences
+        switch request.startMode {
+        case .afterglow: profile = AfterglowPreset.load()
+        case .panorama: profile = VRMoviePreferences(key: request.key)
+        case .standard: profile = VRMoviePreferences()
+        }
+        _afterglowViewing = State(initialValue: afterglow)
+        _outputOverride = State(initialValue: afterglow ? .afterglow : nil)
+        _vrProfile = State(initialValue: profile)
+        _displayMode = State(initialValue: request.startMode == .standard ? .standard : VRMoviePreferences.mode)
+        _camera = StateObject(wrappedValue: VRGestureCamera(fieldOfView: profile.fieldOfView))
+    }
+
+    private var defaultOutput: MovieOutput { MovieOutput.defaultOutput(for: request.url, pickedFile: request.pickedFile) }
+    private var standardOutput: MovieOutput {
+        // A playlist may move from a system-compatible container to an MKV.
+        if outputOverride == .system { return defaultOutput }
+        return outputOverride ?? defaultOutput
+    }
+    private var activeOutput: MovieOutput { model.videoOutput ?? standardOutput }
     private var request: PlaybackRequest { playlist.current }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
-    private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist }
+    private var isFullscreen: Bool { controls.isFullscreen || displayMode != .standard }
+    private var immersive: Bool { if case .immersive = displayMode { return true }; return false }
+    private var hasMessage: Bool { store.errorMessage != nil || model.message != nil || showsPlaylist || showsPlaybackOptions || showsVRSettings }
+    private var isLibraryVideo: Bool { request.pickedFile == nil }
     private var showsPause: Bool { model.phase == .playing || model.phase == .opening }
-    private var canInteract: Bool { scenePhase == .active && store.errorMessage == nil && !showsPlaylist }
+    private var canInteract: Bool { scenePhase == .active && store.errorMessage == nil && !showsPlaylist && !showsVRSettings &&
+        !showsCompatiblePicker && preparingCompatibleCopy == nil }
     private var transportButtonStyle: PlaybackTransportButtonStyle {
         PlaybackTransportButtonStyle { token, pressed in
             controls.setControlPressed(token, pressed: pressed, at: now)
@@ -391,25 +501,47 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             GeometryReader { proxy in
                 ZStack {
                     Color.black.ignoresSafeArea()
-                    VLCVideoSurface(model: model)
+                    MovieVideoSurface(model: model, mode: displayMode, standardOutput: standardOutput,
+                                      decoderPolicy: immersive ? vrDecoderPolicy : .automatic,
+                                      camera: camera, followHead: immersive && (afterglowViewing ? afterglowGyro : followHead) && scenePhase == .active && !showsVRSettings,
+                                      wakeGesture: immersive && canInteract && !hasMessage ? wakeGesture : .off,
+                                      nativeResolution: nativeResolution,
+                                      renderScalePercent: afterglowViewing ? afterglowRenderScale : nil,
+                                      targetFrameRate: afterglowViewing ? afterglowFrameRate : 60)
                         .id(request.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .ignoresSafeArea(.container, edges: controls.isFullscreen ? .all : [])
+                        .ignoresSafeArea(.container, edges: isFullscreen ? .all : [])
                         .allowsHitTesting(false)
                         .accessibilityIdentifier("offlineVideoSurface")
-                    // Tap-only surface: no vertical paging, previews or delayed switches.
-                    Rectangle().fill(Color.clear).contentShape(Rectangle())
-                        .onTapGesture { toggleControls() }
-                        .accessibilityElement()
-                        .accessibilityLabel("视频画面，轻点显示或隐藏控制栏")
-                        .accessibilityAddTraits(.isButton)
-                        .accessibilityAction { toggleControls() }
-                        .accessibilityAction(named: Text("上一个视频")) { navigate(.previous) }
-                        .accessibilityAction(named: Text("下一个视频")) { navigate(.next) }
-                        .accessibilityIdentifier("playbackSurfaceToggle")
+                    Group {
+                        if immersive {
+                            VRPanoramaSurface(camera: camera,
+                                              response: pinchResponse, onTap: toggleControls, onDoubleTap: doubleTapped,
+                                              onZoomEnd: { fov in
+                                vrProfile.fieldOfView = fov
+                                saveCurrentProfile()
+                            })
+                        } else {
+                            Rectangle().fill(Color.clear).contentShape(Rectangle())
+                                .onTapGesture { toggleControls() }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityElement()
+                    .accessibilityLabel(immersive ? "全景视频画面，轻点显示或隐藏控制栏" : "视频画面，轻点显示或隐藏控制栏")
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityAction { toggleControls() }
+                    .accessibilityActions {
+                        if immersive { Button("视角回正") { camera.recenter() } }
+                        if isLibraryVideo {
+                            Button("上一个视频") { navigate(.previous) }
+                            Button("下一个视频") { navigate(.next) }
+                        }
+                    }
+                    .accessibilityIdentifier("playbackSurfaceToggle")
                 }
                 .overlay(alignment: .top) {
-                    if controls.isFullscreen {
+                    if isFullscreen {
                         fullscreenHeader
                             .opacity(controls.isVisible ? 1 : 0)
                             .allowsHitTesting(controls.isVisible)
@@ -427,7 +559,7 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             .background(.black)
             .navigationTitle(request.title)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar(controls.isFullscreen ? .hidden : .visible, for: .navigationBar)
+            .toolbar(isFullscreen ? .hidden : .visible, for: .navigationBar)
             .toolbarBackground(.black, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
@@ -441,15 +573,42 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
             }
         }
         .preferredColorScheme(.dark)
-        .statusBarHidden(controls.isFullscreen)
-        .persistentSystemOverlays(controls.isFullscreen && !controls.isVisible ? .hidden : .automatic)
+        .statusBarHidden(isFullscreen)
+        .persistentSystemOverlays(isFullscreen && !controls.isVisible ? .hidden : .automatic)
+        .background {
+            VRGamepadInput(enabled: immersive && canInteract && !hasMessage, onCommand: gamepadCommand)
+                .frame(width: 0, height: 0).allowsHitTesting(false).accessibilityHidden(true)
+        }
+        .onReceive(camera.controlsRequested) { _ in
+            if immersive && canInteract && !hasMessage { revealControls() }
+        }
         .sheet(isPresented: $showsPlaylist) { playlistSheet }
+        .sheet(isPresented: $showsVRSettings) { immersiveSettings }
+        .sheet(isPresented: $showsCompatiblePicker, onDismiss: resolveCompatibleSelection) {
+            VideoDocumentPicker { selection in
+                compatibleSelection = selection
+                showsCompatiblePicker = false
+            }
+        }
+        .overlay(alignment: .center) {
+            if diagnosticCopyNotice != nil {
+                Text("播放诊断已复制")
+                    .foregroundStyle(.white).padding().background(.black.opacity(0.8), in: Capsule())
+                    .allowsHitTesting(false)
+            }
+        }
+        .task(id: diagnosticCopyNotice) {
+            guard diagnosticCopyNotice != nil else { return }
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            diagnosticCopyNotice = nil
+        }
         .alert("操作提示", isPresented: Binding(
             get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } }
         )) { Button("确定", role: .cancel) { store.errorMessage = nil } }
         message: { Text(store.errorMessage ?? "") }
         .onChange(of: request.id) { _, _ in
             cancelProgressInteraction()
+            if immersive { enterPanorama() }
             controls.resetControlPresses(at: now)
             controls.setPlaying(model.phase == .playing, at: now)
             controls.interacted(at: now)
@@ -527,32 +686,69 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
     }
     private func transportControls(isLandscape: Bool) -> some View {
         VStack(spacing: 4) {
+            if immersive && !isLandscape {
+                Text("请将手机横放后放入 VR 眼镜").font(.caption)
+            }
             if model.phase == .opening { ProgressView("打开本地文件…").tint(.white).font(.caption) }
-            if let message = model.message { Text(message).font(.caption).foregroundStyle(.red).lineLimit(2) }
+            if let message = model.message {
+                Text(message).font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if model.suggestsCompatibleCopy {
+                Button("打开兼容副本…", systemImage: "folder") {
+                    cancelProgressInteraction()
+                    resumeAfterCopyPicker = showsPause
+                    if resumeAfterCopyPicker { model.pause() }
+                    showsCompatiblePicker = true
+                }
+                .disabled(!canInteract)
+                .accessibilityIdentifier("openCompatibleCopy")
+            }
+            if preparingCompatibleCopy != nil {
+                ProgressView("正在打开所选副本…").tint(.white).font(.caption)
+            }
             if let notice = playlist.notice ?? store.deletionNotice {
                 Text(notice).font(.caption).lineLimit(2)
                     .accessibilityIdentifier("playbackActionNotice")
             }
             HStack(spacing: 8) {
-                if !isLandscape { navigationButton(.previous, compact: false) }
+                if isLibraryVideo && !isLandscape { navigationButton(.previous, compact: false) }
                 Spacer(minLength: 4)
-                Button { performTransportAction { showsPlaylist = true } } label: {
-                    Label(playlist.positionLabel, systemImage: "list.bullet")
-                        .font(.caption.monospacedDigit())
-                        .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
-                        .contentShape(Rectangle())
+                if isLibraryVideo {
+                    Button { performTransportAction { showsPlaylist = true } } label: {
+                        Label(playlist.positionLabel, systemImage: "list.bullet")
+                            .font(.caption.monospacedDigit())
+                            .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .disabled(!canInteract)
+                    .accessibilityLabel("本地播放列表 \(playlist.positionLabel)")
+                    .accessibilityIdentifier("openLocalPlaylistButton")
                 }
-                .disabled(!canInteract)
-                .accessibilityLabel("本地播放列表 \(playlist.positionLabel)")
-                .accessibilityIdentifier("openLocalPlaylistButton")
+                if immersive {
+                    Button { camera.recenter(); revealControls() } label: {
+                        Image(systemName: "scope").frame(minWidth: 44, minHeight: 44)
+                    }.accessibilityLabel("视角回正").accessibilityIdentifier("vrRecenterButton")
+                }
+                if !immersive {
+                    Button { performTransportAction(enterAfterglow) } label: {
+                        Text("Afterglow XR").font(.subheadline.weight(.semibold))
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                    }
+                    .disabled(!canInteract)
+                    .accessibilityLabel("用 Afterglow XR 播放")
+                    .accessibilityIdentifier("afterglowCurrentVideo")
+                }
+                videoFormatButton
+                if !immersive { ordinaryPlaybackOptions }
                 Spacer(minLength: 4)
-                if !isLandscape { navigationButton(.next, compact: false) }
+                if isLibraryVideo && !isLandscape { navigationButton(.next, compact: false) }
             }
             PlaybackProgressView(model: model, isEnabled: canInteract, scrubber: scrubber) { editing in
                 controls.setScrubbing(editing, at: now)
             }.id(request.id)
             HStack(spacing: 0) {
-                if isLandscape {
+                if isLibraryVideo && isLandscape {
                     navigationButton(.previous, compact: true).frame(minWidth: 0, maxWidth: .infinity)
                 }
                 Button { performTransportAction { model.seek(to: model.seconds - 15) } } label: {
@@ -568,23 +764,25 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
                     .accessibilityLabel(showsPause ? "暂停" : "播放")
                     .accessibilityIdentifier("togglePlaybackButton")
                     .frame(minWidth: 0, maxWidth: .infinity)
-                transportFavoriteButton.frame(minWidth: 0, maxWidth: .infinity)
-                transportDeleteButton.frame(minWidth: 0, maxWidth: .infinity)
+                if isLibraryVideo {
+                    transportFavoriteButton.frame(minWidth: 0, maxWidth: .infinity)
+                    transportDeleteButton.frame(minWidth: 0, maxWidth: .infinity)
+                }
                 Button { performTransportAction { model.seek(to: model.seconds + 15) } } label: {
                     Image(systemName: "goforward.15")
                         .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52).contentShape(Rectangle())
                 }.disabled(!model.seekable || !canInteract).accessibilityLabel("前进15秒")
                     .frame(minWidth: 0, maxWidth: .infinity)
-                if isLandscape {
+                if isLibraryVideo && isLandscape {
                     navigationButton(.next, compact: true).frame(minWidth: 0, maxWidth: .infinity)
                 }
-                Button { performTransportAction { controls.toggleFullscreen(at: now) } } label: {
-                    Image(systemName: controls.isFullscreen
+                Button { performTransportAction(toggleFullscreen) } label: {
+                    Image(systemName: isFullscreen
                           ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                         .frame(minWidth: 44, maxWidth: .infinity, minHeight: 52).contentShape(Rectangle())
                 }.disabled(!canInteract)
-                    .accessibilityLabel(controls.isFullscreen ? "退出全屏" : "全屏播放")
-                    .accessibilityValue(controls.isFullscreen ? "全屏" : "普通")
+                    .accessibilityLabel(isFullscreen ? "退出全屏" : "全屏播放")
+                    .accessibilityValue(isFullscreen ? "全屏" : "普通")
                     .accessibilityIdentifier("toggleFullscreenButton")
                     .frame(minWidth: 0, maxWidth: .infinity)
             }.font(.title2)
@@ -602,6 +800,138 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         // Keep identifiers on leaf controls. An identifier on this container
         // replaces its descendants' identifiers in SwiftUI's accessibility tree.
     }
+    private func toggleFullscreen() {
+        if controls.isFullscreen || displayMode == .standard { controls.toggleFullscreen(at: now) }
+        leavePanorama()
+    }
+
+    private func leavePanorama() {
+        if afterglowViewing {
+            afterglowViewing = false
+            outputOverride = nil
+        }
+        displayMode = .standard
+    }
+
+    private func selectOutput(_ output: MovieOutput, retry: Bool = true) {
+        model.prepareOutputChange(to: output, retry: retry)
+        outputOverride = output
+    }
+
+    private var videoFormatButton: some View {
+        Button { performTransportAction {
+            if immersive { showsVRSettings = true } else { enterPanorama() }
+        } } label: {
+            Text(immersive ? "VR 设置" : "VR")
+                .font(.subheadline.bold())
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .disabled(!canInteract)
+        .accessibilityLabel(immersive ? "VR 设置" : "进入全景 VR")
+        .accessibilityValue(immersive ? VRMoviePreferences.formatLabel : "普通播放")
+        .accessibilityIdentifier("videoFormatButton")
+    }
+
+    private var ordinaryPlaybackOptions: some View {
+        Button { performTransportAction { showsPlaybackOptions = true } } label: {
+            Image(systemName: "ellipsis.circle").frame(minWidth: 44, minHeight: 44)
+        }
+        .disabled(!canInteract)
+        .accessibilityLabel("播放选项")
+        .accessibilityIdentifier("ordinaryPlaybackOptions")
+        .confirmationDialog("播放选项", isPresented: $showsPlaybackOptions, titleVisibility: .visible) {
+            if activeOutput != .vlcNative {
+                Button("普通播放：切换到原生显示") { selectOutput(.vlcNative) }
+            }
+            if activeOutput != .vlcFrames {
+                Button("普通播放：切换到兼容显示") { selectOutput(.vlcFrames) }
+            }
+            if defaultOutput == .system && activeOutput != .system {
+                Button("切换到系统播放器") { selectOutput(.system) }
+            }
+            Button("复制播放诊断") {
+                Task { if await model.copyPlaybackDiagnostics() { diagnosticCopyNotice = UUID() } }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text(["当前解码：\(activeOutput.title)。", model.videoDetails].compactMap { $0 }.joined(separator: "\n"))
+        }
+    }
+
+    private func enterAfterglow() {
+        afterglowViewing = true
+        selectOutput(.afterglow, retry: false)
+        enterPanorama()
+    }
+
+    private func enterPanorama() {
+        vrProfile = afterglowViewing ? AfterglowPreset.load() : VRMoviePreferences(key: request.key)
+        camera.recenter()
+        camera.setFOV(vrProfile.fieldOfView)
+        displayMode = VRMoviePreferences.mode
+        revealControls()
+    }
+
+    private func saveCurrentProfile() {
+        if afterglowViewing { AfterglowPreset.save(vrProfile) }
+        else { vrProfile.save(key: request.key) }
+    }
+
+    private func doubleTapped() {
+        switch doubleTap {
+        case .recenter:
+            if immersive { camera.recenter() } else { toggleControls() }
+        case .playback: performTransportAction { model.toggle() }
+        case .controls: toggleControls()
+        }
+    }
+
+    private func gamepadCommand(_ command: VRGamepadCommand) {
+        guard immersive && canInteract && !hasMessage else { return }
+        switch command {
+        case .playPause: performTransportAction { model.toggle() }
+        case .recenter: if immersive { camera.recenter() }
+        case .toggleControls: toggleControls()
+        case .backward: performTransportAction { model.seek(to: model.seconds - 15) }
+        case .forward: performTransportAction { model.seek(to: model.seconds + 15) }
+        }
+    }
+
+    private func changeVRDecoder(_ policy: VLCDecoderPolicy) {
+        guard vrDecoderPolicy != policy else { return }
+        vrDecoderPolicy = policy
+        // Returning to automatic is an explicit retry of the preferred path.
+        let preferred: MovieOutput = afterglowViewing ? .afterglow : defaultOutput
+        model.prepareOutputChange(to: preferred, retry: policy == .automatic)
+        outputOverride = afterglowViewing ? .afterglow : nil
+    }
+
+    private var immersiveSettings: some View {
+        let appleActive = activeOutput == .system || activeOutput == .afterglow
+        let retryOutput: MovieOutput = afterglowViewing ? .afterglow : .system
+        let retryTitle = afterglowViewing ? "重试 Afterglow XR" : "恢复系统解码"
+        let fallback = vrDecoderPolicy == .automatic && outputOverride == .afterglow && activeOutput == .vlcFrames
+        var details = model.videoDetails
+        if fallback {
+            details = "Afterglow XR 已回退到 VLC。" + (details.map { " " + $0 } ?? "")
+        }
+        let action: String? = appleActive ? "尝试 VLC 解码" :
+            (afterglowViewing || defaultOutput == .system ? retryTitle : nil)
+        let gyro: Binding<Bool> = afterglowViewing ? $afterglowGyro : $followHead
+        return VRViewerSettingsView(followHead: gyro, nativeResolution: $nativeResolution,
+                             doubleTap: $doubleTap, pinchResponse: $pinchResponse, wakeGesture: $wakeGesture,
+                             decoderPolicy: Binding(get: { vrDecoderPolicy }, set: changeVRDecoder),
+                             sensorAvailable: camera.sensorAvailable, decoder: vrDecoderPolicy == .software && model.videoOutput == .vlcFrames
+                                ? "VLC 软件解码" : (model.videoOutput?.title ?? "正在打开…"),
+                             details: details, decoderAction: vrDecoderPolicy == .automatic ? action : nil,
+                             onCopyDiagnostics: model.copyPlaybackDiagnostics,
+                             onDecoderChange: { selectOutput(appleActive ? .vlcFrames : retryOutput) },
+                             usesAfterglowPreset: afterglowViewing,
+                             onOpenAfterglow: { enterAfterglow() },
+                             onExit: { leavePanorama(); revealControls() })
+    }
+
     private var transportFavoriteButton: some View {
         let favorite = playlist.currentEntry?.isFavorite == true
         return Button {
@@ -680,7 +1010,36 @@ private struct PlaybackButtonPressSurface<Label: View>: View {
         }
     }
     private func revealControls() { controls.interacted(at: now) }
+    private func resolveCompatibleSelection() {
+        let resume = resumeAfterCopyPicker
+        resumeAfterCopyPicker = false
+        guard let selection = compatibleSelection else {
+            if resume && scenePhase == .active && model.phase == .paused { model.toggle() }
+            return
+        }
+        compatibleSelection = nil
+        let old = request
+        preparingCompatibleCopy = Task { @MainActor in
+            defer { preparingCompatibleCopy = nil }
+            do {
+                let file = try await PickedVideoFile.open(selection)
+                try Task.checkCancellation()
+                guard request.id == old.id else { return }
+                try store.queueCompatibleCopy(file, replacing: old)
+                preparingCompatibleCopy = nil
+                closePlayback()
+                dismiss()
+            } catch {
+                guard !Task.isCancelled, request.id == old.id else { return }
+                store.errorMessage = error.localizedDescription
+                if resume && scenePhase == .active && model.phase == .paused { model.toggle() }
+            }
+        }
+    }
+
     private func closePlayback() {
+        preparingCompatibleCopy?.cancel()
+        camera.connect(to: nil, followHead: false)
         cancelProgressInteraction()
         controls.stop()
         playlist.close()

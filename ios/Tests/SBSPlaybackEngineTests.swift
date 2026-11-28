@@ -1,0 +1,325 @@
+import XCTest
+import UIKit
+@testable import NiceVideos
+
+@MainActor
+final class SBSPlaybackEngineTests: XCTestCase {
+    private func waitForRoute(_ predicate: () -> Bool) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(15)
+        while !predicate(), Date() < deadline { try await Task.sleep(nanoseconds: 50_000_000) }
+        return predicate()
+    }
+
+    func testKnownUndecodableAppleTrackSkipsSecondAutomaticOpenButAllowsRetryAndNextFile() async throws {
+        let bundle = Bundle(for: Self.self)
+        let unsupported = try XCTUnwrap(bundle.url(forResource: "audio-only", withExtension: "mp4", subdirectory: "Fixtures"))
+        let supported = try XCTUnwrap(bundle.url(forResource: "panorama-audio", withExtension: "mp4", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        let engine = SBSPlaybackEngine()
+        defer { engine.stop(); window.isHidden = true }
+        var snapshot = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { snapshot = $0 }
+        host.configure(mode: .standard, standardOutput: .system)
+        engine.attach(to: host)
+        try engine.load(fileURL: unsupported)
+        engine.play()
+
+        let rejected = try await waitForRoute { engine.currentOutput == .vlcNative }
+        XCTAssertTrue(rejected, engine.playbackDiagnosticReport() ?? "")
+        guard rejected else { return }
+        let mode = SBSDisplayMode.immersive(.vr360, .sideBySide, headset: true)
+        host.configure(mode: mode, standardOutput: .afterglow)
+        XCTAssertEqual(engine.currentOutput, .vlcFrames)
+        XCTAssertFalse((engine.playbackDiagnosticReport() ?? "").contains("output afterglow"))
+        engine.retryAfterglowOutput()
+        XCTAssertEqual(engine.currentOutput, .afterglow)
+        let retried = try await waitForRoute { engine.currentOutput == .vlcFrames }
+        XCTAssertTrue(retried, engine.playbackDiagnosticReport() ?? "")
+        guard retried else { return }
+
+        try engine.load(fileURL: supported)
+        XCTAssertEqual(engine.currentOutput, .afterglow)
+        engine.play()
+        let resumed = try await waitForRoute {
+            snapshot.videoOutput == .afterglow && snapshot.phase == .playing &&
+                snapshot.hasVideo && (host.renderer?.acceptedFrameID ?? 0) >= 2
+        }
+        XCTAssertTrue(resumed, engine.playbackDiagnosticReport() ?? "")
+    }
+
+    func testSoftwareDecoderPolicyKeepsPositionAndPauseWhenReturningToAutomaticVLC() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "panorama-audio", withExtension: "mp4", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        let mode = SBSDisplayMode.immersive(.vr360, .sideBySide, headset: true)
+        host.configure(mode: mode, standardOutput: .afterglow, decoderPolicy: .software)
+        let engine = SBSPlaybackEngine()
+        defer { engine.stop(); window.isHidden = true }
+        var snapshot = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { snapshot = $0 }
+        engine.attach(to: host)
+        try engine.load(fileURL: url)
+        engine.play()
+
+        let renderer = try XCTUnwrap(host.renderer)
+        let running = try await waitForRoute {
+            snapshot.videoOutput == .vlcFrames && snapshot.phase == .playing && snapshot.seekable &&
+                renderer.acceptedFrameID >= 2
+        }
+        XCTAssertTrue(running, engine.playbackDiagnosticReport() ?? "")
+        guard running else { return }
+        XCTAssertTrue((engine.playbackDiagnosticReport() ?? "").contains("decoderPolicy=software"))
+        engine.seek(to: 17)
+        let sought = try await waitForRoute { (17.3...24).contains(snapshot.seconds) }
+        XCTAssertTrue(sought, engine.playbackDiagnosticReport() ?? "")
+        guard sought else { return }
+        engine.pause()
+        let paused = try await waitForRoute { snapshot.phase == .paused }
+        XCTAssertTrue(paused)
+        guard paused else { return }
+        let before = snapshot.seconds
+
+        host.configure(mode: mode, standardOutput: .vlcFrames)
+        host.mode = .immersive(.vr180, .sideBySide, headset: false)
+        XCTAssertEqual(host.effectiveDecoderPolicy, .software)
+        XCTAssertFalse((engine.playbackDiagnosticReport() ?? "").contains("open loadID=2"))
+        host.configure(mode: mode, standardOutput: .vlcFrames, decoderPolicy: .automatic)
+        let freshFrame = renderer.acceptedFrameID
+        let restored = try await waitForRoute {
+            snapshot.videoOutput == .vlcFrames && snapshot.phase == .paused && snapshot.seekable &&
+                snapshot.hasVideo && renderer.acceptedFrameID > freshFrame && abs(snapshot.seconds - before) < 0.6
+        }
+        let report = engine.playbackDiagnosticReport() ?? ""
+        XCTAssertTrue(restored, report)
+        XCTAssertTrue(report.contains("open loadID=2"), report)
+        XCTAssertTrue(report.contains("decoderPolicy=automatic"), report)
+        XCTAssertFalse(report.contains("open loadID=3"), report)
+    }
+
+    func testRunningVLCMemoryOutputRenegotiatesFullHeight8KOnlyWhenEnteringPanorama() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "stereo8k60-full", withExtension: "mp4", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        host.configure(mode: .standard, standardOutput: .vlcFrames)
+        let engine = SBSPlaybackEngine()
+        var latest = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { latest = $0 }
+        defer { engine.stop(); window.isHidden = true }
+        engine.attach(to: host)
+        try engine.load(fileURL: file)
+        engine.play()
+
+        func waitFor(_ predicate: () -> Bool) async throws -> Bool {
+            let deadline = Date().addingTimeInterval(15)
+            while !predicate() && Date() < deadline { try await Task.sleep(nanoseconds: 80_000_000) }
+            return predicate()
+        }
+        func capture() -> String { engine.playbackDiagnosticReport()?.components(separatedBy: "\n").last ?? "" }
+        let ordinary = try await waitFor {
+            latest.seekable && latest.seconds > 0.25 && capture().contains("buffer=2560x1280")
+        }
+        XCTAssertTrue(ordinary, capture())
+        guard ordinary else { return }
+        engine.pause()
+        let paused = try await waitFor { latest.phase == .paused }
+        XCTAssertTrue(paused)
+        let before = latest.seconds
+        host.mode = .immersive(.vr360, .sideBySide, headset: true)
+        let renderer = try XCTUnwrap(host.renderer)
+        let pausedFrame = renderer.acceptedFrameID
+        XCTAssertGreaterThan(pausedFrame, 0)
+        let pausedReport = capture()
+        XCTAssertTrue(pausedReport.contains("loadID=1") && pausedReport.contains("buffer=2560x1280"), pausedReport)
+        XCTAssertEqual(latest.phase, .paused)
+        XCTAssertEqual(latest.seconds, before, accuracy: 0.15)
+        host.mode = .immersive(.vr180, .sideBySide, headset: false)
+        host.mode = .immersive(.vr360, .sideBySide, headset: true)
+        XCTAssertTrue(capture().contains("loadID=1"), capture())
+        engine.play()
+        let resized = try await waitFor {
+            guard latest.phase == .playing, latest.seconds > before + 0.3,
+                  renderer.acceptedFrameID >= pausedFrame + 2 else { return false }
+            let report = capture()
+            return report.contains("loadID=2") && report.contains("buffer=1600x800")
+        }
+        XCTAssertTrue(resized, engine.playbackDiagnosticReport() ?? "")
+        host.mode = .immersive(.vr180, .sideBySide, headset: true)
+        XCTAssertTrue(capture().contains("loadID=2"), capture())
+    }
+
+    func testVLCChangesPositionToLastScrubAsReopenedPanoramaStarts() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "panorama-audio", withExtension: "mp4", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        let mode = SBSDisplayMode.immersive(.vr360, .sideBySide, headset: true)
+        host.configure(mode: mode, standardOutput: .afterglow)
+        let engine = SBSPlaybackEngine()
+        var snapshot = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { snapshot = $0 }
+        defer { engine.stop(); window.isHidden = true }
+        engine.attach(to: host)
+        try engine.load(fileURL: file)
+        engine.play()
+
+        func waitFor(_ predicate: () -> Bool) async throws -> Bool {
+            let deadline = Date().addingTimeInterval(18)
+            while Date() < deadline && !predicate() { try await Task.sleep(nanoseconds: 50_000_000) }
+            return predicate()
+        }
+        let started = try await waitFor { snapshot.hasVideo && snapshot.seekable }
+        XCTAssertTrue(started)
+        guard started else { return }
+        engine.seek(to: 18.2)
+        let positioned = try await waitFor { (18.4...23).contains(snapshot.seconds) }
+        XCTAssertTrue(positioned)
+        guard positioned else { return }
+        host.configure(mode: mode, standardOutput: .vlcFrames)
+        for target in [34.3, 45.85, 27.25, 53.25] { engine.seek(to: target) }
+        let renderer = try XCTUnwrap(host.renderer)
+        // A displayed seek target alone cannot pass. Require a VLC clock that
+        // has advanced past it, then another picture and continuing clock motion.
+        let reached = try await waitFor {
+            snapshot.videoOutput == .vlcFrames && snapshot.seekable && snapshot.hasVideo &&
+                snapshot.phase == .playing && (53.6...57).contains(snapshot.seconds)
+        }
+        XCTAssertTrue(reached, engine.playbackDiagnosticReport() ?? "")
+        guard reached else { return }
+        let firstFrame = renderer.acceptedFrameID
+        let media = snapshot.seconds
+        let moving = try await waitFor {
+            snapshot.seconds > media + 0.25 && renderer.acceptedFrameID >= firstFrame + 2
+        }
+        XCTAssertTrue(moving, engine.playbackDiagnosticReport() ?? "")
+    }
+
+    func testAfterglowFailureReturnsToVLCAtTheLatestSeekWithoutRetrying() async throws {
+        // VideoLAN accepts this Matroska payload; AVFoundation cannot open it.
+        let source = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "offline", withExtension: "mkv", subdirectory: "Fixtures"))
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
+        try FileManager.default.copyItem(at: source, to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 480, height: 240))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+        let mode = SBSDisplayMode.immersive(.vr360, .sideBySide, headset: true)
+        host.configure(mode: mode, standardOutput: .vlcFrames)
+        let engine = SBSPlaybackEngine()
+        defer { engine.stop(); window.isHidden = true }
+        var snapshot = PlaybackSnapshot(phase: .idle)
+        engine.onUpdate = { snapshot = $0 }
+        engine.attach(to: host)
+        try engine.load(fileURL: file)
+        engine.play()
+        func waitFor(_ predicate: () -> Bool) async throws -> Bool {
+            let end = Date().addingTimeInterval(12)
+            while Date() < end && !predicate() { try await Task.sleep(nanoseconds: 40_000_000) }
+            return predicate()
+        }
+        let started = try await waitFor { snapshot.phase == .playing && snapshot.hasVideo }
+        XCTAssertTrue(started)
+        guard started else { return }
+        let renderer = try XCTUnwrap(host.renderer)
+        let firstFrame = renderer.acceptedFrameID
+        host.configure(mode: mode, standardOutput: .afterglow)
+        engine.seek(to: 0.75)
+        engine.seek(to: 1.50)
+        let restored = try await waitFor {
+            engine.currentOutput == .vlcFrames && snapshot.videoOutput == .vlcFrames &&
+                snapshot.hasVideo && snapshot.phase == .playing && snapshot.seconds >= 1.45 &&
+                renderer.acceptedFrameID > firstFrame
+        }
+        let report = engine.playbackDiagnosticReport() ?? ""
+        XCTAssertTrue(restored, report)
+        XCTAssertTrue(report.contains("open loadID=3 start=1.50"), report)
+        XCTAssertEqual(report.components(separatedBy: "fallback afterglow -> VLC").count - 1, 1, report)
+    }
+
+    func testPausedMKVReopensAtItsPositionAndResumesAfterLeavingVR() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "offline", withExtension: "mkv", subdirectory: "Fixtures"))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 640, height: 320))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let host = SBSPlaybackView(frame: window.bounds)
+        controller.view.addSubview(host)
+        window.makeKeyAndVisible()
+
+        let engine = SBSPlaybackEngine()
+        var latest = PlaybackSnapshot(phase: .idle)
+        let ready = expectation(description: "MKV running on the native drawable")
+        var reachedTime = false
+        engine.onUpdate = { state in
+            latest = state
+            if !reachedTime && state.phase == .playing && state.seconds >= 0.45 {
+                reachedTime = true
+                ready.fulfill()
+            }
+        }
+        defer { engine.stop(); window.isHidden = true }
+        engine.attach(to: host)
+        try engine.load(fileURL: file)
+        engine.play()
+        await fulfillment(of: [ready], timeout: 15)
+
+        engine.pause()
+        let before = latest.seconds
+        for mode in [SBSDisplayMode.half, .standard] {
+            let paused = expectation(description: "Reopened MKV stays paused with a valid video output in \(mode)")
+            var pausedOnce = false
+            engine.onUpdate = { state in
+                latest = state
+                if !pausedOnce && state.phase == .paused && state.seekable && state.hasVideo {
+                    pausedOnce = true
+                    paused.fulfill()
+                }
+            }
+            host.mode = mode
+            await fulfillment(of: [paused], timeout: 15)
+            XCTAssertTrue(pausedOnce, "mode=\(mode) latest=\(latest)")
+            XCTAssertEqual(latest.seconds, before, accuracy: 0.45)
+            let pausedAt = latest.seconds
+            try await Task.sleep(nanoseconds: 300_000_000)
+            XCTAssertEqual(latest.phase, .paused)
+            XCTAssertEqual(latest.seconds, pausedAt, accuracy: 0.15)
+            if mode == .half {
+                let renderer = try XCTUnwrap(host.renderer)
+                host.mode = .full
+                XCTAssertTrue(renderer === host.renderer)
+            }
+        }
+
+        let resumed = expectation(description: "Audio/video clock progresses again on the same MKV")
+        var resumedOnce = false
+        engine.onUpdate = { state in
+            if !resumedOnce && state.phase == .playing && state.seconds >= before + 0.25 {
+                resumedOnce = true
+                resumed.fulfill()
+            }
+        }
+        engine.play()
+        await fulfillment(of: [resumed], timeout: 15)
+    }
+}

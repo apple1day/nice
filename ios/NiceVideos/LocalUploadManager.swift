@@ -22,6 +22,7 @@ final class LocalUploadManager: NSObject, ObservableObject, URLSessionDataDelega
     private var disk: LocalUploadDisk?
     private var activeTask: URLSessionUploadTask?
     private var activeID: UUID?
+    private var preparation: Task<Void, Never>?
     private var responseData = Data()
     private var responseOverflow = false
     private var lastProgress = Date.distantPast
@@ -100,7 +101,10 @@ final class LocalUploadManager: NSObject, ObservableObject, URLSessionDataDelega
             try replace(next)
         } catch { errorMessage = error.localizedDescription }
         // User cancellation must reach the task even when saving metadata fails.
-        if activeID == id { activeTask?.cancel() } else { pump() }
+        if activeID == id {
+            preparation?.cancel()
+            activeTask?.cancel()
+        } else { pump() }
     }
     func clearFinished() {
         let removed = jobs.filter { !$0.state.isPending && $0.id != activeID }.map(\.id)
@@ -115,34 +119,35 @@ final class LocalUploadManager: NSObject, ObservableObject, URLSessionDataDelega
         jobs = next
     }
     private func pump() {
-        guard activeTask == nil, let disk else { return }
+        guard activeTask == nil, activeID == nil, let disk else { return }
         while let index = jobs.firstIndex(where: { $0.state == .queued }) {
             let job = jobs[index]
             do {
                 let request = try LocalUploadWire.request(for: job)
-                // Only the next item is validated/snapshotted, never the entire queue.
+                if let document = job.source.pickedFile {
+                    // Reserve the queue slot while the provider downloads or clones
+                    // the file. Cancellation invalidates this exact attempt, even
+                    // if coordination returns after the user pressed Cancel.
+                    activeID = job.id
+                    preparation = Task { @MainActor in
+                        do {
+                            let file = try await document.prepare(job.source, destination: disk.stagedFile(job.id))
+                            try Task.checkCancellation()
+                            try self.start(job, request: request, file: file)
+                            self.preparation = nil
+                        } catch {
+                            self.preparation = nil
+                            self.activeID = nil
+                            if self.finishPreparation(job, error: error, disk: disk) { self.pump() }
+                        }
+                    }
+                    return
+                }
                 let file = try disk.prepare(source: resolveSource(job), id: job.id, expectedBytes: job.source.size)
-                var next = jobs
-                next[index].state = .uploading
-                next[index].message = nil
-                try replace(next)
-                let task = session.uploadTask(with: request, fromFile: file)
-                task.taskDescription = job.id.uuidString
-                task.countOfBytesClientExpectsToSend = job.source.size
-                activeID = job.id
-                activeTask = task
-                responseData.removeAll(keepingCapacity: true)
-                responseOverflow = false
-                lastProgress = .distantPast
-                progress.set(0, for: job.id)
-                task.resume()
+                try start(job, request: request, file: file)
                 return
             } catch {
-                var next = jobs
-                next[index].state = .failed
-                next[index].message = error.localizedDescription
-                do { try replace(next); try disk.removeSnapshot(job.id) }
-                catch { errorMessage = error.localizedDescription; return }
+                guard finishPreparation(job, error: error, disk: disk) else { return }
             }
         }
         if !completedServers.isEmpty {
@@ -150,6 +155,39 @@ final class LocalUploadManager: NSObject, ObservableObject, URLSessionDataDelega
             completedServers.removeAll()
             queueFinished(servers)
         }
+    }
+    // Main-queue confined. Only a queued attempt may start a network transfer.
+    private func start(_ job: LocalUploadJob, request: URLRequest, file: URL) throws {
+        guard let index = jobs.firstIndex(where: { $0.id == job.id && $0.state == .queued }) else {
+            throw CancellationError()
+        }
+        var next = jobs
+        next[index].state = .uploading
+        next[index].message = nil
+        try replace(next)
+        let task = session.uploadTask(with: request, fromFile: file)
+        task.taskDescription = job.id.uuidString
+        task.countOfBytesClientExpectsToSend = job.source.size
+        activeID = job.id
+        activeTask = task
+        responseData.removeAll(keepingCapacity: true)
+        responseOverflow = false
+        lastProgress = .distantPast
+        progress.set(0, for: job.id)
+        task.resume()
+    }
+
+    private func finishPreparation(_ job: LocalUploadJob, error: Error, disk: LocalUploadDisk) -> Bool {
+        do {
+            try disk.removeSnapshot(job.id)
+            if let index = jobs.firstIndex(where: { $0.id == job.id && $0.state == .queued }) {
+                var next = jobs
+                next[index].state = .failed
+                next[index].message = error.localizedDescription
+                try replace(next)
+            }
+            return true
+        } catch { errorMessage = error.localizedDescription; return false }
     }
     private func currentJob(for task: URLSessionTask) -> LocalUploadJob? {
         guard let id = activeID, task.taskIdentifier == activeTask?.taskIdentifier,
@@ -214,5 +252,5 @@ final class LocalUploadManager: NSObject, ObservableObject, URLSessionDataDelega
         pump()
     }
     // Tests can explicitly release the delegate-owned session after completion.
-    func invalidate() { session.invalidateAndCancel() }
+    func invalidate() { preparation?.cancel(); session.invalidateAndCancel() }
 }

@@ -1,6 +1,14 @@
 import Foundation
 import Combine
 
+private extension DownloadRecord {
+    mutating func failTransfer(_ reason: String) {
+        state = retryingMissingDownload == true ? .missing : .failed
+        retryingMissingDownload = nil
+        message = reason
+    }
+}
+
 // Main-queue confined, including URLSession delegate callbacks. Swift 5 mode.
 final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     static let shared = VideoStore()
@@ -28,11 +36,13 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     private var usedBytesCache: Int64 = 0
     // Keep the lease until the engine closes, including cover dismissal.
     private var playbackSession: PlaybackRequest?
+    private var queuedCompatibleCopy: PickedVideoFile?
     private var catalogs: [String: [Video]] = [:]
     private var active: [String: URLSessionDownloadTask] = [:]
     private var lastProgress: [String: Date] = [:]
     private var refreshTask: Task<Void, Never>?
     private var refreshID = UUID()
+    private var fileRefreshID = UUID()
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionID)
         config.sessionSendsLaunchEvents = true
@@ -65,15 +75,15 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             try storage.recoverRemovals(records: records) { id in
                 defaults.removeObject(forKey: "position." + id)
             }
+            records = try storage.migrateLegacyDownloads(records)
             disk = storage
             migrateLegacyWatchFlags()
             do { catalogs = try storage.loadCatalogs() }
             catch { catalogNotice = "列表缓存读取失败；本地下载不受影响。" }
             videos = catalogs[server] ?? []
-            // A completed manifest entry is displayed without stat/open. Only
-            // interrupted transfers need startup recovery. Explicit play validates
-            // its target; the active root never rescans all files on foreground.
-            reconcileFiles(ids: Set(unfinishedCache.map(\.id)))
+            // Restore interrupted transfers before URLSession callbacks. The active
+            // scene checks the shared folder asynchronously for changes made in Files.
+            reconcileFiles(ids: Set(unfinishedCache.map(\.id)), includeDownloading: !restoreDownloads)
         } catch { errorMessage = "本地存储读取失败：\(error.localizedDescription)" }
         if restoreDownloads { restoreTransfers() } else { restoring = false }
     }
@@ -81,7 +91,7 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     private func rebuildRecordCache() {
         recordsByID = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
         completedCache = records.filter { $0.state == .complete }
-        unfinishedCache = records.filter { $0.state != .complete }
+        unfinishedCache = records.filter { $0.state == .downloading || $0.state == .failed }
         usedBytesCache = completedCache.reduce(0) { $0 + $1.video.size }
         pendingCache = records.filter { $0.pendingDeletionOrder != nil }.sorted {
             let a = $0.pendingDeletionOrder ?? 0
@@ -244,9 +254,20 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         }
         let id = video.storageID(server: base)
         let existing = recordsByID[id]
+        var retryingMissing = false
         if let existing = existing {
             if existing.state == .downloading { return }
-            if existing.state == .complete, disk.verifiedFile(for: existing) != nil { return }
+            switch disk.fileStatus(for: existing) {
+            case .available:
+                if existing.state != .complete { reconcileFiles(ids: [id]) }
+                return
+            case .unavailable:
+                throw ClientError("视频文件暂时无法访问，请解锁设备后重试。")
+            case .absent:
+                retryingMissing = wasDownloaded(existing)
+            case .invalid:
+                break
+            }
         }
         guard !isPlaybackProtected(id) else {
             throw ClientError("请先关闭正在播放的视频，再重新下载。")
@@ -255,9 +276,14 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         request.allowsCellularAccess = defaults.bool(forKey: "allowCellular")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         var record = DownloadRecord(video: video, server: base)
+        record.publicFileName = existing?.publicFileName
+        record.publicFileName = try disk.availableFileName(for: record, among: records)
+        if retryingMissing {
+            record.retryingMissingDownload = true
+            record.downloadedAt = existing?.downloadedAt
+        }
         record.favorite = existing?.favorite ?? false
         record.watched = existing?.watched ?? false
-        let previous = records
         var next = records.filter { $0.id != id }
         next.append(record)
         try disk.saveRecords(next)
@@ -268,14 +294,12 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         active[id] = task
         progress[id] = 0
         task.resume()
-        _ = previous // The prior manifest is never published away before a successful save.
     }
     func cancel(_ record: DownloadRecord) {
         guard let index = records.firstIndex(where: { $0.taskToken == record.taskToken }),
               records[index].state == .downloading else { return }
         var next = records
-        next[index].state = .failed
-        next[index].message = "已取消。重新下载会从头开始。"
+        next[index].failTransfer("已取消。重新下载会从头开始。")
         records = next
         active.removeValue(forKey: record.id)?.cancel()
         progress.removeValue(forKey: record.id)
@@ -316,30 +340,58 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
         }
         playLocal(record)
     }
-    func playLocal(_ record: DownloadRecord, playlistIDs: [String]? = nil) {
+    func playLocal(_ record: DownloadRecord, playlistIDs: [String]? = nil, startMode: PlaybackStartMode = .standard) {
         guard playbackSession == nil && playback == nil else { return }
         do {
             // Freeze the caller's search/filter order before the player opens.
             // Legacy callers still get the complete local library in list order.
             let ids = playlistIDs ?? LocalLibraryOrder.newestFirst(completedCache,
                 completedAt: { $0.downloadedAt }).map(\.id)
-            let request = try localPlaybackRequest(for: record.id, playlistIDs: ids)
-            playbackSession = request
-            deletionNotice = nil
-            playback = request
+            let request = try localPlaybackRequest(for: record.id, playlistIDs: ids, startMode: startMode)
+            presentPlayback(request)
         } catch {
             errorMessage = error.localizedDescription
             reconcileFiles(ids: [record.id])
         }
     }
+    func playPickedFile(_ file: PickedVideoFile, startMode: PlaybackStartMode = .standard) throws {
+        guard playbackSession == nil && playback == nil else {
+            throw ClientError("已有视频正在播放，请先关闭播放器。")
+        }
+        presentPlayback(PlaybackRequest(pickedFile: file, startMode: startMode))
+    }
+
+    // The picker holds its security-scoped grant and open descriptor across the
+    // animation. Present the validated file only after the old player has closed.
+    func queueCompatibleCopy(_ file: PickedVideoFile, replacing request: PlaybackRequest) throws {
+        guard playback != nil, playbackSession?.id == request.id else {
+            throw ClientError("播放器已切换，请重新选择兼容副本。")
+        }
+        queuedCompatibleCopy = file
+    }
+
+    func openQueuedCompatibleCopy() {
+        guard let file = queuedCompatibleCopy else { return }
+        queuedCompatibleCopy = nil
+        do { try playPickedFile(file, startMode: .afterglow) }
+        catch { errorMessage = error.localizedDescription }
+    }
+
+    private func presentPlayback(_ request: PlaybackRequest) {
+        playbackSession = request
+        deletionNotice = nil
+        playback = request
+    }
+
     // Compatibility accessor: metadata only; opening a target still validates it.
     var localPlaylistRecords: [DownloadRecord] { completedCache }
-    func localPlaybackRequest(for id: String, playlistIDs: [String]? = nil) throws -> PlaybackRequest {
+    func localPlaybackRequest(for id: String, playlistIDs: [String]? = nil,
+                              startMode: PlaybackStartMode = .standard) throws -> PlaybackRequest {
         guard let record = recordsByID[id],
               record.state == .complete, let file = disk?.verifiedFile(for: record) else {
             throw ClientError("本地文件缺失或下载未完成，请重新下载。")
         }
-        return try PlaybackRequest(key: record.id, title: record.video.name, url: file, playlistIDs: playlistIDs)
+        return try PlaybackRequest(key: record.id, title: record.video.name, url: file, playlistIDs: playlistIDs, startMode: startMode)
     }
     func transitionPlayback(from old: PlaybackRequest, to next: PlaybackRequest,
                             stopCurrent: () -> Void) throws {
@@ -364,24 +416,73 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             playback = nil
         }
     }
-    // Explicit maintenance only when ids is nil. Playback/list rendering never
-    // calls this with all records. Mutations are published once, not per file.
-    func reconcileFiles(ids: Set<String>? = nil) {
-        guard let disk = disk else { return }
+    // Older builds moved absent and invalid completed downloads into the failed
+    // transfer list. Only that specific failure is evidence of a former download.
+    private static let legacyMissingMessage = "本地文件缺失或大小异常，请重新下载。"
+    private static let invalidFileMessage = "本地文件大小或类型已改变，请放回原文件或重新下载。"
+    private func wasDownloaded(_ record: DownloadRecord) -> Bool {
+        record.state == .complete || record.state == .missing ||
+            (record.state == .failed &&
+                (record.message == Self.legacyMissingMessage || record.message == Self.invalidFileMessage))
+    }
+
+    // Files can move a multi-GB movie while the app is suspended. Enumerate
+    // directory metadata off the main queue; never read movie bytes for the list.
+    @MainActor func refreshDownloadedFiles() async {
+        let generation = UUID()
+        fileRefreshID = generation
+        guard let disk else { return }
+        let snapshot = records.filter(wasDownloaded)
+        guard !snapshot.isEmpty else { return }
+        let statuses = await Task.detached(priority: .utility) {
+            disk.fileStatuses(for: snapshot)
+        }.value
+        guard fileRefreshID == generation, !Task.isCancelled else { return }
+        applyFileStatuses(statuses, snapshot: snapshot, disk: disk)
+    }
+
+    func reconcileFiles(ids: Set<String>? = nil, includeDownloading: Bool = true) {
+        guard let disk else { return }
+        let snapshot = records.filter { record in
+            (ids?.contains(record.id) ?? true) &&
+                (record.state != .downloading || (includeDownloading && active[record.id] == nil))
+        }
+        let statuses = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, disk.fileStatus(for: $0)) })
+        applyFileStatuses(statuses, snapshot: snapshot, disk: disk)
+    }
+
+    private func applyFileStatuses(_ statuses: [String: LocalDownloadFileStatus],
+                                   snapshot: [DownloadRecord], disk: LocalStorage) {
+        let inspected = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0) })
         var next = records
-        for i in next.indices where ids?.contains(next[i].id) ?? true {
-            if disk.verifiedFile(for: next[i]) != nil {
-                if next[i].state != .complete {
-                    next[i].state = .complete
-                    next[i].message = nil
-                    if next[i].downloadedAt == nil { next[i].downloadedAt = Date() }
-                }
-            } else if next[i].state == .complete {
-                next[i].state = .failed
-                next[i].message = "本地文件缺失或大小异常，请重新下载。"
+        for index in next.indices {
+            let record = next[index]
+            // A retry, deletion or fresh download can finish while the folder is
+            // being read. Update only the same input and keep newer watch/favorite flags.
+            guard let original = inspected[record.id], original.taskToken == record.taskToken,
+                  original.state == record.state, original.publicFileName == record.publicFileName,
+                  let status = statuses[record.id] else { continue }
+            switch status {
+            case .available where record.state != .complete:
+                next[index].state = .complete
+                next[index].message = nil
+                next[index].retryingMissingDownload = nil
+                if !wasDownloaded(record), record.downloadedAt == nil { next[index].downloadedAt = Date() }
+            case .absent where wasDownloaded(record):
+                next[index].state = .missing
+                if record.state != .missing { next[index].message = nil }
+                next[index].pendingDeletionOrder = nil
+            case .invalid where wasDownloaded(record):
+                next[index].state = .failed
+                next[index].message = Self.invalidFileMessage
+                next[index].pendingDeletionOrder = nil
+            default:
+                break
             }
         }
-        if next != records { records = next; saveRecords() }
+        guard next != records else { return }
+        do { try disk.saveRecords(next); records = next }
+        catch { errorMessage = "更新本地文件状态失败：\(error.localizedDescription)" }
     }
     private func saveRecords() {
         do { try disk?.saveRecords(records) }
@@ -402,11 +503,14 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
                     self.active[record.id] = download
                     if download.state == .suspended { download.resume() }
                 }
+                // A same-name file can be added externally while a background
+                // download runs. Only absent tasks can need crash recovery.
+                let interrupted = self.records.filter { $0.state == .downloading && !live.contains($0.taskToken) }
+                self.reconcileFiles(ids: Set(interrupted.map(\.id)))
                 var next = self.records
                 for i in next.indices where next[i].state == .downloading {
                     if !live.contains(next[i].taskToken) {
-                        next[i].state = .failed
-                        next[i].message = "系统中已无此下载任务，可能被强制退出中断，可重新下载。"
+                        next[i].failTransfer("系统中已无此下载任务，可能被强制退出中断，可重新下载。")
                     }
                 }
                 if next != self.records { self.records = next }
@@ -431,18 +535,26 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     }
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let index = index(for: downloadTask), records[index].state == .downloading else { return }
-        let record = records[index]
+        var record = records[index]
         var next = records
         do {
             guard let disk = disk else { throw ClientError("本地存储不可用。") }
+            // Files may have created a namesake during a long download. Commit
+            // the new destination before publishing the completed movie.
+            let name = try disk.availableFileName(for: record, among: records)
+            if name != record.publicFileName {
+                record.publicFileName = name
+                next[index] = record
+                try disk.saveRecords(next)
+            }
             try disk.finish(temp: location, response: downloadTask.response, record: record)
             next[index].state = .complete
             next[index].message = nil
+            next[index].retryingMissingDownload = nil
             next[index].downloadedAt = Date()
             progress[record.id] = 1
         } catch {
-            next[index].state = .failed
-            next[index].message = error.localizedDescription
+            next[index].failTransfer(error.localizedDescription)
         }
         records = next
         active.removeValue(forKey: record.id)
@@ -452,8 +564,7 @@ final class VideoStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let index = index(for: task), records[index].state == .downloading, let error = error else { return }
         var next = records
-        next[index].state = .failed
-        next[index].message = error.localizedDescription + "；可重新下载（从头开始）。"
+        next[index].failTransfer(error.localizedDescription + "；可重新下载（从头开始）。")
         let id = next[index].id
         records = next
         active.removeValue(forKey: id)
@@ -535,6 +646,55 @@ extension VideoStore {
             errorMessage = (["部分项目未删除或空间回收未完成，详情如下："] + failures + warnings).joined(separator: "\n")
         }
         return deleted
+    }
+    // A confirmed history cleanup may only change the private index. In particular,
+    // never invoke a file removal if Files restores or replaces an item mid-action.
+    func forgetMissingDownloads(_ request: BatchDeletionRequest) -> BatchDeletionResult {
+        var outcome = BatchDeletionResult(recordsOnly: true)
+        guard request.scope == .missingHistory, !restoring else { return outcome }
+        guard let disk else {
+            outcome.failures = request.records.map { "\($0.video.name)：本地存储不可用，原记录已保留。" }
+            return outcome
+        }
+        let current = request.records.compactMap { snapshot -> DownloadRecord? in
+            guard let record = recordsByID[snapshot.id], record.taskToken == snapshot.taskToken,
+                  record.publicFileName == snapshot.publicFileName, record.state == .missing,
+                  !isPlaybackProtected(record.id) else { return nil }
+            return record
+        }
+        // Check only the records confirmed by the user. A single-row removal
+        // should cost one lookup even in a large downloads folder.
+        var ids = Set<String>()
+        var changed = Set<String>()
+        outcome.skipped = request.records.count - current.count
+        for record in current {
+            switch disk.fileStatus(for: record) {
+            case .absent:
+                ids.insert(record.id)
+            case .available, .invalid:
+                changed.insert(record.id)
+                outcome.skipped += 1
+            case .unavailable:
+                outcome.failures.append("\(record.video.name)：文件夹暂时无法访问，记录已保留。")
+            }
+        }
+        if !ids.isEmpty {
+            let next = records.filter { !ids.contains($0.id) }
+            do {
+                try disk.saveRecords(next)
+                records = next
+                for record in current where ids.contains(record.id) {
+                    defaults.removeObject(forKey: "position." + record.id)
+                    outcome.removedTokens.insert(record.taskToken)
+                }
+                deletionNotice = nil
+            } catch {
+                let message = error.localizedDescription
+                outcome.failures += current.filter { ids.contains($0.id) }.map { "\($0.video.name)：保存失败，\(message)" }
+            }
+        }
+        if !changed.isEmpty { reconcileFiles(ids: changed) }
+        return outcome
     }
     private func deleteLocally(_ record: DownloadRecord, saving next: [DownloadRecord]) throws -> String? {
         guard !isPlaybackProtected(record.id) else {

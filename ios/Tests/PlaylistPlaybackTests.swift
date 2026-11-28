@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import Combine
+import Observation
 @testable import NiceVideos
 
 private final class PlaylistTestEngine: LocalPlaybackEngine {
@@ -57,6 +58,7 @@ final class PlaylistPlaybackTests: XCTestCase {
             let video = Video(name: name, size: 4, contentType: "video/mp4", url: "/api/stream/\(name)",
                               downloadUrl: "/api/download/\(name)")
             var record = DownloadRecord(video: video, server: try ServerAddress.normalize("http://127.0.0.1:\(8100 + index)"))
+            record.publicFileName = try disk.availableFileName(for: record, among: records)
             record.state = .complete
             // Explicit newest-first dates retain the fixture's display order.
             // Legacy reverse order is covered separately by LibraryPoliciesTests.
@@ -82,6 +84,26 @@ final class PlaylistPlaybackTests: XCTestCase {
         }
         return PlaylistFixture(disk: disk, records: records, defaults: defaults, store: store,
                                anchor: anchor, model: model, pool: pool, requests: requests)
+    }
+
+    @MainActor func testCompatibleCopyOnlyOpensAfterTheOriginalPlayerCloses() async throws {
+        let f = try fixture(count: 1)
+        let url = f.disk.root.appendingPathComponent("4K-compat.mp4")
+        try Data([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]).write(to: url)
+        let file = try await PickedVideoFile.open(url)
+        let stale = PlaybackRequest(pickedFile: file)
+        XCTAssertThrowsError(try f.store.queueCompatibleCopy(file, replacing: stale))
+        try f.store.queueCompatibleCopy(file, replacing: f.anchor)
+        XCTAssertEqual(f.store.playback?.id, f.anchor.id)
+        f.model.close()
+        XCTAssertNil(f.store.playback)
+        f.store.openQueuedCompatibleCopy()
+        let replacement = try XCTUnwrap(f.store.playback)
+        XCTAssertTrue(replacement.pickedFile === file)
+        XCTAssertEqual(replacement.startMode, .afterglow)
+        f.store.playbackDidClose(replacement)
+        f.store.openQueuedCompatibleCopy()
+        XCTAssertNil(f.store.playback, "The queued choice is consumed just once")
     }
 
     @MainActor private func finishQueuedCallbacks() async {
@@ -434,6 +456,7 @@ final class PlaylistPlaybackTests: XCTestCase {
         let f = try fixture(count: 2, sameNames: true)
         XCTAssertEqual(f.model.entries.count, 2)
         XCTAssertNotEqual(f.records[0].id, f.records[1].id)
+        XCTAssertNotEqual(try f.disk.destination(for: f.records[0]), try f.disk.destination(for: f.records[1]))
         XCTAssertTrue(f.model.move(.next))
         XCTAssertEqual(f.model.current.key, f.records[1].id)
     }
@@ -535,6 +558,27 @@ final class PlaylistPlaybackTests: XCTestCase {
         let subscription = f.model.player.objectWillChange.sink { _ in updates += 1 }
         for _ in 0..<100 { f.pool.engines[0].tick(12) }
         XCTAssertEqual(updates, 0)
+        withExtendedLifetime(subscription) {}
+    }
+
+    @MainActor func testAdvancingClockUpdatesProgressWithoutInvalidatingPlayerSurface() throws {
+        let f = try fixture()
+        let player = f.model.player
+        let engine = f.pool.engines[0]
+        player.attach(to: UIView())
+        engine.tick(12)
+        var playerUpdates = 0
+        let subscription = player.objectWillChange.sink { _ in playerUpdates += 1 }
+        let progressChanged = expectation(description: "elapsed time observer receives a new position")
+        let position = withObservationTracking { player.seconds } onChange: { progressChanged.fulfill() }
+        XCTAssertEqual(position, 12)
+
+        for tick in 1...100 { engine.tick(12 + Double(tick) / 10) }
+        XCTAssertEqual(XCTWaiter.wait(for: [progressChanged], timeout: 0), .completed)
+        XCTAssertEqual(player.seconds, 22)
+        XCTAssertEqual(playerUpdates, 0)
+        player.pause()
+        XCTAssertGreaterThan(playerUpdates, 0, "Transport changes still update the full player.")
         withExtendedLifetime(subscription) {}
     }
 }

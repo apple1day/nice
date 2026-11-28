@@ -25,11 +25,13 @@ final class PlaylistPlaybackModel: ObservableObject {
     private var closed = false
 
     init(request: PlaybackRequest, store: VideoStore,
-         engineFactory: @escaping () -> LocalPlaybackEngine = { VLCPlaybackEngine() },
+         engineFactory: (() -> LocalPlaybackEngine)? = nil,
          defaults: UserDefaults = .standard, manageAudioSession: Bool = true,
          requestResolver: ((String) throws -> PlaybackRequest)? = nil) {
         self.store = store
-        self.engineFactory = engineFactory
+        let file = request.pickedFile
+        let makeEngine = engineFactory ?? { SBSPlaybackEngine(pickedFile: file) }
+        self.engineFactory = makeEngine
         self.defaults = defaults
         self.manageAudioSession = manageAudioSession
         resolveRequest = requestResolver ?? { try store.localPlaybackRequest(for: $0) }
@@ -40,7 +42,14 @@ final class PlaylistPlaybackModel: ObservableObject {
         let ids = request.playlistIDs ?? LocalLibraryOrder.newestFirst(
             store.completed, completedAt: { $0.downloadedAt }).map(\.id)
         playlist = LocalPlaybackPlaylist(ids: ids, currentID: request.key)
-        let engine = WatchedPlaybackEngine(base: engineFactory()) { [weak store] in
+        if file != nil {
+            // Files opens one external movie, without mutating the download
+            // library, observing its records or auto-advancing into it at EOF.
+            player = PlaybackModel(request: request, engine: makeEngine(), defaults: defaults,
+                                   manageAudioSession: manageAudioSession)
+            return
+        }
+        let engine = WatchedPlaybackEngine(base: makeEngine()) { [weak store] in
             store?.markWatched(request.key)
         }
         player = PlaybackModel(request: request, engine: engine, defaults: defaults,
@@ -128,7 +137,7 @@ final class PlaylistPlaybackModel: ObservableObject {
     // cached button appearance. A stale press must never mark a different clip.
     @discardableResult func markCurrentForDeletion(expectedRequestID: UUID) -> Bool {
         guard !closed, !switching, store.playback != nil,
-              current.id == expectedRequestID else {
+              current.id == expectedRequestID, current.pickedFile == nil else {
             notice = "视频已切换或播放器已关闭，请重新点击当前视频的删除按钮。"
             return false
         }

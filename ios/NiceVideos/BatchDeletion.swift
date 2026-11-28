@@ -3,11 +3,13 @@ import Foundation
 enum BatchDeletionScope {
     case localVideos
     case downloadTasks
+    case missingHistory
 
     func includes(_ record: DownloadRecord) -> Bool {
         switch self {
+        case .missingHistory: return record.state == .missing
         case .localVideos: return record.state == .complete
-        case .downloadTasks: return record.state != .complete
+        case .downloadTasks: return record.state == .downloading || record.state == .failed
         }
     }
 }
@@ -29,16 +31,23 @@ struct BatchDeletionRequest: Identifiable {
 
     var title: String {
         switch scope {
+        case .missingHistory:
+            return records.count == 1 ? "移除「\(records[0].video.name)」的记录？" : "移除这 \(records.count) 条已删除记录？"
         case .localVideos: return "删除这 \(records.count) 个本地视频？"
         case .downloadTasks:
             return clearAll ? "清空当前 \(records.count) 项下载任务？" : "删除这 \(records.count) 项下载任务？"
         }
     }
 
-    var buttonTitle: String { clearAll ? "确认清空" : "确认删除" }
+    var buttonTitle: String {
+        if scope == .missingHistory { return "确认移除记录" }
+        return clearAll ? "确认清空" : "确认删除"
+    }
 
     var message: String {
         switch scope {
+        case .missingHistory:
+            return "将从本地列表移除这些记录、收藏和续播进度。保留手机与服务器上的文件，已恢复或正在重新下载的项目会跳过。"
         case .localVideos:
             return "立即删除所选手机文件及播放进度，并移出待删除队列，不会删除服务器原视频。此操作无法撤销。"
         case .downloadTasks:
@@ -52,6 +61,7 @@ struct BatchDeletionRequest: Identifiable {
 }
 
 struct BatchDeletionResult {
+    var recordsOnly = false
     var removedTokens = Set<String>()
     var skipped = 0
     var failures: [String] = []
@@ -59,7 +69,7 @@ struct BatchDeletionResult {
     var details: [String] = []
 
     var summary: String {
-        var parts = ["已删除 \(removedTokens.count) 项"]
+        var parts = [recordsOnly ? "已移除 \(removedTokens.count) 条记录" : "已删除 \(removedTokens.count) 项"]
         if skipped > 0 { parts.append("跳过 \(skipped) 项") }
         if !failures.isEmpty { parts.append("失败 \(failures.count) 项") }
         return parts.joined(separator: "，") + "。"
@@ -72,13 +82,14 @@ extension VideoStore {
     // cancellation, progress/bookmark cleanup and pending-queue cleanup.
     @discardableResult
     func deleteBatch(_ request: BatchDeletionRequest) -> BatchDeletionResult {
-        var result = BatchDeletionResult()
+        var result = BatchDeletionResult(recordsOnly: request.scope == .missingHistory)
         guard !request.records.isEmpty else { return result }
         guard !restoring else {
             result.failures = request.records.map { "\($0.video.name)：正在恢复下载任务，请稍后重试。" }
             errorMessage = "正在恢复下载任务，未删除任何项目。"
             return result
         }
+        if request.scope == .missingHistory { return forgetMissingDownloads(request) }
         for snapshot in request.records {
             guard let current = request.currentRecord(for: snapshot, in: records) else {
                 result.skipped += 1

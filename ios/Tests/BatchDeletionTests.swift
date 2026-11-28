@@ -48,7 +48,7 @@ final class BatchDeletionTests: XCTestCase {
         XCTAssertEqual(try disk.loadRecords(), store.records)
     }
 
-    @MainActor func testClearTasksRemovesUnfinishedAndPartialFilesButKeepsCompleted() throws {
+    @MainActor func testClearTasksKeepsUserFilesAtUnfinishedPathsAndCompletedDownloads() throws {
         let (disk, defaults, entries, store) = try fixture([.complete, .downloading, .failed])
         let request = BatchDeletionRequest(scope: .downloadTasks, records: store.records, clearAll: true)
         XCTAssertEqual(request.records.count, 2)
@@ -57,7 +57,7 @@ final class BatchDeletionTests: XCTestCase {
         XCTAssertTrue(store.unfinished.isEmpty)
         XCTAssertEqual(store.completed.map(\.id), [entries[0].id])
         XCTAssertNotNil(disk.verifiedFile(for: entries[0]))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: try disk.destination(for: entries[1]).path))
+        XCTAssertEqual(try Data(contentsOf: disk.destination(for: entries[1])), Data([0, 1]))
         XCTAssertEqual(defaults.double(forKey: "position." + entries[0].id), 20)
         XCTAssertNil(defaults.object(forKey: "position." + entries[1].id))
         XCTAssertEqual(try disk.loadRecords(), store.records)
@@ -191,6 +191,64 @@ final class BatchDeletionTests: XCTestCase {
         XCTAssertFalse(relaunched.loading)
         relaunched.playLocal(entries[1])
         XCTAssertTrue(try XCTUnwrap(relaunched.playback).url.isFileURL)
+    }
+
+    @MainActor func testClearMissingHistoryRefreshesRestoredMoviesAndOnlyForgetsAbsentConfirmedEntries() throws {
+        let (disk, defaults, rows, store) = try fixture([.missing, .missing, .missing, .complete, .failed])
+        let list = LocalLibraryModel(store: store)
+        XCTAssertEqual(Set(list.visibleMissingRecords.map(\.id)), Set(rows.prefix(3).map(\.id)))
+        list.setSearch("批量 2")
+        XCTAssertEqual(list.visibleMissingRecords, [rows[2]])
+        let request = BatchDeletionRequest(scope: .missingHistory, records: [rows[0], rows[1], rows[3], rows[4], rows[0]])
+        XCTAssertEqual(request.records, [rows[0], rows[1]])
+        let restored = try disk.destination(for: rows[1])
+        let data = Data([4, 5, 6, 7])
+        try data.write(to: restored)
+        let result = store.deleteBatch(request)
+        XCTAssertEqual(result.removedTokens, [rows[0].taskToken])
+        XCTAssertEqual(result.skipped, 1)
+        XCTAssertTrue(result.failures.isEmpty)
+        XCTAssertTrue(result.summary.contains("已移除 1 条记录"))
+        XCTAssertEqual(store.records.map(\.state), [.complete, .missing, .complete, .failed])
+        XCTAssertEqual(try Data(contentsOf: restored), data)
+        XCTAssertThrowsError(try store.localPlaybackRequest(for: rows[0].id))
+        XCTAssertEqual(try store.localPlaybackRequest(for: rows[1].id).url, restored)
+        XCTAssertNil(defaults.object(forKey: "position." + rows[0].id))
+        for record in rows.dropFirst() {
+            XCTAssertEqual(defaults.double(forKey: "position." + record.id), 20)
+        }
+        let reopened = VideoStore(storage: disk, defaults: defaults, restoreDownloads: false)
+        XCTAssertEqual(reopened.records, store.records)
+        XCTAssertEqual(reopened.deleteBatch(request).skipped, 2)
+    }
+
+    @MainActor func testRemoveMissingRecordSkipsNewDownloadAttemptAndPreservesUserMovedFile() throws {
+        let (disk, defaults, rows, _) = try fixture([.missing, .missing])
+        let request = BatchDeletionRequest(scope: .missingHistory, records: rows)
+        let moved = disk.root.appendingPathComponent("文件夹外的原片.mp4")
+        let bytes = Data([1, 2, 3, 4])
+        try bytes.write(to: moved)
+        let next = DownloadRecord(video: rows[1].video, server: try ServerAddress.normalize(rows[1].server))
+        try disk.saveRecords([rows[0], next])
+        let refreshed = VideoStore(storage: disk, defaults: defaults, restoreDownloads: false)
+        let result = refreshed.deleteBatch(request)
+        XCTAssertEqual(result.skipped, 1)
+        XCTAssertEqual(result.removedTokens, [rows[0].taskToken])
+        XCTAssertEqual(refreshed.records, [next])
+        XCTAssertEqual(try Data(contentsOf: moved), bytes)
+    }
+
+    @MainActor func testMissingCleanupKeepsHistoryAndBookmarksIfSavingFails() throws {
+        let (disk, defaults, rows, store) = try fixture([.missing, .missing])
+        let manifest = disk.root.appendingPathComponent("downloads.json")
+        try FileManager.default.removeItem(at: manifest)
+        try FileManager.default.createDirectory(at: manifest, withIntermediateDirectories: true)
+        try Data([1]).write(to: manifest.appendingPathComponent("occupied"))
+        let outcome = store.deleteBatch(BatchDeletionRequest(scope: .missingHistory, records: rows))
+        XCTAssertTrue(outcome.removedTokens.isEmpty)
+        XCTAssertEqual(outcome.failures.count, 2)
+        XCTAssertEqual(store.records, rows)
+        for row in rows { XCTAssertEqual(defaults.double(forKey: "position." + row.id), 20) }
     }
 
     func testSelectionOnlyIncludesVisibleRowsAndDoesNotFollowRetries() {

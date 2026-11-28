@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 private struct UploadDestination: Identifiable {
     let id = UUID()
@@ -11,29 +12,61 @@ struct LocalUploadView: View {
     @StateObject private var uploads = LocalUploadManager.shared
     @AppStorage("allowUploadCellular") private var allowCellular = false
     @State private var destination: UploadDestination?
+    @State private var choosingFiles = false
+    @State private var fileDestination: UploadDestination?
+    @State private var inspection: Task<Void, Never>?
+    @State private var picked: [LocalUploadSource] = []
 
     var body: some View {
         List {
             Section {
                 Button {
-                    do {
-                        destination = UploadDestination(server: try ServerAddress.normalize(store.server),
-                                                        allowsCellular: allowCellular)
-                    } catch { uploads.errorMessage = "请先在「设置」配置上传目标服务器。\n\(error.localizedDescription)" }
+                    guard let target = uploadDestination() else { return }
+                    fileDestination = target
+                    choosingFiles = true
                 } label: {
-                    Label("选择本地视频上传", systemImage: "square.and.arrow.up")
-                }.accessibilityIdentifier("chooseVideosToUploadButton")
-                Text("从 App 已下载的视频中选择一个或多个。上传后保留手机文件、收藏及观看状态；服务器同名文件不会被覆盖。")
-                    .font(.footnote).foregroundStyle(.secondary)
-                Text("此版为前台上传。大视频请保持 App 在前台；锁屏、切后台或强退不保证继续。中断后可重新上传，不支持断点续传。")
+                    Label("从「文件」选择视频", systemImage: "folder")
+                }
+                .disabled(inspection != nil || !picked.isEmpty)
+                .accessibilityIdentifier("chooseFilesToUploadButton")
+                Button {
+                    destination = uploadDestination()
+                } label: {
+                    Label("从已下载视频选择", systemImage: "arrow.down.circle")
+                }
+                .disabled(inspection != nil || !picked.isEmpty)
+                .accessibilityIdentifier("chooseVideosToUploadButton")
+                Text("支持多选 MP4、MOV、MKV 等视频。大视频请保持 App 在前台，上传中断后需要从头重试。")
                     .font(.footnote).foregroundStyle(.secondary)
                 Toggle("允许新上传使用蜂窝数据", isOn: $allowCellular)
                 Text("默认关闭。任务会固定使用确认时的服务器地址和网络设置；单个视频上限 20 GiB。")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if uploads.jobs.isEmpty {
-                ContentUnavailableView("暂无上传任务", systemImage: "arrow.up.circle",
-                    description: Text("点击上方按钮选择手机中的本地视频。"))
+            if inspection != nil {
+                Section {
+                    ProgressView("正在读取所选文件信息…")
+                    Button("取消选择", role: .cancel) { discardFileSelection() }
+                }
+            } else if !picked.isEmpty, let target = fileDestination {
+                Section("待上传的文件（\(picked.count)）") {
+                    LabeledContent("上传到", value: target.server.absoluteString)
+                    ForEach(picked, id: \.id) { source in
+                        LabeledContent {
+                            Text(ByteCountFormatter.string(fromByteCount: source.size, countStyle: .file))
+                        } label: {
+                            Text(source.name).lineLimit(2)
+                        }
+                    }
+                    Button("确认上传到服务器") {
+                        if uploads.enqueue(picked, server: target.server, allowsCellular: allowCellular) {
+                            discardFileSelection()
+                        }
+                    }
+                    .accessibilityIdentifier("confirmFilesUploadButton")
+                    Button("取消选择", role: .cancel) { discardFileSelection() }
+                }
+            } else if uploads.jobs.isEmpty {
+                ContentUnavailableView("暂无上传任务", systemImage: "arrow.up.circle")
             }
             ForEach(uploads.jobs.reversed()) { job in
                 VStack(alignment: .leading, spacing: 8) {
@@ -64,6 +97,10 @@ struct LocalUploadView: View {
                     .disabled(!uploads.jobs.contains { !$0.state.isPending })
             }
         }
+        // Some file providers advertise MKV and WebM as generic data. The upload
+        // service validates every selected file against the server's supported formats.
+        .fileImporter(isPresented: $choosingFiles, allowedContentTypes: [.data],
+                      allowsMultipleSelection: true, onCompletion: receiveFiles)
         .sheet(item: $destination) { value in
             UploadVideoPicker(store: store, destination: value) { sources in
                 uploads.enqueue(sources, server: value.server, allowsCellular: value.allowsCellular)
@@ -73,6 +110,47 @@ struct LocalUploadView: View {
             get: { uploads.errorMessage != nil }, set: { if !$0 { uploads.errorMessage = nil } }
         )) { Button("确定", role: .cancel) { uploads.errorMessage = nil } }
         message: { Text(uploads.errorMessage ?? "") }
+    }
+    private func uploadDestination() -> UploadDestination? {
+        do {
+            return UploadDestination(server: try ServerAddress.normalize(store.server), allowsCellular: allowCellular)
+        } catch {
+            uploads.errorMessage = "请先在「设置」配置上传目标服务器。\n\(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    private func receiveFiles(_ result: Result<[URL], Error>) {
+        guard let target = fileDestination else { return }
+        switch result {
+        case .success(let urls):
+            guard !urls.isEmpty else { discardFileSelection(); return }
+            inspection = Task { @MainActor in
+                do {
+                    let sources = try await LocalUploadSource.pickedFiles(urls)
+                    guard !Task.isCancelled, fileDestination?.id == target.id else { return }
+                    picked = sources
+                } catch {
+                    guard !Task.isCancelled, fileDestination?.id == target.id else { return }
+                    fileDestination = nil
+                    uploads.errorMessage = error.localizedDescription
+                }
+                inspection = nil
+            }
+        case .failure(let error):
+            discardFileSelection()
+            let nsError = error as NSError
+            if nsError.domain != NSCocoaErrorDomain || nsError.code != NSUserCancelledError {
+                uploads.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func discardFileSelection() {
+        inspection?.cancel()
+        inspection = nil
+        fileDestination = nil
+        picked = []
     }
 }
 
@@ -101,7 +179,7 @@ private struct UploadVideoPicker: View {
     @State private var failedToQueue = false
 
     init(store: VideoStore, destination: UploadDestination, upload: @escaping ([LocalUploadSource]) -> Bool) {
-        _library = StateObject(wrappedValue: LocalLibraryModel(store: store))
+        _library = StateObject(wrappedValue: LocalLibraryModel(store: store, includeMissing: false))
         self.destination = destination
         self.upload = upload
     }
