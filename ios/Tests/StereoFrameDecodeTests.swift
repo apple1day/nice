@@ -128,6 +128,29 @@ import XCTest
         try await checkStereoOutput(picked: false)
     }
 
+    func testVLCContinuesProducingWhileFourOutputSurfacesAreRetained() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "sbs", withExtension: "mp4", subdirectory: "Fixtures"))
+        let ready = expectation(description: "VLC delivers successive replacements with four outstanding surfaces")
+        var retained: [CVPixelBuffer] = []
+        var deliveries = 0
+        let engine = VLCPlaybackEngine(frameHandler: { frame in
+            guard deliveries < 8 else { return }
+            // Model the two in-flight GPU commands, renderer and delivery slot
+            // by releasing the oldest surface only once its replacement arrives.
+            XCTAssertFalse(retained.contains { $0 === frame })
+            if retained.count == 4 { retained.removeFirst() }
+            retained.append(frame)
+            deliveries += 1
+            if deliveries == 8 { ready.fulfill() }
+        }, preferSmallerPanoramaFrames: true)
+        defer { engine.stop() }
+        try engine.load(fileURL: url)
+        engine.play()
+        await fulfillment(of: [ready], timeout: 10)
+        XCTAssertEqual(deliveries, 8)
+    }
+
     func testPickedSBSFramePreservesVisibleGeometryAndBothEyes() async throws {
         try await checkStereoOutput(picked: true)
     }

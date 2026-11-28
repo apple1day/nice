@@ -83,8 +83,12 @@ ffmpeg -hide_banner -loglevel error -y -stream_loop 29 -i "$pattern_dir/panorama
 # projection and frame motion; actual decoded audio is measured in the hosted test.
 ffmpeg -hide_banner -loglevel error -y -i panorama-audio.mp4 -map 0:v:0 -c copy \
   -movflags +faststart ../../UITests/panorama-chart.mp4
-# A compact hev1 clip with B frames and two independently measurable eyes.
-ffmpeg -hide_banner -loglevel error -y -f lavfi \
-  -i "color=red:s=320x160:r=60000/1001,drawbox=x=160:w=160:h=160:c=blue:t=fill,drawbox=x=0:w=160:h=160:c=lime:t=fill:enable='gte(t,1)',drawbox=x=160:w=160:h=160:c=yellow:t=fill:enable='gte(t,1)'" \
-  -t 2 -c:v libx265 -pix_fmt yuv420p -tag:v hev1 -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
-  -x265-params 'pools=1:frame-threads=1:bframes=2:b-adapt=0:open-gop=0:keyint=60:min-keyint=60:scenecut=0:log-level=error' direct-hevc.mp4
+# Reordered HEVC frames exercise both high-rate and film-rate presentation.
+make_direct_hevc() {
+  ffmpeg -hide_banner -loglevel error -y -f lavfi \
+    -i "color=red:s=320x160:r=$1,drawbox=x=160:w=160:h=160:c=blue:t=fill,drawbox=x=0:w=160:h=160:c=lime:t=fill:enable='gte(t,1)',drawbox=x=160:w=160:h=160:c=yellow:t=fill:enable='gte(t,1)'" \
+    -t 2 -c:v libx265 -pix_fmt yuv420p -tag:v hev1 -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+    -x265-params 'pools=1:frame-threads=1:bframes=2:b-adapt=0:open-gop=0:keyint=60:min-keyint=60:scenecut=0:log-level=error' "$2"
+}
+make_direct_hevc 60000/1001 direct-hevc.mp4
+make_direct_hevc 24 direct-hevc-24.mp4

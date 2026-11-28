@@ -231,7 +231,11 @@ static NICEFrameGeometry NICEVisibleGeometry(id<NICEVLCTrackSource> media, unsig
         _pitches[i] = (unsigned)pitch;
         _lines[i] = (unsigned)rows;
     }
-    _poolLimits = @{ (__bridge NSString *)kCVPixelBufferPoolAllocationThresholdKey: @5 }; // includes scratch
+    // Two distinct frames can still be in GPU commands, a third is the latest
+    // renderer frame, and a fourth is waiting for main-queue delivery. Leave
+    // room for VLC to write the next picture as well as the reserved scratch.
+    // This is a ceiling: Core Video allocates the sixth surface only on demand.
+    _poolLimits = @{ (__bridge NSString *)kCVPixelBufferPoolAllocationThresholdKey: @6 };
     return self;
 }
 

@@ -268,10 +268,11 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
                 delivery = -7;
                 return;
             }
-            // Reduced decode is optional. Native 8K IOSurfaces can be mapped
-            // directly; only retain as many as fit in a 128 MiB lookahead.
+            // Decode order can place several future P/B pictures ahead of the
+            // next due picture. Retain them when the actual surfaces fit. With
+            // 8192x2048 NV12 this permits up to five, with 8192x4096 up to two.
             size_t bytes = MAX(CVPixelBufferGetDataSize(image), w*h*3/2);
-            self->_surfaceLimit = MAX(1, MIN(2, (128u*1024u*1024u)/bytes));
+            self->_surfaceLimit = MAX(1, MIN(8, (128u*1024u*1024u)/bytes));
             CMVideoFormatDescriptionRef imageFormat = NULL;
             CMSampleBufferRef picture = NULL;
             // The output handler belongs to this input packet. Its timestamp
@@ -283,7 +284,7 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
             if (imageFormat) CFRelease(imageFormat);
             if (picture) {
                 [self->_pictures addObject:CFBridgingRelease(picture)];
-                [self trimPicturesAt:clock];
+                while (self->_pictures.count > self->_surfaceLimit) [self trimPicturesAt:clock];
             }
         });
     if (packet) CFRelease(packet);
@@ -297,7 +298,6 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
 // Keep the latest due picture and then the nearest future pictures. A future
 // P-frame anchor never prevents the next ready B-frame from entering the queue.
 - (void)trimPicturesAt:(double)clock {
-    if (_pictures.count <= _surfaceLimit) return;
     NSInteger earliest = 0, latest = 0, dueCount = 0;
     double minTime = INFINITY, maxTime = -INFINITY;
     for (NSInteger i = 0; i < _pictures.count; i++) {
@@ -310,6 +310,14 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
     [_pictures removeObjectAtIndex:dueCount > 1 ? earliest : latest];
 }
 
+- (BOOL)hasPictureDueAt:(double)seconds {
+    for (id entry in _pictures) {
+        double pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp((__bridge CMSampleBufferRef)entry));
+        if (pts > _lastPTS && pts >= seconds - 0.25 && pts <= seconds + 0.002) return YES;
+    }
+    return NO;
+}
+
 - (nullable CMSampleBufferRef)copyPictureAt:(double)seconds {
     NSError *error = nil;
     CMSampleBufferRef picture = [self readPictureAt:seconds error:&error];
@@ -320,18 +328,18 @@ static CMVideoFormatDescriptionRef CopyDecoderFormat(CMVideoFormatDescriptionRef
 - (nullable CMSampleBufferRef)readPictureAt:(double)seconds error:(NSError **)error {
     if (!isfinite(seconds) || seconds < 0) return NULL;
     if (!_reader && ![self startAt:seconds error:error]) return NULL;
-    // Retain two NV12 surfaces and one packet. If the queue is full, keep
-    // decoding packets whose DTS is already due: their PTS may precede an
-    // anchor already queued. trimPicturesAt then evicts a more distant frame.
+    // Decode packets whose DTS is due even if the queue is full: their PTS
+    // may precede an anchor already queued. Decode ahead only while waiting
+    // for a usable picture; never delay a due picture for speculative work.
     for (int i = 0; i < 12; i++) {
         if (!_next) _next = [_output copyNextSampleBuffer];
         if (!_next) {
             if (_reader.status == AVAssetReaderStatusFailed) *error = _reader.error ?: DecodeError(@"compressed read", -8);
             break;
         }
-        CMTime time = OutputDTS(_next);
-        double lookahead = _pictures.count < _surfaceLimit ? 0.1 : 0;
-        if (CMTimeGetSeconds(time) > seconds + lookahead) break;
+        double dts = CMTimeGetSeconds(OutputDTS(_next));
+        if (dts > seconds &&
+            (dts > seconds + 0.1 || _pictures.count >= _surfaceLimit || [self hasPictureDueAt:seconds])) break;
         BOOL ok = [self decode:_next clock:seconds error:error];
         CFRelease(_next);
         _next = NULL;

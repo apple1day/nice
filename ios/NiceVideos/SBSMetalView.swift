@@ -244,6 +244,9 @@ final class SBSMetalView: UIView, MTKViewDelegate {
     }
 
     private var needsDraw = false
+    // Movie and display clocks are independent. Keep the display link running
+    // across ordinary gaps between 24/30 fps pictures on a 60 Hz screen.
+    private var cleanTicks = 0
     private var missedDrawables = 0
     // Leave room in the decoder's bounded pool for its scratch, incoming and
     // newest pending frame. Never wait for the GPU on the UI thread.
@@ -355,8 +358,9 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         delayedRetry = nil
         retries = 0
         needsDraw = true
+        cleanTicks = 0
         missedDrawables = 0
-        if canPresent && isReadyForDisplay { metalView.isPaused = false }
+        if metalView.isPaused && canPresent && isReadyForDisplay { metalView.isPaused = false }
     }
 
     private func missedDisplayTick() {
@@ -415,8 +419,15 @@ final class SBSMetalView: UIView, MTKViewDelegate {
         // In particular, Files dismissal, rotation and returning from the
         // background can deliver frames before a drawable is available. Keep
         // the newest one dirty and retry at the next display tick, even paused.
-        guard needsDraw, canPresent else {
+        guard canPresent else {
             view.isPaused = true
+            return
+        }
+        guard needsDraw else {
+            // No drawable or GPU work for an unchanged picture. Parking on
+            // the very first empty tick repeatedly restarts MTKView mid-movie.
+            cleanTicks += 1
+            if cleanTicks >= 4 { view.isPaused = true }
             return
         }
         guard gpuSlots.wait(timeout: .now()) == .success else {
