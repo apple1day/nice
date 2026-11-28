@@ -355,7 +355,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     }
 
     String playbackReport() {
-        String phase = failed ? "失败" : ended ? "已结束" : stalledPicture ? "等待新画面"
+        String phase = failed ? "失败" : ended ? "已结束" : stalledPicture ? "视频输出异常"
                 : !prepared ? "正在打开" : playing ? "播放中" : "已暂停";
         String mode = inVr ? VrOptionsDialog.projectionName(vrFormat.projection) + " · "
                 + VrOptionsDialog.layoutName(vrFormat) + " · " + (vrFormat.headset ? "双眼" : "单屏") : "原始画面";
@@ -467,7 +467,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
     }
 
     private boolean checkPictureMotion(long current, boolean moving) {
-        if (!moving || !prepared || failed || dragging || session == null || !active
+        if (!moving || !prepared || failed || dragging || discreteTarget >= 0 || session == null || !active
                 || (duration > 0 && duration - current < 900)) {
             resetPictureWatch();
             return false;
@@ -475,7 +475,7 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         VideoFrameWatch.Action action = frameWatch.sample(current, SystemClock.elapsedRealtime(),
                 movie.presentedSamples(), firstFrame, session.frameRate());
         if (action == VideoFrameWatch.Action.RECONNECT) {
-            outputEvent = "播放时钟前进但没有新画面，在 " + time(current) + " 自动重连一次";
+            outputEvent = frameWatch.finding() + "，在 " + time(current) + " 自动重连一次";
             retireSession(true);
             status("正在从 " + time(current) + " 重连视频输出…", false);
             startIfReady();
@@ -483,7 +483,8 @@ public final class PlayerActivity extends Activity implements MovieSurface.Liste
         }
         if (action == VideoFrameWatch.Action.REPORT) {
             stalledPicture = true;
-            status("已重连一次，播放时钟仍前进但画面没有更新。请在「片源信息」查看解码能力或切换解码方式。", false);
+            outputEvent = "自动重连后仍异常：" + frameWatch.finding();
+            status(outputEvent + "。可在「片源信息」查看解码能力或切换解码方式。", false);
             showControls(true);
         } else if (stalledPicture && !frameWatch.reported()) {
             stalledPicture = false;
