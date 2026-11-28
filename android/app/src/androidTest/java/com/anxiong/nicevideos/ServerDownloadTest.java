@@ -30,9 +30,11 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
@@ -51,7 +53,7 @@ public final class ServerDownloadTest {
         final List<String> deletes = new CopyOnWriteArrayList<>();
         volatile int listedSize;
         volatile Exception failure;
-        volatile boolean downloaded;
+        volatile boolean downloaded, rejectDeletion, removed;
         LocalServer() throws Exception {
             try (InputStream input = InstrumentationRegistry.getInstrumentation().getContext()
                     .getAssets().open("moving-sbs.mp4"); ByteArrayOutputStream buffer = new ByteArrayOutputStream()) {
@@ -74,7 +76,7 @@ public final class ServerDownloadTest {
         }
         private byte[] index() throws Exception {
             JSONArray videos = new JSONArray();
-            if (!deletes.contains(NAME)) videos.put(row(NAME, listedSize));
+            if (!removed) videos.put(row(NAME, listedSize));
             videos.put(row(REMOTE_ONLY, media.length));
             return new JSONObject().put("videos", videos).toString().getBytes(StandardCharsets.UTF_8);
         }
@@ -94,10 +96,16 @@ public final class ServerDownloadTest {
                         boolean movie = ("/api/download/" + NAME).equals(path)
                                 || ("/api/download/" + REMOTE_ONLY).equals(path);
                         boolean delete = "DELETE".equals(request[0]) && path.startsWith("/api/videos/");
-                        if (delete) deletes.add(path.substring("/api/videos/".length()));
+                        if (delete) {
+                            String target = path.substring("/api/videos/".length());
+                            deletes.add(target);
+                            if (!rejectDeletion && NAME.equals(target)) removed = true;
+                        }
                         byte[] response = list ? index() : movie ? (path.endsWith(NAME)
                                 ? Arrays.copyOf(media, listedSize) : media) : new byte[0];
-                        String headers = "HTTP/1.1 " + (list || movie || delete ? "200 OK" : "404 Not Found")
+                        String status = list || movie || delete ? "200 OK" : "404 Not Found";
+                        if (delete && rejectDeletion) status = "500 Internal Server Error";
+                        String headers = "HTTP/1.1 " + status
                                 + "\r\nContent-Type: " + (movie ? "video/mp4" : "application/json")
                                 + "\r\nContent-Length: " + response.length + "\r\nConnection: close\r\n\r\n";
                         OutputStream out = connection.getOutputStream();
@@ -210,6 +218,55 @@ public final class ServerDownloadTest {
             } finally {
                 for (VideoLibrary.Entry e : library.all()) if (e.source.startsWith(base + "/")) library.remove(e);
                 library.prefs.edit().putString("server", previous).commit();
+            }
+        }
+    }
+
+    @Test public void unsafeLocalCopiesNeverSendDeleteAndServerFailureKeepsTheCopy() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        VideoLibrary library = new VideoLibrary(context);
+        try (LocalServer server = new LocalServer()) {
+            String base = server.address();
+            List<ServerVideos.Movie> catalog = ServerVideos.list(base);
+            VideoLibrary.Entry entry = new VideoLibrary.Entry(UUID.randomUUID().toString());
+            entry.name = NAME;
+            entry.source = ServerVideos.downloadEndpoint(base, NAME);
+            entry.bytes = server.media.length;
+            entry.disk = entry.id + ".mp4";
+            File copy = library.file(entry);
+            try {
+                assertTrue(library.saveCommitted(entry));
+                DownloadedServerDeletion.Plan snapshot = DownloadedServerDeletion.plan(base, catalog, library.all());
+                assertEquals(1, snapshot.size());
+                assertFalse(copy.exists());
+                assertEquals(1, DownloadedServerDeletion.run(snapshot, library, () -> true).skipped);
+                Files.write(copy.toPath(), Arrays.copyOf(server.media, server.media.length - 8));
+                assertEquals(1, DownloadedServerDeletion.run(snapshot, library, () -> true).skipped);
+                Files.write(copy.toPath(), server.media);
+
+                entry.state = VideoLibrary.TRANSFER;
+                assertTrue(library.saveCommitted(entry));
+                assertEquals(0, DownloadedServerDeletion.plan(base, catalog, library.all()).size());
+                assertEquals(1, DownloadedServerDeletion.run(snapshot, library, () -> true).skipped);
+                entry.state = VideoLibrary.READY;
+                entry.direct = true;
+                assertTrue(library.saveCommitted(entry));
+                assertEquals(0, DownloadedServerDeletion.plan(base, catalog, library.all()).size());
+                assertEquals(1, DownloadedServerDeletion.run(snapshot, library, () -> true).skipped);
+                assertTrue(server.deletes.isEmpty());
+
+                entry.direct = false;
+                assertTrue(library.saveCommitted(entry));
+                server.rejectDeletion = true;
+                DownloadedServerDeletion.Result failure = DownloadedServerDeletion.run(snapshot, library, () -> true);
+                assertEquals(1, failure.failed);
+                assertEquals(0, failure.deleted);
+                assertEquals(Collections.singletonList(NAME), server.deletes);
+                assertEquals(VideoLibrary.READY, library.find(entry.id).state);
+                assertArrayEquals(server.media, Files.readAllBytes(copy.toPath()));
+                assertFalse(server.removed);
+            } finally {
+                library.remove(entry);
             }
         }
     }
