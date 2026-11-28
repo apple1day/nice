@@ -6,7 +6,7 @@ bundle=$(cd -- "$(dirname -- "$0")" && pwd -P)
 payload="$bundle/payload.apk"
 recovery="$bundle/NiceVideos-Mobile-Recovery.tar.age"
 signer="$bundle/apksigner.jar"
-output="$bundle/NiceVideos-Android-1.3.11-Update.apk"
+output="$bundle/NiceVideos-Android-1.3.12-Update.apk"
 expected=94b219553d6b9f07108b25d9be09764e94445e9f140200635e33ba7626f6a21b
 
 die() { printf '%s\n' "$*" >&2; exit 1; }

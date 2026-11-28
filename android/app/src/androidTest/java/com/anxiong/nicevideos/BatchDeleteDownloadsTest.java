@@ -42,7 +42,7 @@ import static org.junit.Assert.*;
 @RunWith(AndroidJUnit4.class)
 @SdkSuppress(minSdkVersion = 29)
 public final class BatchDeleteDownloadsTest {
-    private static final String BUTTON = "一键删除已下载视频";
+    private static final String BUTTON = "批量删除本机副本";
     private final Instrumentation ins = InstrumentationRegistry.getInstrumentation();
     private final Context app = ins.getTargetContext();
     private final VideoLibrary library = new VideoLibrary(app);

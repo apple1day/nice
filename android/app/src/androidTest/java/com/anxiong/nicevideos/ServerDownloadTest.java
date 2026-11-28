@@ -11,6 +11,7 @@ import android.view.ViewGroup;
 import android.widget.TextView;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import androidx.test.filters.SdkSuppress;
 import androidx.test.platform.app.InstrumentationRegistry;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -29,33 +30,54 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import static org.junit.Assert.*;
 
 @RunWith(AndroidJUnit4.class)
 public final class ServerDownloadTest {
     private static final String NAME = "样片 #+ 1%.mp4";
+    private static final String REMOTE_ONLY = "尚未下载.mp4";
 
-    /** The Go list and download routes, on the emulator's own loopback interface. */
+    /** The Go list, delete and download routes, on the emulator's own loopback interface. */
     private static final class LocalServer implements Closeable {
         final ServerSocket socket;
         final Thread worker;
-        final byte[] media = new byte[144_599];
-        final byte[] index;
+        final byte[] media;
+        final List<String> deletes = new CopyOnWriteArrayList<>();
+        volatile int listedSize;
         volatile Exception failure;
         volatile boolean downloaded;
         LocalServer() throws Exception {
-            for (int i = 0; i < media.length; i++) media[i] = (byte)(i * 17);
-            index = new JSONObject().put("videos", new JSONArray().put(new JSONObject()
-                    .put("name", NAME).put("size", media.length).put("contentType", "video/mp4")
-                    .put("downloadUrl", "/api/download/" + android.net.Uri.encode(NAME))))
-                    .toString().getBytes(StandardCharsets.UTF_8);
+            try (InputStream input = InstrumentationRegistry.getInstrumentation().getContext()
+                    .getAssets().open("moving-sbs.mp4"); ByteArrayOutputStream buffer = new ByteArrayOutputStream()) {
+                byte[] chunk = new byte[8192];
+                for (int n; (n = input.read(chunk)) != -1; ) buffer.write(chunk, 0, n);
+                // Both file versions are playable: the newer one appends an empty MP4 free-space box.
+                buffer.write(new byte[]{0, 0, 0, 8, 'f', 'r', 'e', 'e'});
+                media = buffer.toByteArray();
+            }
+            listedSize = media.length;
             socket = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
             worker = new Thread(this::serve, "NiceTestHttp");
             worker.setDaemon(true);
             worker.start();
         }
         String address() { return "http://127.0.0.1:" + socket.getLocalPort(); }
+        private JSONObject row(String name, int size) throws Exception {
+            return new JSONObject().put("name", name).put("size", size)
+                    .put("contentType", "video/mp4").put("downloadUrl", "/api/download/" + Uri.encode(name));
+        }
+        private byte[] index() throws Exception {
+            JSONArray videos = new JSONArray();
+            if (!deletes.contains(NAME)) videos.put(row(NAME, listedSize));
+            videos.put(row(REMOTE_ONLY, media.length));
+            return new JSONObject().put("videos", videos).toString().getBytes(StandardCharsets.UTF_8);
+        }
         private void serve() {
             try {
                 while (!socket.isClosed()) {
@@ -68,11 +90,15 @@ public final class ServerDownloadTest {
                         String[] request = line.split(" ", 3);
                         String path = new URI(request[1]).getPath();
                         while ((line = in.readLine()) != null && !line.isEmpty()) { /* headers */ }
-                        boolean list = "/api/videos".equals(path);
-                        boolean movie = ("/api/download/" + NAME).equals(path);
-                        byte[] response = list ? index : movie ? media : new byte[0];
-                        String headers = "HTTP/1.1 " + (list || movie ? "200 OK" : "404 Not Found")
-                                + "\r\nContent-Type: " + (list ? "application/json" : "video/mp4")
+                        boolean list = "GET".equals(request[0]) && "/api/videos".equals(path);
+                        boolean movie = ("/api/download/" + NAME).equals(path)
+                                || ("/api/download/" + REMOTE_ONLY).equals(path);
+                        boolean delete = "DELETE".equals(request[0]) && path.startsWith("/api/videos/");
+                        if (delete) deletes.add(path.substring("/api/videos/".length()));
+                        byte[] response = list ? index() : movie ? (path.endsWith(NAME)
+                                ? Arrays.copyOf(media, listedSize) : media) : new byte[0];
+                        String headers = "HTTP/1.1 " + (list || movie || delete ? "200 OK" : "404 Not Found")
+                                + "\r\nContent-Type: " + (movie ? "video/mp4" : "application/json")
                                 + "\r\nContent-Length: " + response.length + "\r\nConnection: close\r\n\r\n";
                         OutputStream out = connection.getOutputStream();
                         out.write(headers.getBytes(StandardCharsets.US_ASCII));
@@ -87,7 +113,8 @@ public final class ServerDownloadTest {
     }
 
     private static TextView label(View v, String text) {
-        if (v instanceof TextView && text.contentEquals(((TextView)v).getText())) return (TextView)v;
+        if (v instanceof TextView && (text.contentEquals(((TextView)v).getText())
+                || text.equals(v.getContentDescription()))) return (TextView)v;
         if (v instanceof ViewGroup) {
             ViewGroup group = (ViewGroup)v;
             for (int i = 0; i < group.getChildCount(); i++) {
@@ -104,7 +131,7 @@ public final class ServerDownloadTest {
         do {
             app.onActivity(a -> {
                 TextView v = label(a.getWindow().getDecorView(), label);
-                if (v != null && v.isShown()) clicked.set(v.performClick());
+                if (v != null && v.isShown() && v.isEnabled()) clicked.set(v.performClick());
             });
             if (clicked.get()) return;
             SystemClock.sleep(100);
@@ -112,7 +139,82 @@ public final class ServerDownloadTest {
         fail("No clickable control: " + label);
     }
 
-    @Test public void serverListAndDownloadPublishOnlyTheByteIdenticalLocalCopy() throws Exception {
+    private static void await(String reason, int seconds, BooleanSupplier condition) {
+        long deadline = SystemClock.elapsedRealtime() + seconds * 1000L;
+        while (!condition.getAsBoolean()) {
+            if (SystemClock.elapsedRealtime() >= deadline) fail(reason);
+            SystemClock.sleep(100);
+        }
+    }
+
+    @Test public void defaultAddressAndPreviouslySavedAddressSurviveReopening() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        VideoLibrary library = new VideoLibrary(context);
+        String previous = library.prefs.getString("server", null);
+        try {
+            assertTrue(library.prefs.edit().remove("server").commit());
+            assertEquals("http://192.168.168.2:8106", new VideoLibrary(context).serverAddress());
+            String custom = "http://127.0.0.1:38106";
+            assertTrue(library.prefs.edit().putString("server", custom).commit());
+            assertEquals(custom, new VideoLibrary(context).serverAddress());
+        } finally {
+            library.prefs.edit().putString("server", previous).commit();
+        }
+    }
+
+    @Test @SdkSuppress(minSdkVersion = 29)
+    public void allDownloadsIncludesNewVersionAndPreservesTheCompletedOlderCopy() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        VideoLibrary library = new VideoLibrary(context);
+        String previous = library.prefs.getString("server", null);
+        try (LocalServer server = new LocalServer()) {
+            String base = server.address();
+            library.prefs.edit().putString("server", base).commit();
+            server.listedSize = server.media.length - 8;
+            try (ActivityScenario<MainActivity> scene = ActivityScenario.launch(MainActivity.class)) {
+                TestAppWindows controls = new TestAppWindows(scene);
+                controls.click("服务器");
+                click(scene, "下载 " + NAME);
+                await("Older version did not finish", 60, () -> library.all().stream()
+                        .anyMatch(e -> e.source.startsWith(base + "/") && e.name.equals(NAME)
+                                && VideoLibrary.READY.equals(e.state)));
+
+                server.listedSize = server.media.length;
+                controls.click("刷新");
+                AtomicBoolean newVersionAvailable = new AtomicBoolean();
+                await("Changed-size movie should offer a new download", 15, () -> {
+                    scene.onActivity(a -> newVersionAvailable.set(label(a.getWindow().getDecorView(), "下载 " + NAME) != null));
+                    return newVersionAvailable.get();
+                });
+                controls.click("全部下载");
+                controls.click("取消");
+                assertEquals(1, library.all().stream().filter(e -> e.source.startsWith(base + "/")).count());
+                controls.click("全部下载");
+                controls.click("加入下载队列");
+                await("Both missing downloads should finish", 60, () -> library.all().stream()
+                        .filter(e -> e.source.startsWith(base + "/") && VideoLibrary.READY.equals(e.state)).count() == 3);
+                int oldVersions = 0, newVersions = 0, otherMovies = 0;
+                for (VideoLibrary.Entry e : library.all()) {
+                    if (!e.source.startsWith(base + "/")) continue;
+                    try (android.os.ParcelFileDescriptor fd = library.openMovie(e)) {
+                        assertEquals(e.bytes, fd.getStatSize());
+                    }
+                    if (e.name.equals(REMOTE_ONLY)) otherMovies++;
+                    else if (e.name.equals(NAME) && e.bytes == server.media.length - 8) oldVersions++;
+                    else if (e.name.equals(NAME) && e.bytes == server.media.length) newVersions++;
+                }
+                assertEquals(1, oldVersions);
+                assertEquals(1, newVersions);
+                assertEquals(1, otherMovies);
+                assertTrue(server.deletes.isEmpty());
+            } finally {
+                for (VideoLibrary.Entry e : library.all()) if (e.source.startsWith(base + "/")) library.remove(e);
+                library.prefs.edit().putString("server", previous).commit();
+            }
+        }
+    }
+
+    @Test public void serverDeleteRequiresTheSameCompletedCopyAndPreservesItsBytes() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         VideoLibrary library = new VideoLibrary(context);
         String previous = library.prefs.getString("server", null);
@@ -121,7 +223,7 @@ public final class ServerDownloadTest {
             library.prefs.edit().putString("server", base).commit();
             try (ActivityScenario<MainActivity> app = ActivityScenario.launch(MainActivity.class)) {
                 click(app, "服务器");
-                click(app, "下载");
+                click(app, "下载 " + NAME);
                 VideoLibrary.Entry e = null;
                 long deadline = SystemClock.elapsedRealtime() + 60_000;
                 while (SystemClock.elapsedRealtime() < deadline) {
@@ -144,6 +246,24 @@ public final class ServerDownloadTest {
                     String localUri = row.getString(row.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI));
                     assertEquals(expected.getAbsolutePath(), Uri.parse(localUri).getPath());
                 }
+                List<ServerVideos.Movie> catalog = ServerVideos.list(base);
+                DownloadedServerDeletion.Plan selected = DownloadedServerDeletion.plan(base, catalog, library.all());
+                assertEquals(1, selected.size());
+                // Neither a different server nor a same-name replacement can reuse this download.
+                assertEquals(0, DownloadedServerDeletion.plan("http://127.0.0.1:1", catalog, library.all()).size());
+                server.listedSize++;
+                DownloadedServerDeletion.Result stale = DownloadedServerDeletion.run(selected, library, () -> true);
+                assertEquals(0, stale.deleted);
+                assertEquals(1, stale.skipped);
+                assertTrue(server.deletes.isEmpty());
+                server.listedSize--;
+                assertEquals(1, DownloadedServerDeletion.run(selected, library, () -> false).skipped);
+                assertTrue(server.deletes.isEmpty());
+
+                click(app, "一键删除已下载视频（1）");
+                await("Expected DELETE for the one completed movie", 15, () -> !server.deletes.isEmpty());
+                assertEquals(Collections.singletonList(NAME), server.deletes);
+                assertNotNull("Offline record disappeared", library.find(e.id));
                 try (InputStream in = context.getContentResolver().openInputStream(library.uri(e))) {
                     assertNotNull(in);
                     ByteArrayOutputStream read = new ByteArrayOutputStream();

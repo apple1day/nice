@@ -12,6 +12,8 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.system.ErrnoException;
+import android.system.Os;
 import org.json.JSONObject;
 import org.json.JSONException;
 import java.io.File;
@@ -47,6 +49,17 @@ final class VideoLibrary {
     VideoLibrary(Context c) {
         context = c.getApplicationContext();
         prefs = c.getSharedPreferences("video_library", Context.MODE_PRIVATE);
+    }
+
+    String serverAddress() {
+        String saved = prefs.getString("server", "");
+        return saved.isEmpty() ? ServerVideos.DEFAULT_ADDRESS : saved;
+    }
+
+    // A new size under the same server filename is a different version. Direct links
+    // have no catalogue size, so their exact original URL identifies the transfer.
+    static String downloadKey(String url, boolean direct, long bytes) {
+        return (direct ? "link" : Long.toString(bytes)) + " " + url;
     }
 
     private Entry parse(String value) {
@@ -315,8 +328,12 @@ final class VideoLibrary {
         synchronized (VideoLibrary.class) {
             // Activity recreation can leave a list row referring to an old record.
             for (Entry current : all()) {
-                if (current.source.equals(movie.url)) { prior = current; break; }
+                if (current.source.equals(movie.url) && current.direct == movie.direct
+                        && (movie.direct || current.bytes == movie.bytes)) { prior = current; break; }
             }
+            if (prior != null) prior = find(prior.id);
+            if (prior != null && (!prior.source.equals(movie.url) || prior.direct != movie.direct
+                    || (!movie.direct && prior.bytes != movie.bytes))) prior = null;
             if (prior != null && !FAILED.equals(prior.state) && !missingPublicFile(prior)) return false;
             if (prior != null && !prior.publicDownload) removeTransfer(prior);
             Entry e = prior == null ? new Entry(UUID.randomUUID().toString()) : prior;
@@ -330,6 +347,7 @@ final class VideoLibrary {
             // so that a literal #, +, or % on the server also reaches the filesystem unchanged.
             String subPath = PUBLIC_FOLDER + "/" + Uri.encode(e.disk);
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(e.source)).setTitle(e.name)
+                    .addRequestHeader("Accept-Encoding", "identity")
                     .setDescription("Nice 视频 · Download/" + PUBLIC_FOLDER)
                     .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                     .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, subPath);
@@ -349,12 +367,24 @@ final class VideoLibrary {
         long bytes, total;
     }
 
-    private boolean containsVideo(ParcelFileDescriptor fd, String contentType) {
-        if (contentType != null) {
-            String mime = contentType.toLowerCase(Locale.ROOT);
-            if (mime.startsWith("text/html") || mime.contains("mpegurl") || mime.contains("dash+xml")
-                    || mime.startsWith("application/json") || mime.startsWith("application/xhtml")) return false;
-        }
+    static boolean invalidVideoPayload(ParcelFileDescriptor fd, String contentType) throws IOException {
+        String mime = contentType == null ? "" : contentType.toLowerCase(Locale.ROOT);
+        if (mime.startsWith("text/") || mime.contains("json") || mime.contains("mpegurl")
+                || mime.contains("dash+xml") || mime.contains("xhtml")) return true;
+        byte[] prefix = new byte[512];
+        try {
+            int n = Os.pread(fd.getFileDescriptor(), prefix, 0, prefix.length, 0);
+            if (n <= 0) return true;
+            String text = new String(prefix, 0, n, StandardCharsets.UTF_8).trim();
+            if (text.startsWith("\uFEFF")) text = text.substring(1).trim();
+            text = text.toLowerCase(Locale.ROOT);
+            return text.startsWith("#extm3u") || text.startsWith("[") || text.startsWith("{")
+                    || text.startsWith("<?xml") || text.startsWith("<mpd") || text.startsWith("<asx")
+                    || text.startsWith("<html") || text.startsWith("<!doctype");
+        } catch (ErrnoException ex) { throw new IOException("无法核对已下载的文件。", ex); }
+    }
+
+    private boolean containsVideo(ParcelFileDescriptor fd) {
         MediaExtractor extractor = new MediaExtractor();
         try {
             extractor.setDataSource(fd.getFileDescriptor());
@@ -403,7 +433,7 @@ final class VideoLibrary {
                 try (ParcelFileDescriptor fd = openDownload(e)) {
                     long size = fd.getStatSize();
                     String mime = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_MEDIA_TYPE));
-                    if (e.direct && !containsVideo(fd, mime)) {
+                    if (invalidVideoPayload(fd, mime) || (e.direct && !containsVideo(fd))) {
                         t.state = FAILED; t.label = "链接未返回可识别的视频文件";
                         manager().remove(e.job);
                     } else if (size > 0 && (expected < 0 || size == expected)) {

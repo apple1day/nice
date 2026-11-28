@@ -44,6 +44,10 @@ public final class MainActivity extends Activity {
     private MovieExportTask exports;
     private MovieUploadTask uploads;
     private DownloadedVideoDeletion deletions;
+    private ServerBatchTask serverBatch;
+    private TextView downloadAll, deleteServerDownloads;
+    private DownloadedServerDeletion.Plan serverPlan;
+    private String pendingDownloadAllServer;
     private boolean preparingDeletion;
     private String pendingUploadServer;
 
@@ -51,7 +55,9 @@ public final class MainActivity extends Activity {
         final MovieExportTask exports;
         final MovieUploadTask uploads;
         final DownloadedVideoDeletion deletions;
-        Transfers(MovieExportTask exports, MovieUploadTask uploads, DownloadedVideoDeletion deletions) {
+        final ServerBatchTask serverBatch;
+        Transfers(MovieExportTask exports, MovieUploadTask uploads, DownloadedVideoDeletion deletions, ServerBatchTask serverBatch) {
+            this.serverBatch = serverBatch;
             this.exports = exports;
             this.uploads = uploads;
             this.deletions = deletions;
@@ -101,6 +107,8 @@ public final class MainActivity extends Activity {
         exports = retained == null ? new MovieExportTask(library) : retained.exports;
         uploads = retained == null ? new MovieUploadTask(getApplicationContext().getContentResolver()) : retained.uploads;
         deletions = retained == null ? new DownloadedVideoDeletion(library) : retained.deletions;
+        serverBatch = retained == null ? new ServerBatchTask(library) : retained.serverBatch;
+        if (state != null) pendingDownloadAllServer = state.getString("downloadAllServer");
         if (state != null) pendingUploadServer = state.getString("uploadServer");
         if (state != null) pendingExportId = state.getString("exportId");
         vrFolders = new VrFolderLibrary(this);
@@ -126,6 +134,11 @@ public final class MainActivity extends Activity {
             updatePanel(); refreshRows();
             if (!deletions.running()) { checkPublicFiles(); startMigration(); }
         });
+        serverBatch.listen(refreshCatalog -> {
+            refreshRows();
+            if (refreshCatalog) fetch();
+            if (!serverBatch.running()) { poll(); startMigration(); }
+        });
         exports.listen(() -> { updatePanel(); refreshRows(); });
         uploads.listen(finished -> {
             if (finished) {
@@ -139,6 +152,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
+        state.putString("downloadAllServer", pendingDownloadAllServer);
         state.putString("exportId", pendingExportId);
         state.putString("uploadServer", pendingUploadServer);
         state.putString("tab", tab.name()); state.putInt("filter", filter);
@@ -155,7 +169,7 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private String address() { return library.prefs.getString("server", ""); }
+    private String address() { return library.serverAddress(); }
     private int dp(float n) { return (int)(getResources().getDisplayMetrics().density * n + .5f); }
     private GradientDrawable bg(int color, int radius) {
         GradientDrawable d = new GradientDrawable(); d.setColor(color); d.setCornerRadius(dp(radius)); return d;
@@ -218,6 +232,8 @@ public final class MainActivity extends Activity {
         exportAll = null;
         clearMissing = null;
         deleteDownloads = null;
+        downloadAll = null;
+        deleteServerDownloads = null;
         panel.removeAllViews();
         LinearLayout heading = row(); panel.addView(heading, -1, dp(50));
         if (tab == Tab.VR) {
@@ -248,6 +264,15 @@ public final class MainActivity extends Activity {
                 TextView upload = pill(uploads.running() ? "上传中…" : "上传本机视频", false, () -> pick(PICK_FOR_UPLOAD));
                 upload.setEnabled(!uploads.running());
                 actions.addView(upload);
+                LinearLayout transfers = row();
+                panel.addView(transfers);
+                downloadAll = pill("全部下载", false, this::confirmDownloadAll);
+                transfers.addView(downloadAll);
+                gap(transfers);
+                deleteServerDownloads = pill("一键删除已下载视频", false, this::deleteFromServer);
+                deleteServerDownloads.setTextColor(0xffffb4ab);
+                transfers.addView(deleteServerDownloads);
+                panel.addView(text("点击删除会立即清理服务器原片，保留已下载的本机副本。", 13, MUTED, false));
             }
         } else {
             exportAll = pill("导出全部", false, () -> pickExportFolder(""));
@@ -255,7 +280,7 @@ public final class MainActivity extends Activity {
             heading.addView(pill("打开文件", true, () -> pick(PICK)));
             LinearLayout downloads = row(); downloads.setPadding(0, dp(7), 0, 0); panel.addView(downloads);
             downloads.addView(pill("视频直链", false, this::directDownload)); gap(downloads);
-            deleteDownloads = pill("一键删除已下载视频", false, this::confirmDeleteDownloads);
+            deleteDownloads = pill("批量删除本机副本", false, this::confirmDeleteDownloads);
             deleteDownloads.setTextColor(0xffffb4ab);
             downloads.addView(deleteDownloads);
             clearMissing = pill("清理已删除记录", false, this::confirmClearMissing);
@@ -280,8 +305,9 @@ public final class MainActivity extends Activity {
     private void refreshRows() {
         rows.clear(); sources.clear();
         boolean hasExport = false, hasDownloads = false;
-        for (VideoLibrary.Entry e : library.all()) {
-            if (e.downloaded()) sources.put(e.source, e);
+        List<VideoLibrary.Entry> records = library.all();
+        for (VideoLibrary.Entry e : records) {
+            if (e.downloaded()) sources.putIfAbsent(VideoLibrary.downloadKey(e.source, e.direct, e.bytes), e);
             hasDownloads |= DownloadedVideoDeletion.eligible(e) && !missing.contains(e.id);
             hasExport |= MovieExporter.eligible(e) && !missing.contains(e.id);
             if (tab == Tab.LOCAL && (filter == 0 || (filter == 1 && e.favorite) || (filter == 2 && e.downloaded()))) rows.add(e);
@@ -300,13 +326,20 @@ public final class MainActivity extends Activity {
             else if (rows.isEmpty()) message = "这个服务器还没有影片。";
             String upload = uploads.status(address());
             if (!upload.isEmpty()) message = serverError.isEmpty() ? upload : upload + "\n" + serverError;
+            String result = serverBatch.status(address());
+            if (!result.isEmpty()) message = message.isEmpty() ? result : result + "\n" + message;
+            serverPlan = DownloadedServerDeletion.plan(address(), remote, records);
+            deleteServerDownloads.setText("一键删除已下载视频（" + serverPlan.size() + "）");
+            boolean idle = !loading && serverError.isEmpty() && !serverBatch.running() && !deletions.running() && !migrating;
+            enable(deleteServerDownloads, idle && serverPlan.size() > 0);
+            enable(downloadAll, idle && remote.stream().anyMatch(ServerVideos.Movie::supportsOffline));
         } else if (rows.isEmpty()) {
             message = filter == 1 ? "还没有收藏。可在影片右侧菜单中加入收藏。" : filter == 2 ?
                     "还没有离线副本。可粘贴视频直链，或从服务器下载。" : "点「视频直链」下载影片，或点「打开文件」播放本机视频。";
         }
         if (clearMissing != null) clearMissing.setVisibility(missing.isEmpty() ? View.GONE : View.VISIBLE);
         if (deleteDownloads != null) {
-            boolean enabled = hasDownloads && !preparingDeletion && !deletions.running() && !exports.running() && !migrating;
+            boolean enabled = hasDownloads && !serverBatch.running() && !preparingDeletion && !deletions.running() && !exports.running() && !migrating;
             deleteDownloads.setEnabled(enabled);
             deleteDownloads.setAlpha(enabled ? 1f : .5f);
         }
@@ -320,6 +353,36 @@ public final class MainActivity extends Activity {
         if (tab == Tab.LOCAL && !deletions.status().isEmpty()) message = deletions.status();
         feedback.setText(message); feedback.setVisibility(message.isEmpty() ? View.GONE : View.VISIBLE);
         adapter.notifyDataSetChanged();
+    }
+
+    private void enable(TextView button, boolean enabled) {
+        button.setEnabled(enabled);
+        button.setAlpha(enabled ? 1f : .5f);
+    }
+
+    private VideoLibrary.Entry source(ServerVideos.Movie movie) {
+        return sources.get(VideoLibrary.downloadKey(movie.url, movie.direct, movie.bytes));
+    }
+
+    private void confirmDownloadAll() {
+        if (!downloadAll.isEnabled()) return;
+        if (!canWriteDownloads()) {
+            pendingDownloadAllServer = address();
+            requestDownloadPermission();
+            return;
+        }
+        String base = address();
+        List<ServerVideos.Movie> selection = new ArrayList<>(remote);
+        new AlertDialog.Builder(this).setTitle("下载全部支持的视频？")
+                .setMessage("影片将保存到 Download/NiceVideos。已下载和下载中的影片会自动跳过。")
+                .setNegativeButton("取消", null).setPositiveButton("加入下载队列", (dialog, which) -> {
+                    if (base.equals(address())) serverBatch.download(base, selection);
+                }).show();
+    }
+
+    private void deleteFromServer() {
+        if (deleteServerDownloads.isEnabled() && serverPlan != null && serverPlan.size() > 0)
+            serverBatch.delete(address(), serverPlan);
     }
 
     private void pickVrFolder() {
@@ -516,7 +579,8 @@ public final class MainActivity extends Activity {
         }
         if (item instanceof ServerVideos.Movie) {
             ServerVideos.Movie m = (ServerVideos.Movie) item;
-            VideoLibrary.Entry existing = sources.get(m.url);
+            if (!m.supportsOffline() || serverBatch.running()) return;
+            VideoLibrary.Entry existing = source(m);
             if (existing != null && !VideoLibrary.FAILED.equals(existing.state)) activate(existing);
             else download(m, existing);
             return;
@@ -573,26 +637,29 @@ public final class MainActivity extends Activity {
             });
         }
         if (e.publicDownload && !VideoLibrary.TRANSFER.equals(e.state)) {
-            menu.getMenu().add("从列表移除").setOnMenuItemClickListener(item -> {
+            menu.getMenu().add("从列表移除").setEnabled(!serverBatch.running()).setOnMenuItemClickListener(item -> {
+                if (serverBatch.running()) return true;
                 library.forget(e); missing.remove(e.id); refreshRows();
                 return true;
             });
             if (missing.contains(e.id)) { menu.show(); return; }
         }
         menu.getMenu().add(!e.downloaded() ? "从最近播放移除" : VideoLibrary.TRANSFER.equals(e.state) ?
-                "取消下载" : "删除本机副本").setOnMenuItemClickListener(item -> { confirmRemove(e); return true; });
+                "取消下载" : "删除本机副本").setEnabled(!serverBatch.running()).setOnMenuItemClickListener(item -> { confirmRemove(e); return true; });
         menu.show();
     }
 
     private void confirmRemove(VideoLibrary.Entry e) {
+        if (serverBatch.running()) return;
         boolean transfer = VideoLibrary.TRANSFER.equals(e.state);
         String title = !e.downloaded() ? "移除播放记录" : transfer ? "取消下载" : "删除本机副本";
         String hint = !e.downloaded() ? "只移除这条记录，文件管理器中的原片会保留。" :
                 transfer ? "已传输的部分将被清理。" : e.publicDownload ?
                         "这会删除公共下载目录中的视频文件，其他播放器也将无法打开它。" :
-                        "删除后可从服务器重新下载，服务器原片会保留。";
+                        "这会删除此设备上的离线文件和下载记录。";
         new AlertDialog.Builder(this).setTitle(title).setMessage(e.name + "\n\n" + hint)
                 .setNegativeButton("返回", null).setPositiveButton("确认", (d, w) -> {
+                    if (serverBatch.running()) return;
                     try { library.remove(e); progress.remove(e.id); refreshRows(); }
                     catch (IOException | RuntimeException ex) { toast(error(ex)); }
                 }).show();
@@ -612,14 +679,14 @@ public final class MainActivity extends Activity {
         dialog.setOnShowListener(shown -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             try {
                 ServerVideos.Movie movie = ServerVideos.direct(url.getText().toString(), name.getText().toString());
-                dialog.dismiss(); download(movie, sources.get(movie.url));
+                dialog.dismiss(); download(movie, source(movie));
             } catch (IOException ex) { url.setError(ex.getMessage()); }
         }));
         dialog.show();
     }
 
     private void confirmDeleteDownloads() {
-        if (preparingDeletion || deletions.running() || migrating || exports.running() || pendingExportId != null) return;
+        if (serverBatch.running() || preparingDeletion || deletions.running() || migrating || exports.running() || pendingExportId != null) return;
         preparingDeletion = true;
         refreshRows();
         jobs.execute(() -> {
@@ -637,9 +704,9 @@ public final class MainActivity extends Activity {
                         + "本机文件和对应的下载记录都会删除，其他播放器也无法再打开这些副本。"
                         + "服务器原片、另存的副本和手动打开的影片会保留。"
                         + (plan.unavailable == 0 ? "" : "\n另有 " + plan.unavailable + " 部暂时无法核对，将跳过。");
-                new AlertDialog.Builder(this).setTitle("一键删除已下载视频").setMessage(hint)
+                new AlertDialog.Builder(this).setTitle("批量删除本机副本").setMessage(hint)
                         .setNegativeButton("取消", null).setPositiveButton("确认删除", (dialog, which) -> {
-                            if (migrating || exports.running() || pendingExportId != null) {
+                            if (serverBatch.running() || migrating || exports.running() || pendingExportId != null) {
                                 toast("请等当前文件操作完成后重试。"); return;
                             }
                             exports.clearStatus();
@@ -669,7 +736,7 @@ public final class MainActivity extends Activity {
     private void editServer() {
         EditText edit = new EditText(this);
         edit.setSingleLine(); edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        edit.setHint("http://192.168.1.10:8106"); edit.setText(address()); edit.selectAll();
+        edit.setHint(ServerVideos.DEFAULT_ADDRESS); edit.setText(address()); edit.selectAll();
         FrameLayout wrapper = new FrameLayout(this);
         wrapper.setPadding(dp(22), dp(12), dp(22), 0); wrapper.addView(edit);
         AlertDialog d = new AlertDialog.Builder(this).setTitle("服务器地址").setView(wrapper)
@@ -677,7 +744,11 @@ public final class MainActivity extends Activity {
         d.setOnShowListener(i -> d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             try {
                 String base = ServerVideos.address(edit.getText().toString());
-                if (!base.equals(address())) remote = new ArrayList<>();
+                if (!base.equals(address())) {
+                    serverBatch.serverChanged();
+                    remote = new ArrayList<>();
+                    pendingDownloadAllServer = null;
+                }
                 library.prefs.edit().putString("server", base).apply();
                 d.dismiss(); updatePanel(); fetch();
             } catch (IOException ex) { edit.setError(ex.getMessage()); }
@@ -696,9 +767,16 @@ public final class MainActivity extends Activity {
             main.post(() -> {
                 if (!live() || generation != fetchGeneration) return;
                 if (report.isEmpty()) remote = result;
-                serverError = report; loading = false; refreshRows();
+                serverError = report; loading = false; refreshRows(); resumeDownloadAll();
             });
         });
+    }
+
+    private void resumeDownloadAll() {
+        if (pendingDownloadAllServer == null || loading || !canWriteDownloads()) return;
+        boolean show = pendingDownloadAllServer.equals(address()) && downloadAll != null && downloadAll.isEnabled();
+        pendingDownloadAllServer = null;
+        if (show) confirmDownloadAll();
     }
 
     private boolean canWriteDownloads() {
@@ -718,10 +796,12 @@ public final class MainActivity extends Activity {
         requestedDownload = null;
         requestedRetryId = null;
         if (!canWriteDownloads()) {
+            pendingDownloadAllServer = null;
             toast("保存到公共下载目录需要存储权限。已有离线影片仍可播放。");
             return;
         }
-        if (movie != null) download(movie, retryId == null ? sources.get(movie.url) : library.find(retryId));
+        resumeDownloadAll();
+        if (movie != null) download(movie, retryId == null ? source(movie) : library.find(retryId));
         startMigration();
     }
 
@@ -751,7 +831,7 @@ public final class MainActivity extends Activity {
     }
 
     private void startMigration() {
-        if (!canWriteDownloads() || exports.running() || deletions.running() || pendingExportId != null) return;
+        if (serverBatch.running() || !canWriteDownloads() || exports.running() || deletions.running() || pendingExportId != null) return;
         boolean batch = getSharedPreferences("download_options", MODE_PRIVATE).getBoolean(MIGRATION_REQUESTED, false);
         LegacyDownloadMigration migration = new LegacyDownloadMigration(library);
         Set<String> pending = migration.pendingIds();
@@ -799,7 +879,7 @@ public final class MainActivity extends Activity {
         }
     }
     @Override protected void onPause() { resumed = false; main.removeCallbacks(pollLater); super.onPause(); }
-    @Override public Object onRetainNonConfigurationInstance() { return new Transfers(exports, uploads, deletions); }
+    @Override public Object onRetainNonConfigurationInstance() { return new Transfers(exports, uploads, deletions, serverBatch); }
 
     @Override protected void onDestroy() {
         if (vrRead != null) vrRead.cancel();
@@ -810,6 +890,10 @@ public final class MainActivity extends Activity {
         if (deletions != null) {
             deletions.listen(null);
             if (!isChangingConfigurations()) deletions.close();
+        }
+        if (serverBatch != null) {
+            serverBatch.listen(null);
+            if (!isChangingConfigurations()) serverBatch.close();
         }
         if (uploads != null) {
             uploads.listen(null);
@@ -895,6 +979,7 @@ public final class MainActivity extends Activity {
                 cell.setTag(new TextView[]{name, detail, action});
             } else cell = (LinearLayout) recycled;
             TextView[] fields = (TextView[])cell.getTag();
+            enable(fields[2], true);
             Object item = rows.get(position);
             if (item instanceof VrFolderLibrary.Item) {
                 VrFolderLibrary.Item e = (VrFolderLibrary.Item)item;
@@ -920,12 +1005,13 @@ public final class MainActivity extends Activity {
                 fields[2].setOnClickListener(v -> actions(v, e));
             } else {
                 ServerVideos.Movie m = (ServerVideos.Movie)item;
-                VideoLibrary.Entry e = sources.get(m.url);
+                VideoLibrary.Entry e = source(m);
                 fields[0].setText(m.name); fields[1].setText(e == null ? size(m.bytes) : description(e));
-                String label = e == null ? "下载" : missing.contains(e.id) ? "重新下载" : VideoLibrary.READY.equals(e.state) ? "播放" :
+                String label = !m.supportsOffline() ? "不支持下载" : e == null ? "下载" : missing.contains(e.id) ? "重新下载" : VideoLibrary.READY.equals(e.state) ? "播放" :
                         VideoLibrary.FAILED.equals(e.state) ? "重试" : "取消";
                 fields[2].setText(label); fields[2].setTextSize(14); fields[2].setContentDescription(label + " " + m.name);
                 fields[2].setOnClickListener(v -> activate(m));
+                enable(fields[2], m.supportsOffline() && !serverBatch.running());
             }
             cell.setOnClickListener(v -> activate(item));
             cell.setOnLongClickListener(v -> {
