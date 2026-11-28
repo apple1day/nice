@@ -34,6 +34,14 @@ struct Failure: LocalizedError {
     @Published var loading = false
     @Published var message = ""
     @Published var current = ""
+    @Published var batchTotal = 0
+    @Published var batchProcessed = 0
+    @Published var batchFailed = 0
+    @Published var stopRequested = false
+    var localBytes: Int64 { local.reduce(Int64(0)) { $0 + $1.size } }
+    var storageLabel: String { ByteCountFormatter.string(fromByteCount: localBytes, countStyle: .file) }
+    var pending: [Video] { videos.filter { $0.supported && !downloaded($0) } }
+    var pendingBytes: Int64 { pending.reduce(Int64(0)) { $0 + $1.size } }
     private let fm = FileManager.default
     private var catalogBase: URL?
     private var folder: URL {
@@ -86,34 +94,63 @@ struct Failure: LocalizedError {
     private func destination(_ v: Video, _ b: URL) -> URL {
         let hash = SHA256.hash(data: Data((b.absoluteString + "\n" + v.name + "\n" + String(v.size)).utf8)).map { String(format: "%02x", $0) }.joined()
         let safe = String((v.name as NSString).lastPathComponent.prefix(100)).replacingOccurrences(of: "/", with: "_")
-        return folder.appendingPathComponent(hash.prefix(16) + "_" + safe)
+        return folder.appendingPathComponent(String(hash.prefix(16)) + "_" + safe)
     }
     func downloaded(_ v: Video) -> Bool {
         guard let b = catalogBase else { return false }
         return local.contains { $0.url == destination(v,b) && $0.size == v.size }
     }
     func download(_ v: Video) async {
-        guard !busy, !loading, v.supported, !downloaded(v), let b = catalogBase else { return }
-        busy = true; current = v.name; message = ""
+        guard !busy, !loading, let b = catalogBase else { return }
+        scan()
+        guard v.supported, !downloaded(v) else { return }
+        busy = true; current = v.name; message = ""; batchTotal = 0
         defer { busy = false; current = ""; scan() }
-        do {
-            guard v.downloadUrl.hasPrefix("/api/"), let u = URL(string: v.downloadUrl, relativeTo: b)?.absoluteURL,
-                  u.scheme == b.scheme, u.host == b.host, u.port == b.port,
-                  u.user == nil, u.password == nil, u.fragment == nil else { throw Failure(message: "下载地址无效") }
-            try prepare()
-            let (tmp, response) = try await URLSession.shared.download(from: u)
-            defer { try? fm.removeItem(at: tmp) }
-            let mime = response.mimeType?.lowercased() ?? ""
-            let size = (try fm.attributesOfItem(atPath: tmp.path)[.size] as? NSNumber)?.int64Value
-            guard (response as? HTTPURLResponse)?.statusCode == 200, size == v.size,
-                  !mime.hasPrefix("text/"), !mime.contains("json"), !mime.contains("mpegurl") else {
-                throw Failure(message: "下载失败或文件大小不一致，请刷新列表重试")
+        do { try await transfer(v, base: b); message = "下载完成" }
+        catch { message = error.localizedDescription }
+    }
+    func downloadAll() async {
+        guard !busy, !loading, let b = catalogBase else { return }
+        scan()
+        let queue = pending
+        guard !queue.isEmpty else { return }
+        busy = true; stopRequested = false; batchTotal = queue.count
+        batchProcessed = 0; batchFailed = 0; message = ""
+        var failures: [String] = []
+        defer { busy = false; current = ""; batchTotal = 0; scan() }
+        for video in queue {
+            if stopRequested { break }
+            current = video.name
+            if !downloaded(video) {
+                do { try await transfer(video, base: b) }
+                catch {
+                    batchFailed += 1
+                    failures.append(video.name + "：" + error.localizedDescription)
+                }
             }
-            let target = destination(v,b)
-            if fm.fileExists(atPath: target.path) { _ = try fm.replaceItemAt(target, withItemAt: tmp) }
-            else { try fm.moveItem(at: tmp, to: target) }
-            message = "下载完成"
-        } catch { message = error.localizedDescription }
+            batchProcessed += 1
+            scan()
+        }
+        let status = stopRequested ? "批量下载已停止" : "批量下载结束"
+        message = "\(status)：成功或已存在 \(batchProcessed - batchFailed)，失败 \(batchFailed)，未处理 \(batchTotal - batchProcessed)"
+        if !failures.isEmpty { message += "\n" + failures.joined(separator: "\n") }
+    }
+    private func transfer(_ v: Video, base b: URL) async throws {
+        guard v.downloadUrl.hasPrefix("/api/"), let u = URL(string: v.downloadUrl, relativeTo: b)?.absoluteURL,
+              u.scheme == b.scheme, u.host == b.host, u.port == b.port,
+              u.user == nil, u.password == nil, u.fragment == nil else { throw Failure(message: "下载地址无效") }
+        try prepare()
+        let (tmp, response) = try await URLSession.shared.download(from: u)
+        defer { try? fm.removeItem(at: tmp) }
+        let mime = response.mimeType?.lowercased() ?? ""
+        let size = (try fm.attributesOfItem(atPath: tmp.path)[.size] as? NSNumber)?.int64Value
+        guard (response as? HTTPURLResponse)?.statusCode == 200, size == v.size,
+              !mime.hasPrefix("text/"), !mime.contains("json"), !mime.contains("mpegurl") else {
+            throw Failure(message: "下载失败或文件大小不一致，请刷新列表重试")
+        }
+        let target = destination(v,b)
+        if fm.fileExists(atPath: target.path) { _ = try fm.replaceItemAt(target, withItemAt: tmp) }
+        else { try fm.moveItem(at: tmp, to: target) }
     }
     func deleteAll() {
         guard !busy else { return }
@@ -133,6 +170,7 @@ struct Failure: LocalizedError {
 struct Home: View {
     @ObservedObject var store: Store
     @State private var confirm = false
+    @State private var confirmDownloadAll = false
     @State private var selected: LocalVideo?
     @State private var search = ""
     var body: some View {
@@ -144,6 +182,17 @@ struct Home: View {
                         Button("连接 / 刷新") { Task { await store.refresh() } }.disabled(store.busy || store.loading)
                         if store.loading { ProgressView() }
                         if store.busy { ProgressView("正在下载：\(store.current)") }
+                        if store.busy && store.batchTotal > 0 {
+                            ProgressView(value: Double(store.batchProcessed), total: Double(store.batchTotal))
+                            Text("已处理 \(store.batchProcessed)/\(store.batchTotal)，失败 \(store.batchFailed)")
+                            Button(store.stopRequested ? "等待当前文件完成" : "停止后续下载") { store.stopRequested = true }.disabled(store.stopRequested)
+                        }
+                        Button("一键下载全部视频") { confirmDownloadAll = true }
+                            .disabled(store.busy || store.loading || store.pending.isEmpty)
+                        Text("待下载：\(store.pending.count) 个 · \(ByteCountFormatter.string(fromByteCount: store.pendingBytes, countStyle: .file))")
+                            .font(.footnote)
+                        Text("本地已下载：\(store.local.count) 个 · 占用 \(store.storageLabel)")
+                            .font(.headline)
                         if !store.message.isEmpty { Text(store.message).font(.footnote) }
                     }
                     Section(header: Text("视频")) {
@@ -161,12 +210,18 @@ struct Home: View {
                         }
                     }
                 }.searchable(text: $search).navigationTitle("服务器视频")
+                    .alert("下载全部视频？", isPresented: $confirmDownloadAll) {
+                        Button("下载") { Task { await store.downloadAll() } }
+                        Button("取消", role: .cancel) {}
+                    } message: {
+                        Text("下载当前服务器全部支持且尚未下载的视频，不受搜索筛选影响。预计新增 \(ByteCountFormatter.string(fromByteCount: store.pendingBytes, countStyle: .file))。")
+                    }
             }.navigationViewStyle(.stack).tabItem { Label("下载", systemImage: "arrow.down.circle") }
             NavigationView {
                 List {
                     Section {
                         Text("已下载：\(store.local.count) 个文件")
-                        Text(ByteCountFormatter.string(fromByteCount: store.local.reduce(Int64(0)) { $0 + $1.size }, countStyle: .file))
+                        Text("存储占用：\(store.storageLabel)").font(.headline)
                         Button(role: .destructive) { confirm = true } label: { Text("一键删除已下载视频") }
                             .disabled(store.busy || store.local.isEmpty)
                         if !store.message.isEmpty { Text(store.message).font(.footnote) }
