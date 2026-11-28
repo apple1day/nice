@@ -69,7 +69,8 @@ public final class MainActivity extends Activity {
     private TextView exportAll, clearMissing, deleteDownloads;
     private final ExecutorService migrations = Executors.newSingleThreadExecutor();
     private final Set<String> missing = new HashSet<>();
-    private boolean migrating, rescanAfterMigration;
+    private boolean migrating, rescanAfterMigration, scanningMissing;
+    private final Runnable scanMissingLater = this::checkPublicFiles;
     private String migrationStatus = "";
     private ServerVideos.Movie requestedDownload;
     private String requestedRetryId;
@@ -227,6 +228,8 @@ public final class MainActivity extends Activity {
         if (next == tab) return;
         if (vrRead != null) { vrRead.cancel(); vrRead = null; }
         tab = next; build();
+        main.removeCallbacks(scanMissingLater);
+        if (tab == Tab.LOCAL) checkPublicFiles();
         if (tab == Tab.VR) loadVrFolder();
         if (tab == Tab.SERVER && remote.isEmpty() && !loading && !address().isEmpty()) fetch();
     }
@@ -289,9 +292,8 @@ public final class MainActivity extends Activity {
             deleteDownloads = pill("批量删除本机副本", false, this::confirmDeleteDownloads);
             deleteDownloads.setTextColor(0xffffb4ab);
             downloads.addView(deleteDownloads);
-            clearMissing = pill("清理已删除记录", false, this::confirmClearMissing);
+            clearMissing = pill("一键清理已删除的视频", false, () -> scanLocalFiles(true));
             panel.addView(clearMissing, -2, -2);
-            clearMissing.setVisibility(missing.isEmpty() ? View.GONE : View.VISIBLE);
             LinearLayout chips = row(); chips.setPadding(0, dp(7), 0, 0); panel.addView(chips);
             String[] names = {"全部", "收藏", "已下载"};
             for (int i = 0; i < names.length; i++) {
@@ -345,7 +347,10 @@ public final class MainActivity extends Activity {
             message = filter == 1 ? "还没有收藏。可在影片右侧菜单中加入收藏。" : filter == 2 ?
                     "还没有离线副本。可粘贴视频直链，或从服务器下载。" : "点「视频直链」下载影片，或点「打开文件」播放本机视频。";
         }
-        if (clearMissing != null) clearMissing.setVisibility(missing.isEmpty() ? View.GONE : View.VISIBLE);
+        if (clearMissing != null) {
+            clearMissing.setText(scanningMissing ? "正在检查本地文件…" : "一键清理已删除的视频");
+            enable(clearMissing, !scanningMissing && !serverBatch.running() && !migrating && !deletions.running() && !exports.running() && !preparingDeletion);
+        }
         if (deleteDownloads != null) {
             boolean enabled = hasDownloads && !serverBatch.running() && !preparingDeletion && !deletions.running() && !exports.running() && !migrating;
             deleteDownloads.setEnabled(enabled);
@@ -744,22 +749,6 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private void confirmClearMissing() {
-        Set<String> candidates = new HashSet<>(missing);
-        new AlertDialog.Builder(this).setTitle("清理已删除记录")
-                .setMessage("将从本地列表移除 " + candidates.size() + " 条找不到公共文件的记录。")
-                .setNegativeButton("取消", null).setPositiveButton("清理", (d, w) -> jobs.execute(() -> {
-                    int removed = 0;
-                    for (String id : candidates) if (library.forgetIfMissing(id)) removed++;
-                    final int count = removed;
-                    main.post(() -> {
-                        if (!live()) return;
-                        missing.removeAll(candidates); refreshRows(); checkPublicFiles();
-                        toast("已清理 " + count + " 条记录。");
-                    });
-                })).show();
-    }
-
     private void editServer() {
         if (serverBatch.moving()) { toast("请先停止下载并删除。"); return; }
         EditText edit = new EditText(this);
@@ -836,15 +825,34 @@ public final class MainActivity extends Activity {
         startMigration();
     }
 
-    private void checkPublicFiles() {
+    private void checkPublicFiles() { scanLocalFiles(false); }
+
+    private void scanLocalFiles(boolean manual) {
+        main.removeCallbacks(scanMissingLater);
+        if (!live() || !resumed || tab != Tab.LOCAL) return;
+        if (scanningMissing || serverBatch.running() || migrating || deletions.running()
+                || exports.running() || preparingDeletion) {
+            main.postDelayed(scanMissingLater, 3000);
+            return;
+        }
+        scanningMissing = true;
+        if (manual) refreshRows();
         jobs.execute(() -> {
-            Set<String> absent = new HashSet<>();
+            Set<String> removed = new HashSet<>();
             for (VideoLibrary.Entry e : library.all()) {
-                if (library.missingPublicFile(e)) absent.add(e.id);
+                if (Thread.currentThread().isInterrupted()) break;
+                if (library.forgetIfMissing(e.id)) removed.add(e.id);
             }
             main.post(() -> {
                 if (!live()) return;
-                missing.clear(); missing.addAll(absent); refreshRows();
+                scanningMissing = false;
+                missing.removeAll(removed);
+                for (String id : removed) progress.remove(id);
+                if (tab == Tab.LOCAL) {
+                    refreshRows();
+                    if (manual || !removed.isEmpty()) toast("已清理 " + removed.size() + " 条已删除的视频记录。");
+                    if (resumed) main.postDelayed(scanMissingLater, 5000);
+                }
             });
         });
     }
@@ -909,7 +917,7 @@ public final class MainActivity extends Activity {
             if (tab == Tab.VR) loadVrFolder();
         }
     }
-    @Override protected void onPause() { resumed = false; main.removeCallbacks(pollLater); super.onPause(); }
+    @Override protected void onPause() { resumed = false; main.removeCallbacks(pollLater); main.removeCallbacks(scanMissingLater); super.onPause(); }
     @Override public Object onRetainNonConfigurationInstance() { return new Transfers(exports, uploads, deletions, serverBatch); }
 
     @Override protected void onDestroy() {

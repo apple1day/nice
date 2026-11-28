@@ -1,4 +1,4 @@
-name: Android 1.3.13 download and move
+name: Android 1.3.14 download and move
 on:
   push:
     branches: [fix/android-server-downloads]
@@ -50,7 +50,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/move-apk"
           if [[ "$BUILD_KIND" == mobile ]]; then
             ./gradlew -PtestMobile -PstandaloneDownloads :app:assembleMobile :app:assembleMobileAndroidTest :app:testMobileUnitTest
-            apk="$RUNNER_TEMP/move-apk/NiceVideos-Android-1.3.13.apk"
+            apk="$RUNNER_TEMP/move-apk/NiceVideos-Android-1.3.14.apk"
             cp app/build/outputs/apk/mobile/app-mobile.apk "$apk"
             old=releases/1.3.12/NiceVideos-Android-1.3.12.apk
             "$sdk/apksigner" verify --print-certs "$old" > "$RUNNER_TEMP/old-cert"
@@ -59,12 +59,12 @@ jobs:
             id=com.anxiong.nicevideos.mobile.downloads
           else
             ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest
-            apk="$RUNNER_TEMP/move-apk/NiceVideos-Android-1.3.13-Preview.apk"
+            apk="$RUNNER_TEMP/move-apk/NiceVideos-Android-1.3.14-Preview.apk"
             cp app/build/outputs/apk/debug/app-debug.apk "$apk"
             id=com.anxiong.nicevideos.vr.preview
           fi
           "$sdk/apksigner" verify --verbose "$apk"
-          "$sdk/aapt" dump badging "$apk" | grep -F "package: name='$id' versionCode='25' versionName='1.3.13'"
+          "$sdk/aapt" dump badging "$apk" | grep -F "package: name='$id' versionCode='26' versionName='1.3.14'"
           sha256sum "$apk"
       - name: Enable emulator acceleration
         run: sudo chmod 666 /dev/kvm
@@ -77,10 +77,10 @@ jobs:
           disk-size: 12G
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: cd android && if [ "$BUILD_KIND" = mobile ]; then ./gradlew -PtestMobile -PstandaloneDownloads :app:connectedMobileAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.anxiong.nicevideos.ServerDownloadTest; else ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.anxiong.nicevideos.ServerDownloadTest; fi
+          script: cd android && if [ "$BUILD_KIND" = mobile ]; then ./gradlew -PtestMobile -PstandaloneDownloads :app:connectedMobileAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.anxiong.nicevideos.ServerDownloadTest,com.anxiong.nicevideos.BatchDeleteDownloadsTest; else ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.anxiong.nicevideos.ServerDownloadTest,com.anxiong.nicevideos.BatchDeleteDownloadsTest; fi
       - uses: actions/upload-artifact@v4
         with:
-          name: NiceVideos-1.3.13-${{ env.BUILD_KIND }}
+          name: NiceVideos-1.3.14-${{ env.BUILD_KIND }}
           path: ${{ runner.temp }}/move-apk/*.apk
       - uses: actions/upload-artifact@v4
         if: always()

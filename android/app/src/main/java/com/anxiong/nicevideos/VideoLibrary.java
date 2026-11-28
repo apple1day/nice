@@ -12,6 +12,8 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.provider.DocumentsContract;
+import android.system.OsConstants;
 import android.system.ErrnoException;
 import android.system.Os;
 import org.json.JSONObject;
@@ -274,12 +276,77 @@ final class VideoLibrary {
         }
     }
 
+    // A missing download record is not sufficient proof that the underlying file is gone.
+    private static boolean absentOnDisk(File file) {
+        try { Os.stat(file.getAbsolutePath()); return false; }
+        catch (ErrnoException ex) { return ex.errno == OsConstants.ENOENT; }
+        catch (RuntimeException ex) { return false; }
+    }
+
+    private boolean missingLocalFile(Entry e) {
+        if (!READY.equals(e.state)) return false;
+        String storage = Environment.getExternalStorageState();
+        boolean mounted = Environment.MEDIA_MOUNTED.equals(storage) || Environment.MEDIA_MOUNTED_READ_ONLY.equals(storage);
+        try {
+            if (e.downloaded()) {
+                if (!e.publicDownload) {
+                    return (e.restoredPrivate || mounted) && absentOnDisk(file(e));
+                }
+                if (!mounted || !missingPublicFile(e)) return false;
+                File recorded = publicFile(Uri.fromFile(new File(publicDirectory(), e.disk)));
+                if (!absentOnDisk(recorded)) return false;
+                if (e.publicUri.isEmpty()) {
+                    // An untracked or renamed DownloadManager file is not automatically removed.
+                    if (e.job < 0) return false;
+                    try (Cursor c = manager().query(new DownloadManager.Query().setFilterById(e.job))) {
+                        if (c == null) return false;
+                        if (!c.moveToFirst()) return true;
+                        String path = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI));
+                        return path != null && "file".equals(Uri.parse(path).getScheme())
+                                && recorded.equals(publicFile(Uri.parse(path)));
+                    }
+                }
+                Uri uri = Uri.parse(e.publicUri);
+                if ("file".equals(uri.getScheme())) return recorded.equals(publicFile(uri));
+                if (!MediaStore.AUTHORITY.equals(uri.getAuthority())) return false;
+                try (Cursor c = context.getContentResolver().query(uri,
+                        new String[]{MediaStore.MediaColumns.DATA}, null, null, null)) {
+                    if (c == null) return false;
+                    if (!c.moveToFirst()) return true;
+                    String path = c.getString(0);
+                    // A MediaStore URI may follow a moved file; preserve uncertain locations.
+                    return path != null && recorded.equals(new File(path).getCanonicalFile());
+                }
+            }
+            // Only primary-volume documents with a retained read grant can be
+            // positively classified. Revoked permissions, USB/SD/cloud files are retained.
+            if (!mounted || e.document.isEmpty()) return false;
+            Uri uri = Uri.parse(e.document);
+            if (!"com.android.externalstorage.documents".equals(uri.getAuthority())
+                    || !DocumentsContract.isDocumentUri(context, uri)) return false;
+            boolean grant = context.getContentResolver().getPersistedUriPermissions().stream()
+                    .anyMatch(p -> p.isReadPermission() && uri.equals(p.getUri()));
+            if (!grant) return false;
+            String id = DocumentsContract.getDocumentId(uri);
+            if (!id.startsWith("primary:") || id.length() <= 8) return false;
+            File root = Environment.getExternalStorageDirectory().getCanonicalFile();
+            File document = new File(root, id.substring(8)).getCanonicalFile();
+            if (!document.getPath().startsWith(root.getPath() + File.separator)) return false;
+            try (ParcelFileDescriptor fd = context.getContentResolver().openFileDescriptor(uri, "r")) {
+                return false;
+            } catch (FileNotFoundException ex) {
+                return absentOnDisk(document);
+            }
+        } catch (IOException | RuntimeException ex) {
+            return false;
+        }
+    }
+
     boolean forgetIfMissing(String id) {
         synchronized (VideoLibrary.class) {
             Entry current = find(id);
-            if (current == null || !missingPublicFile(current)) return false;
-            forget(current);
-            return true;
+            if (current == null || !missingLocalFile(current)) return false;
+            return prefs.edit().remove("movie." + id).commit();
         }
     }
 

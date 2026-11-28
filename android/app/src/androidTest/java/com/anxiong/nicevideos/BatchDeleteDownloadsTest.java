@@ -173,6 +173,36 @@ public final class BatchDeleteDownloadsTest {
         }
     }
 
+    @Test public void localListAutomaticallyRemovesDeletedRecordsButPreservesExistingAndPending() throws Exception {
+        byte[] data = {1, 2, 3, 4};
+        VideoLibrary.Entry gone = migratedCopy("gone.mp4", data, "https://example.org/gone.mp4");
+        VideoLibrary.Entry kept = migratedCopy("kept.mp4", data, "https://example.org/kept.mp4");
+        VideoLibrary.Entry pending = migratedCopy("pending.mp4", data, "https://example.org/pending.mp4");
+        pending.state = VideoLibrary.TRANSFER;
+        library.saveCommitted(pending);
+        try {
+            assertEquals(1, resolver.delete(Uri.parse(gone.publicUri), null, null));
+            assertEquals(1, resolver.delete(Uri.parse(pending.publicUri), null, null));
+            assertFalse(library.forgetIfMissing(pending.id));
+            // Keep the deliberately incomplete record out of the activity's DownloadManager poll.
+            pending.state = VideoLibrary.FAILED;
+            library.saveCommitted(pending);
+            try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
+                await("Missing record should be pruned automatically", 15, () -> library.find(gone.id) == null);
+                assertNotNull(library.find(kept.id));
+                assertNotNull(library.find(pending.id));
+                assertArrayEquals(data, bytes(resolver.openInputStream(Uri.parse(kept.publicUri))));
+                assertEquals(1, resolver.delete(Uri.parse(kept.publicUri), null, null));
+                await("Foreground rescan should prune externally deleted file", 15, () -> library.find(kept.id) == null);
+            }
+        } finally {
+            library.forget(gone);
+            library.forget(kept);
+            library.forget(pending);
+            for (Uri row : publicRows) if (exists(row)) resolver.delete(row, null, null);
+        }
+    }
+
     @Test public void movingAConfirmedFilePreservesItAndItsReplacementAtTheOldPath() throws Exception {
         assertFalse("Use a clean test installation", library.all().stream().anyMatch(VideoLibrary.Entry::downloaded));
         byte[] original = {3, 1, 4}, other = {1, 5, 9};
